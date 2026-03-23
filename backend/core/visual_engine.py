@@ -1,0 +1,1362 @@
+import requests
+import os
+import random
+import hashlib
+import json
+import base64
+import time
+import asyncio
+import re
+try:
+    from . import assets_downloader
+    from .assets_downloader import clean_keyword
+except (ImportError, ValueError):
+    import assets_downloader
+    from assets_downloader import clean_keyword
+
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+    print("Warning: 'duckduckgo-search' module not found. Web search will be disabled.")
+
+try:
+    import pollinations
+except ImportError:
+    pollinations = None
+    print("Warning: 'pollinations' module not found. AI generation might be limited.")
+
+try:
+    import fal_client
+except ImportError:
+    fal_client = None
+    print("Warning: 'fal-client' module not found. Paid Flux generation will be disabled.")
+
+import yaml
+import matplotlib.pyplot as plt
+import matplotlib
+import io
+import numpy as np
+
+# Constants
+ASPECT_RATIOS = {
+    "16:9 (Youtube)": (1280, 720),
+    "9:16 (Shorts)": (720, 1280),
+    "1:1 (Square)": (1024, 1024),
+    "4:3 (Classic)": (1024, 768),
+    "21:9 (Ultrawide)": (1536, 640)
+}
+
+AI_MODELS = {
+    "Pollinations (Free, Fast)": "pollinations",
+    "Z-Image-Turbo (Local, Free)": "zimage",
+    "Cloudflare (Flux, Paid)": "cloudflare",
+    "Stable Diffusion (Local)": "local_sd",
+    "AI Horde (Free, Slow)": "horde"
+}
+
+SEARCH_ENGINES = {
+    "Bing (Global)": "bing",
+    "DuckDuckGo (Privacy)": "ddg"
+}
+
+IMAGE_STYLES = {
+    "None (기본)": "",
+    "Cinematic (영화 같은)": "cinematic lighting, dramatic atmosphere, movie scene, 4k, 8k, highly detailed, film grain, bokeh, professional cinematography",
+    "Anime (애니메이션)": "anime style, cel shaded, vibrant colors, studio ghibli style, makoto shinkai style, 2d animation, flat color",
+    "Digital Art (디지털 아트)": "digital art, concept art, trending on artstation, sharp focus, octane render, detailed illustration",
+    "Photographic (실사)": "photorealistic, hyperrealistic, raw photo, dslr, 85mm lens, f1.8, soft lighting, sharp focus, 8k, highly detailed texture, professional photography",
+    "Neon Punk (네온 펑크)": "cyberpunk, neon lights, futuristic, synthwave, retrofuturism, glowing lights, night city",
+    "Oil Painting (유화)": "oil painting, thick brushstrokes, canvas texture, classic art style, impressionism, fine art",
+    "Comic Book (만화책)": "comic book style, bold lines, halftone patterns, vibrant colors, graphic novel style, ink outlines",
+    "3D Model (3D 렌더링)": "3d render, unreal engine 5, ray tracing, octane render, physically based rendering, 3d modeling, high poly"
+}
+
+# Matplotlib 설정 (한글 폰트 등)
+# 윈도우의 경우 'Malgun Gothic', 리눅스/맥은 다른 폰트 필요할 수 있음
+# 여기서는 윈도우 환경(Malgun Gothic)을 가정
+matplotlib.rcParams['font.family'] = 'Malgun Gothic'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+try:
+    from .config_utils import load_config, get_asset_dir
+except (ImportError, ValueError):
+    from config_utils import load_config, get_asset_dir
+
+def create_graph_image(data, title, output_path, theme='light'):
+    """
+    딕셔너리 데이터를 받아 깔끔한 막대 그래프 이미지를 생성합니다.
+    data: {'2023': 10, '2024': 20} (JSON/Dict)
+    theme: 'light' or 'dark'
+    """
+    try:
+        if not isinstance(data, dict):
+            return None
+
+        # 스타일: 깔끔한 화이트/그레이 톤 (뉴스/리포트 스타일)
+        plt.style.use('default')
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        if theme == 'dark':
+            bg_color = '#2c3e50'
+            face_color = '#34495e'
+            text_color = '#ecf0f1'
+            grid_color = '#7f8c8d'
+            bar_colors = ['#3498db', '#2980b9', '#1abc9c', '#16a085', '#bdc3c7']
+        else:
+            bg_color = '#f8f9fa'
+            face_color = '#ffffff'
+            text_color = '#2c3e50'
+            grid_color = '#bdc3c7'
+            bar_colors = ['#2c3e50', '#34495e', '#7f8c8d', '#95a5a6', '#bdc3c7']
+
+        # 배경색 설정
+        fig.patch.set_facecolor(bg_color)
+        ax.set_facecolor(face_color)
+
+        labels = list(data.keys())
+        values = list(data.values())
+
+        # 색상 설정
+        colors = bar_colors
+        if len(values) > 5:
+            if theme == 'dark':
+                colors = plt.cm.GnBu(np.linspace(0.5, 1, len(values)))
+            else:
+                colors = plt.cm.Blues(np.linspace(0.5, 1, len(values)))
+
+        bars = ax.bar(labels, values, color=colors[:len(labels)], edgecolor='none', width=0.6)
+
+        # 타이틀 및 라벨 설정
+        ax.set_title(title, fontsize=24, pad=25, fontweight='bold', color=text_color, fontfamily='Malgun Gothic')
+        # x축 라벨 제거 (깔끔하게) 또는 조정
+        ax.tick_params(axis='x', labelsize=14, labelcolor=text_color, rotation=0)
+        ax.tick_params(axis='y', labelsize=12, labelcolor=grid_color)
+
+        # 상단/우측 테두리 제거
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color(grid_color)
+        ax.spines['bottom'].set_color(grid_color)
+
+        # 그리드 설정 (가로선만, 아주 연하게)
+        ax.grid(axis='y', linestyle='-', alpha=0.2, color=grid_color)
+
+        # 값 표시 (바 위에 텍스트)
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2.0, height + (max(values)*0.01), 
+                    f'{height:,}', ha='center', va='bottom', fontsize=14, fontweight='bold', color=text_color)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, facecolor=bg_color, bbox_inches='tight')
+        plt.close()
+        return output_path
+    except Exception as e:
+        print(f"Graph generation error: {e}")
+        return None
+
+try:
+    from . import assets_downloader
+except (ImportError, ValueError):
+    import assets_downloader
+
+def search_web_image(keyword, cancel_check=None):
+    """
+    Playwright를 사용하여 빙/덕덕고 이미지 검색 (Single Result)
+    """
+    if cancel_check and cancel_check():
+        raise InterruptedError("User requested cancellation")
+    print(f"Searching web image for: {keyword}")
+
+    # 1. Bing Image Search
+    bing_image = assets_downloader.search_image_bing(keyword, cancel_check=cancel_check)
+    if bing_image:
+        print(f"Found Bing image: {bing_image}")
+        return bing_image
+
+    return None
+
+
+async def search_web_images_list(keyword, count=5, engine="bing", cancel_check=None):
+    """
+    빙과 덕덕고 엔진을 사용하여 최소 count개의 이미지 URL을 수집합니다.
+    이미 정제된 키워드가 들어올 경우(부정어 포함) 그대로 사용합니다.
+    """
+    if cancel_check and cancel_check():
+        raise InterruptedError("User requested cancellation")
+
+    print(f"Searching web images list for: {keyword} using {engine}")
+    results = []
+
+    # [수정] 이미 정제된 키워드(부정어 '-' 포함)가 들어오는 경우, 추가 정제 없이 그대로 사용
+    if " -" in keyword:
+        search_keyword = keyword
+        fallback_base = keyword.split(" -")[0]
+        print(f"[Search] Using pre-refined keyword: {search_keyword}")
+    else:
+        # 기존의 복잡한 정제 로직 (정제되지 않은 키워드가 들어올 경우를 대비한 하위 호환성)
+        base_keyword = keyword
+        is_korean = bool(re.search(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', base_keyword))
+        
+        other_countries = [
+            "미국", "USA", "America", "일본", "Japan", "중국", "China", "영국", "UK", "Britain",
+            "프랑스", "France", "독일", "Germany", "러시아", "Russia", "베트남", "Vietnam", "태국", "Thailand",
+            "유럽", "Europe", "아시아", "Asia", "북한", "North Korea", "대만", "Taiwan", "인도", "India",
+            "캐나다", "Canada", "호주", "Australia", "브라질", "Brazil", "멕시코", "Mexico", "이탈리아", "Italy",
+            "스페인", "Spain", "우크라이나", "Ukraine", "이스라엘", "Israel"
+        ]
+
+        clean_base = base_keyword
+        ai_technical_terms = [
+            "realistic", "4k", "8k", "detailed", "photography", "cinematic", "storytelling", 
+            "wide shot", "close up", "high resolution", "highly detailed", "masterpiece",
+            "rendering", "unreal engine", "octane render", "environment", "scene", "storytelling scene"
+        ]
+        
+        words = clean_base.split()
+        new_words = []
+        for word in words:
+            low_word = word.lower().strip(",.")
+            if low_word in ["news", "newsing"]: continue
+            if low_word in ["infographic", "chart", "graph", "graphic"]:
+                new_words.append("visual")
+                continue
+            if low_word in ai_technical_terms: continue
+            new_words.append(word)
+        
+        # [수정] 검색어가 너무 짧아지는 것을 방지 (최소 3단어 유지 시도)
+        if len(new_words) < 3 and len(words) > len(new_words):
+             # 기술적 용어 중에서도 의미가 있는 단어는 다시 추가
+             for word in words:
+                 if word.lower() in ["modern", "vessel", "ship", "building", "exterior", "interior"]:
+                     if word not in new_words: new_words.append(word)
+        
+        if len(new_words) > 12: new_words = new_words[:12]
+        clean_base = " ".join(new_words).strip()
+        
+        if not clean_base or clean_base.lower() == "news":
+            clean_base = "business" if not is_korean else "직장인"
+
+        has_other_country = any(country.lower() in clean_base.lower() for country in other_countries)
+        korea_already_present = any(k in clean_base.lower() for k in ["한국", "korea", "south korea"])
+        
+        final_base = clean_base
+        if not has_other_country and not korea_already_present and clean_base:
+            if is_korean: final_base = f"한국 {clean_base}"
+            else: final_base = f"Korea {clean_base}"
+        
+        if not final_base: final_base = "Korea" if not is_korean else "한국"
+                
+        if is_korean:
+            exclude_beauty = ""
+            if any(word in final_base for word in ["지친", "피곤", "야근", "힘든", "스트레스"]):
+                exclude_beauty = " -화장 -모델 -beauty -makeup -cosmetic"
+            search_keyword = f"{final_base}{exclude_beauty} -자막 -워터마크 -출처"
+        else:
+            exclude_beauty = ""
+            if any(word in final_base.lower() for word in ["tired", "exhausted", "stressed", "overwhelmed", "late night"]):
+                exclude_beauty = " -beauty -makeup -cosmetic -model"
+            search_keyword = f"{final_base}{exclude_beauty} -watermark -logo -caption -자막 -워터마크"
+        
+        fallback_base = final_base
+        print(f"[Search] Using refined keyword: {search_keyword}")
+
+    async def try_engine(eng, current_count, current_keyword):
+        if cancel_check and cancel_check():
+            raise InterruptedError("User requested cancellation")
+        eng_results = []
+        # [추가] 검색어가 너무 길거나 복잡하면 결과가 안 나올 수 있으므로, 
+        # 엔진별 특성에 맞춰 키워드 최적화
+        target_keyword = current_keyword
+        if eng in ["bing", "ddg"]:
+            # 빙과 DDG는 부정 검색어(-)가 너무 많으면 결과가 잘 안 나옴 -> 최대 2개로 제한
+            parts = current_keyword.split(" -")
+            if len(parts) > 3:
+                target_keyword = parts[0] + " -" + " -".join(parts[1:3])
+            
+            # [추가] 영문 검색어 우선 (해외 엔진은 영문 검색 결과가 훨씬 풍부함)
+            # 이미 정제된 키워드는 영문일 가능성이 높지만, 한글이 섞여있다면 
+            # 검색 품질 향상을 위해 정리 시도
+        
+        if eng == "bing":
+            eng_results = await assets_downloader.get_bing_images_list(target_keyword, current_count, cancel_check=cancel_check)
+        elif eng == "ddg":
+            try:
+                # [수정] DuckDuckGo도 Playwright 기반으로 전환하여 더 안정적으로 수집
+                eng_results = await assets_downloader.get_duckduckgo_images_list(target_keyword, current_count, cancel_check=cancel_check)
+            except Exception as e:
+                print(f"DDG Search Error: {e}")
+        # [수정] 구글 검색 비활성화 (사용자 요청)
+        # elif eng == "google":
+        #     eng_results = await assets_downloader.get_google_images_list(target_keyword, current_count, cancel_check=cancel_check)
+        return eng_results
+
+    # 1. Primary Engine with Refined Keyword
+    results.extend(await try_engine(engine, count, search_keyword))
+    
+    # 2. Fallbacks if needed
+    # [수정] 구글 제거 (빙/덕덕고만 사용)
+    engines_to_try = ["bing", "ddg"]
+    if engine in engines_to_try:
+        engines_to_try.remove(engine)
+    
+    for fallback_eng in engines_to_try:
+        if len(results) >= count:
+            break
+        needed = count - len(results)
+        print(f"Need {needed} more results. Trying {fallback_eng}...")
+        fallback_results = await try_engine(fallback_eng, needed, search_keyword)
+        if not fallback_results and fallback_base != search_keyword:
+             print(f"Fallback {fallback_eng} failed. Trying fallback base query: {fallback_base}")
+             fallback_results = await try_engine(fallback_eng, needed, fallback_base)
+        results.extend(fallback_results)
+        
+    # 중복 제거 (순서 유지)
+    seen = set()
+    unique_results = []
+    for url in results:
+        if url not in seen:
+            unique_results.append(url)
+            seen.add(url)
+            
+    return unique_results[:count]
+
+def _clean_prompt_text(text):
+    if not text:
+        return ""
+    return " ".join(str(text).replace("\n", " ").split()).strip()
+
+
+def _is_action_driven_scene(text):
+    if not text:
+        return False
+    lower_text = text.lower()
+    english_tokens = [
+        "walking", "checking", "buying", "selling", "moving", "entering", "leaving",
+        "working", "commuters", "workers", "shoppers", "crowd", "queue", "traffic",
+        "loading", "unloading", "operating", "inspecting", "discussing",
+        "inside", "through", "during", "at"
+    ]
+    korean_tokens = [
+        "출근", "퇴근", "이동", "점검", "확인", "검사", "구매", "쇼핑", "운영",
+        "작업", "장면", "모습", "중", "하는", "대기", "통행", "탑승", "하차"
+    ]
+    return any(token in lower_text for token in english_tokens) or any(token in text for token in korean_tokens)
+
+
+def _build_news_broll_scene(description, keyword):
+    normalized_description = _clean_prompt_text(description)
+    normalized_keyword = _clean_prompt_text(keyword)
+    if not normalized_description:
+        normalized_description = normalized_keyword
+    if not normalized_keyword:
+        normalized_keyword = "Seoul, South Korea"
+
+    scene_action = normalized_description
+    
+    # 수정: 무조건 사람을 넣지 않음. 묘사에 사람이 들어갈 때만 행동을 추가. 
+    person_keywords = ["person", "man", "woman", "people", "adult", "worker", "사람", "남성", "여성", "직장인", "군인", "시민"]
+    needs_people = any(pk in scene_action.lower() for pk in person_keywords)
+    
+    if needs_people and not _is_action_driven_scene(scene_action):
+        scene_action = f"People engaging in {normalized_keyword} with natural movement"
+
+    # 수정: 무조건 뉴스룸이나 한국 성인을 강제하지 않고 범용적인 고품질 B-roll 스타일로 변경 
+    base_prompt = (
+        "high quality b-roll footage, cinematic composition, realistic environment, 4k, 8k, "
+        f"subject or location: {normalized_keyword}, "
+        f"scene description: {scene_action}"
+    )
+    
+    return base_prompt
+
+
+def refine_ai_prompt(description, keyword="", style="", model=""): 
+    style_prompt_prefix = f"({style}), " if style else "" 
+    
+    # [유지] 뉴스룸, 기자 등 특정 키워드 강제 제거 
+    news_keywords = [ 
+        "newsroom", "studio", "reporter", "journalist", "anchor", "announcer", 
+        "news desk", "breaking news", "broadcast", "television station", "tv studio", 
+        "news set", "anchor desk", "news ticker", "press conference", 
+        "뉴스룸", "기자", "아나운서", "뉴스 데스크", "방송국", "스튜디오", "앵커", 
+        "기자 회견", "속보", "뉴스 세트" 
+    ] 
+    
+    for nk in news_keywords: 
+        if re.search(r'[a-zA-Z]', nk): 
+            pattern = rf'\b{nk}\b' 
+        else: 
+            pattern = rf'{nk}' 
+        description = re.sub(pattern, '', description, flags=re.IGNORECASE).strip() 
+        if keyword: 
+            keyword = re.sub(pattern, '', keyword, flags=re.IGNORECASE).strip() 
+
+    # [수정] 뉴스룸 억제 구문도 부정어 대신 긍정어(풍경/사물 집중)로 변경 
+    if not any(word in description.lower() for word in ["nature", "landscape", "abstract"]): 
+        description += ", pure documentary scene, natural daily life, real world location" 
+
+    # 🌟 [핵심 수정] "No hands, No POV" 단어를 완전히 삭제하고 "멀리서 찍은 3인칭 샷"을 강제합니다. 
+    if not any(word in description.lower() for word in ["person", "man", "woman", "people", "worker"]): 
+        description += ", wide establishing shot, extreme long shot, distant third-person camera, purely scenic, pure landscape, vast environment, full scene view" 
+    else: 
+        description += ", full body shot, wide angle shot, distant third-person camera, people seen from a distance, natural environment" 
+
+    # [유지] 1인칭 시점을 유발하는 '단어' 자체를 입력값에서 삭제 
+    forbidden_pov_terms = [ 
+        r'\bPOV\b', r'\bfirst person\b', r'\b1st person\b', r'\bpoint of view\b', 
+        r'\bholding\b', r'\btouching\b', r'\bpointing\b', r'\bhands\b', r'\bfingers\b', 
+        r'\barms\b', r'\bhand\b', r'\bfinger\b', r'\barm\b' 
+    ] 
+    for term in forbidden_pov_terms: 
+        description = re.sub(term, '', description, flags=re.IGNORECASE).strip() 
+        keyword = re.sub(term, '', keyword or "", flags=re.IGNORECASE).strip() 
+
+    description = re.sub(r'\s+', ' ', description).replace(', ,', ',').strip() 
+
+    # [수정] 그래프/차트 역시 손 단어를 빼고 '풀 스크린 뷰'를 강조 
+    hard_to_draw_keywords = ["그래프", "차트", "통계", "수익률", "지수", "상승", "하락", "매출", "graph", "chart", "statistics", "revenue", "index", "growth", "data"] 
+    is_hard_to_draw = any(hk in description.lower() for hk in hard_to_draw_keywords) or any(hk in (keyword or "").lower() for hk in hard_to_draw_keywords) 
+    
+    if is_hard_to_draw: 
+        if any(k in description or k in (keyword or "") for k in ["그래프", "chart", "graph", "차트"]): 
+            description = description.replace("그래프", "추상적인 3D 데이터 시각화").replace("graph", "abstract 3D data visualization").replace("chart", "abstract business trend visualization") 
+            description += ", full frame abstract visualization, glowing lines, dark background, highly aesthetic, purely visual, wide establishing shot, full screen visualization ONLY" 
+        
+        if any(k in description or k in (keyword or "") for k in ["돈", "money", "포상금", "수익", "revenue"]): 
+            description = description.replace("돈", "부와 성공을 상징하는 추상적 묘사").replace("money", "abstract representation of wealth").replace("포상금", "award and success") 
+        
+        description += ", highly aesthetic composition, purely visual, wordless, blank surfaces" 
+
+    broll_scene_prompt = _build_news_broll_scene(description, keyword) 
+    
+    person_keywords = ["person", "man", "woman", "girl", "boy", "people", "adult", "politician", "face", "portrait"] 
+    is_person_focused = any(pk in description.lower() for pk in person_keywords) or any(pk in (keyword or "").lower() for pk in person_keywords) 
+    
+    bokeh_effect = "slight depth of field for person emphasis, " if is_person_focused else "sharp focus on entire scene, pure landscape view, " 
+    
+    is_flux = model in ["cloudflare", "flux", "pollinations"] 
+    flux_text_suppression = "" 
+    if is_flux: 
+        # 🌟 [핵심 수정] Flux 모델용 지시어에서도 Hand, POV 단어를 완전히 뺐습니다. 
+        # 또한 텍스트, 간판, 국적 혼동 방지를 위해 한국 국기(Taegeukgi)와 건축양식을 명시합니다.
+        # 한국 외교부 등 특정 건물의 경우, 그 명칭(South Korean Ministry of Foreign Affairs)을 직접 언급하되 텍스트는 빼도록 합니다.
+        flux_text_suppression = ( 
+            "Wide establishing shot, distant third-person camera. Purely visual imagery. " 
+            "NO TEXT, NO LETTERS, NO SIGNAGE, NO WORDS on any surfaces. "
+            "Blank building exterior without any symbols or names. "
+            "South Korean flag (Taegeukgi) visible on a flagpole. "
+            "Modern South Korean architecture, Seoul city background. "
+            "Highly aesthetic scene, textless, purely visual. " 
+        ) 
+
+    # 🌟 [핵심 수정] 배경 설명에서도 부정어 삭제 및 긍정어(넓은 샷)로 대체 
+    korean_identity_boost = ( 
+        "Cinematic wide establishing shot, eye-level perspective, professional documentary photography. " 
+        "Distant camera view, unobstructed foreground, clean composition. " 
+        f"{bokeh_effect}High detail, cinematic lighting, 8k photo, sharp focus." 
+    ) 
+    
+    quality_boost = "realistic skin and materials, natural perspective" 
+    
+    # [유지] 로컬 SD나 Horde 등 네거티브가 먹히는 구형 모델을 위해 네거티브 가중치(1.8) 강화 
+    base_negative = ( 
+        "(hands:1.8), (fingers:1.8), (arms:1.8), (human:1.3), (person:1.3), (interaction:1.5), " 
+        "(POV:1.8), (first person perspective:1.8), (1st person:1.8), (holding:1.8), (point of view:1.8), " 
+        "touching screen, pointing finger, pointing at camera, arms in foreground, hands in foreground, " 
+        "text, words, letters, signage, banners, logos, watermark, labels, " 
+        "Chinese characters, Japanese characters, Kanji, Hanzi, foreign text, " 
+        "numbers, digits, data labels, axis labels, " 
+        "monitor, screen, display, computer, laptop, " 
+        "blurry, distorted, low quality, bad anatomy, " 
+        "sign, placard, poster, protest sign, banner, billboard, flyer, " 
+        "extra limbs, malformed hands, mutated fingers, fused fingers, " 
+        "Chinese architecture, Japanese architecture, Pagoda, Torii gate, " 
+        "Western people, Caucasian features, blonde hair, blue eyes, " 
+        "extra hands, extra fingers, mutated hands, deformed hands, multiple arms, " 
+        "extra limbs, malformed limbs, missing arms, missing legs, " 
+        "fused fingers, too many fingers, long fingers, cloned fingers, " 
+        "low quality, worst quality, blurry, distorted, deformed, bad anatomy" 
+    ) 
+
+    style_lower = style.lower() if style else "" 
+    if "anime" in style_lower or "comic" in style_lower or "illustration" in style_lower: 
+        negative_prompt = base_negative + ", photorealistic, realistic, photograph" 
+    else: 
+        negative_prompt = base_negative + ", cartoon, illustration, drawing, painting, anime, sketch" 
+
+    if is_flux: 
+        refined = f"{flux_text_suppression}, {style_prompt_prefix}{broll_scene_prompt}, {korean_identity_boost}, {quality_boost}" 
+    else: 
+        refined = f"{style_prompt_prefix}{broll_scene_prompt}, {korean_identity_boost}, {quality_boost}" 
+    
+    return f"{refined} --no {negative_prompt}"
+
+
+
+def _split_positive_negative_prompt(prompt):
+    positive = prompt
+    negative = ""
+    if " --no " in prompt:
+        parts = prompt.split(" --no ", 1)
+        positive = parts[0]
+        negative = parts[1]
+    return positive, negative
+
+
+_ZIMAGE_PIPELINE = None
+_ZIMAGE_MODEL_ID = None
+
+
+def generate_image_zimage(prompt, output_path, model_id="Tongyi-MAI/Z-Image-Turbo", width=1280, height=720, seed=None, steps=9):
+    try:
+        import torch
+        from diffusers import ZImagePipeline
+    except Exception as e:
+        print(f"Z-Image dependencies unavailable: {e}")
+        return None
+
+    if not torch.cuda.is_available():
+        print("Z-Image requires CUDA GPU.")
+        return None
+
+    global _ZIMAGE_PIPELINE, _ZIMAGE_MODEL_ID
+    try:
+        if _ZIMAGE_PIPELINE is None or _ZIMAGE_MODEL_ID != model_id:
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+            # ModelScope를 통한 다운로드 시도 (HuggingFace 우회)
+            try:
+                from modelscope import snapshot_download
+                print(f"Attempting to download {model_id} from ModelScope...")
+                model_dir = snapshot_download(model_id)
+                print(f"Model downloaded from ModelScope to: {model_dir}")
+                load_path = model_dir
+            except Exception as ms_e:
+                print(f"ModelScope download failed or not installed: {ms_e}. Falling back to default loader.")
+                load_path = model_id
+
+            _ZIMAGE_PIPELINE = ZImagePipeline.from_pretrained(
+                load_path,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=False
+            )
+            _ZIMAGE_PIPELINE.to("cuda")
+            _ZIMAGE_MODEL_ID = model_id
+
+        positive, negative = _split_positive_negative_prompt(prompt)
+        if seed is None:
+            seed = random.randint(1, 1000000)
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        call_args = {
+            "prompt": positive,
+            "width": width,
+            "height": height,
+            "num_inference_steps": steps,
+            "guidance_scale": 0.0,
+            "generator": generator
+        }
+        if negative:
+            call_args["negative_prompt"] = negative
+
+        try:
+            result = _ZIMAGE_PIPELINE(**call_args)
+        except TypeError:
+            call_args.pop("negative_prompt", None)
+            result = _ZIMAGE_PIPELINE(**call_args)
+
+        image = result.images[0]
+        image.save(output_path)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            print(f"Generated with Z-Image - Saved to {output_path}")
+            return output_path
+        print("Z-Image output too small.")
+    except Exception as e:
+        print(f"Z-Image generation failed: {e}")
+    return None
+
+def generate_image_local_sd(prompt, output_path, sd_url="http://127.0.0.1:7860", width=1280, height=720):
+    """
+    Local Stable Diffusion (Automatic1111) API
+    """
+    try:
+        # 프롬프트에서 --no 뒷부분 분리 (네거티브 프롬프트)
+        positive, negative = _split_positive_negative_prompt(prompt)
+
+        payload = {
+            "prompt": positive,
+            "negative_prompt": negative,
+            "steps": 25, # 품질 위해 스텝 수 증가
+            "width": width,
+            "height": height,
+            "sampler_name": "DPM++ 2M Karras", # 더 좋은 샘플러
+            "cfg_scale": 7,
+            "seed": -1 # Random seed
+        }
+        response = requests.post(f"{sd_url}/sdapi/v1/txt2img", json=payload, timeout=60)
+        if response.status_code == 200:
+            r = response.json()
+            image_data = base64.b64decode(r['images'][0])
+            with open(output_path, 'wb') as f:
+                f.write(image_data)
+            print("Generated with Local SD")
+            return output_path
+    except Exception as e:
+        print(f"Local SD failed: {e}")
+    return None
+
+def generate_image_cloudflare(prompt, output_path, account_id, api_token, width=1024, height=768):
+    """
+    Cloudflare Workers AI (Requires Account ID & API Token)
+    Upgraded to Flux-1-Schnell for higher quality
+    """
+    try:
+        if not account_id or not api_token:
+            print("Cloudflare credentials missing.")
+            return None
+
+        # Upgraded model from SDXL to Flux-1-Schnell
+        model = "@cf/black-forest-labs/flux-1-schnell"
+        print(f"Requesting Cloudflare AI ({model})...")
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+
+        # Split negative prompt if present
+        positive, negative = _split_positive_negative_prompt(prompt)
+
+        payload = {
+            "prompt": positive,
+            "num_steps": 4,  # Flux Schnell is optimized for 4 steps
+            "width": width,
+            "height": height
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=90)
+
+        if response.status_code == 200:
+            # Flux-1-Schnell via Cloudflare returns a JSON with image data or binary
+            # Check response content type
+            if "application/json" in response.headers.get("Content-Type", ""):
+                result = response.json()
+                if "result" in result and "image" in result["result"]:
+                    import base64
+                    image_data = base64.b64decode(result["result"]["image"])
+                    with open(output_path, "wb") as f:
+                        f.write(image_data)
+                else:
+                    print(f"Cloudflare Flux output unexpected format: {result}")
+                    return None
+            else:
+                # Binary response
+                with open(output_path, "wb") as f:
+                    f.write(response.content)
+
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                print(f"Generated with Cloudflare Flux - Saved to {output_path}")
+                return output_path
+            else:
+                print("Cloudflare output too small.")
+        else:
+            print(f"Cloudflare AI failed: {response.status_code} - {response.text}")
+
+    except Exception as e:
+        print(f"Cloudflare AI error: {e}")
+
+    return None
+
+def generate_image_pollinations(prompt, output_path, seed=None, width=1280, height=720):
+    """
+    Pollinations.ai (Free API) - Uses official python library if available, else requests
+    """
+    # 1. Try using the official library first (More reliable)
+    if pollinations:
+        try:
+            # Split negative prompt if present
+            final_prompt = prompt
+            negative = None
+            if " --no " in prompt:
+                parts = prompt.split(" --no ")
+                final_prompt = parts[0]
+                negative = parts[1]
+
+            if seed is None:
+                seed = random.randint(1, 100000)
+
+            # Try flux first, if fails, try turbo
+            models_to_try = ["flux", "turbo"]
+
+            for model_name in models_to_try:
+                try:
+                    print(f"Generating with Pollinations Lib (Model: {model_name})...")
+                    image_obj = pollinations.Image(
+                        prompt=final_prompt,
+                        negative=negative,
+                        model=model_name,
+                        width=width,
+                        height=height,
+                        seed=seed
+                    )
+
+                    # Check if it saved to a file
+                    generated_file = getattr(image_obj, 'file', None)
+                    # print(f"Pollinations Lib ({model_name}) generated file path: {generated_file}")
+
+                    if generated_file and os.path.exists(generated_file):
+                        # Move/Rename to output_path
+                        if os.path.exists(output_path):
+                            os.remove(output_path)
+                        os.rename(generated_file, output_path)
+                        print(f"Generated with Pollinations (Lib/{model_name}) - Saved to {output_path}")
+                        return output_path
+                    elif hasattr(image_obj, 'save'):
+                        image_obj.save(output_path)
+                        if os.path.exists(output_path):
+                            print(f"Generated with Pollinations (Lib/{model_name}/Save) - Saved to {output_path}")
+                            return output_path
+
+                    print(f"Pollinations Lib ({model_name}) failed to create file.")
+
+                except Exception as e:
+                    print(f"Pollinations Library ({model_name}) failed: {e}")
+
+            print("All Pollinations Lib models failed. Falling back to requests...")
+
+        except Exception as e:
+            print(f"Pollinations Library logic failed: {e}. Falling back to requests...")
+
+    # 2. Fallback to Requests (Old method)
+    try:
+        # 1. Clean up prompt
+        final_prompt = prompt
+        negative = ""
+        if " --no " in prompt:
+            parts = prompt.split(" --no ")
+            final_prompt = parts[0]
+            negative = parts[1]
+
+        safe_prompt = requests.utils.quote(final_prompt)
+        safe_negative = requests.utils.quote(negative)
+
+        if seed is None:
+            seed = random.randint(1, 100000)
+
+        # 2. Construct URL
+        # Try flux first, then turbo
+        models = ["flux", "turbo"]
+
+        for model in models:
+            try:
+                # Base URL
+                url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width={width}&height={height}&seed={seed}&nologo=true&model={model}"
+                if negative:
+                     url += f"&negative={safe_negative}"
+
+                # 3. Request
+                print(f"Requesting Pollinations (Web/{model}): {url[:100]}...")
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Referer': 'https://pollinations.ai/',
+                    'Origin': 'https://pollinations.ai'
+                }
+
+                # Increase timeout to 60s for Flux
+                response = requests.get(url, headers=headers, timeout=60)
+
+                if response.status_code == 200:
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'image' in content_type:
+                        with open(output_path, "wb") as f:
+                            f.write(response.content)
+
+                        # Check file size
+                        if os.path.getsize(output_path) > 1000:
+                            print(f"Generated with Pollinations ({model}) - Saved to {output_path}")
+                            return output_path
+                        else:
+                            print(f"Pollinations output too small: {os.path.getsize(output_path)} bytes")
+                    else:
+                        print(f"Pollinations returned non-image: {content_type}")
+                elif response.status_code == 530:
+                     print(f"Pollinations ({model}) failed with status 530 (Server Error/Blocked). Skipping other models.")
+                     break # Skip other models if server is blocking/down
+                else:
+                    print(f"Pollinations ({model}) failed with status {response.status_code}")
+            except Exception as e:
+                 print(f"Pollinations ({model}) error: {e}")
+
+    except Exception as e:
+        print(f"Pollinations failed: {e}")
+
+    return None
+
+def generate_image_ai_horde(prompt, output_path, width=1024, height=768):
+    """
+    AI Horde (Free, Distributed) - Fallback
+    """
+    try:
+        # Check for Anonymous Key
+        api_key = "0000000000" # Anonymous key
+        is_anonymous = api_key == "0000000000"
+
+        # Adjust resolution for Anonymous usage to avoid Kudos requirements
+        # Limit max dimension to ~768 if anonymous
+        if is_anonymous:
+            max_dim = 768
+            if width > max_dim or height > max_dim:
+                ratio = width / height
+                if width > height:
+                    width = max_dim
+                    height = int(max_dim / ratio)
+                else:
+                    height = max_dim
+                    width = int(max_dim * ratio)
+                print(f"Resized for AI Horde (Anonymous): {width}x{height}")
+
+        # AI Horde requires width/height to be multiples of 64
+        # Use rounding to nearest 64
+        width = int((width + 32) // 64) * 64
+        height = int((height + 32) // 64) * 64
+
+        # Ensure minimum size
+        if width < 64: width = 64
+        if height < 64: height = 64
+
+        headers = {
+            "apikey": api_key, 
+            "Client-Agent": "AutoVideoSystem:v1.0:unknown",
+            "Content-Type": "application/json"
+        }
+
+        # Split negative prompt
+        positive = prompt
+        negative = ""
+        if " --no " in prompt:
+            parts = prompt.split(" --no ")
+            positive = parts[0]
+            negative = parts[1]
+
+        # Construct payload
+        # Note: 'models' can be left empty to allow any model, or specify generic ones
+        # We use a safe list or specific reliable models if needed. 
+        # For now, let's try with empty models list to maximize worker availability, 
+        # or use "stable_diffusion" which is a category.
+
+        payload = {
+            "prompt": f"{positive} ### {negative}" if negative else positive,
+            "params": {
+                "steps": 20, # Reduced steps for speed
+                "n": 1,
+                "width": width,
+                "height": height,
+                "cfg_scale": 7.0,
+                "sampler_name": "k_dpmpp_2m",
+                "karras": True
+            },
+            "nsfw": False,
+            "censor_nsfw": True,
+            "trusted_workers": False,
+            "models": [], # Allow any model for faster pickup
+            "r2": True 
+        }
+
+        print(f"Requesting AI Horde: {width}x{height}...")
+        req = requests.post("https://stablehorde.net/api/v2/generate/async", json=payload, headers=headers)
+
+        if req.status_code != 202:
+            print(f"AI Horde Request Failed: {req.status_code} - {req.text}")
+            return None
+
+        uuid = req.json()['id']
+        print(f"AI Horde Job ID: {uuid}. Waiting for generation...")
+
+        # 2. Polling for result
+        start_time = time.time()
+        while time.time() - start_time < 180: # Increased to 3 minutes
+            time.sleep(5)
+            try:
+                check_url = f"https://stablehorde.net/api/v2/generate/check/{uuid}"
+                check = requests.get(check_url)
+
+                if check.status_code != 200:
+                    continue
+
+                check_data = check.json()
+
+                if check_data['done']:
+                    status_url = f"https://stablehorde.net/api/v2/generate/status/{uuid}"
+                    status = requests.get(status_url)
+
+                    if status.status_code != 200:
+                        print(f"AI Horde Status Failed: {status.status_code}")
+                        break
+
+                    gens = status.json().get('generations', [])
+                    if gens:
+                        img_url = gens[0]['img']
+                        print(f"Downloading Horde Image: {img_url}")
+                        img_resp = requests.get(img_url)
+                        if img_resp.status_code == 200:
+                            with open(output_path, "wb") as f:
+                                f.write(img_resp.content)
+                            print(f"Generated with AI Horde - Saved to {output_path}")
+                            return output_path
+                    else:
+                         print("AI Horde returned no generations.")
+                    break
+
+                # print(f"Horde Status: {check_data.get('wait_time', 'unknown')}s remaining...")
+
+            except Exception as e:
+                print(f"AI Horde Polling Error: {e}")
+                time.sleep(2)
+
+    except Exception as e:
+        print(f"AI Horde failed: {e}")
+    return None
+
+
+
+def download_visual_content(scene, index, output_dir=None, cancel_check=None):
+    """
+    기존 단일 이미지 생성 함수 (렌더링용)
+    """
+    if cancel_check and cancel_check():
+        raise InterruptedError("User requested cancellation")
+    # Ensure directories exist
+    if output_dir:
+        bg_dir = output_dir
+    else:
+        bg_dir = os.path.join(get_asset_dir(), "backgrounds")
+    os.makedirs(bg_dir, exist_ok=True)
+
+    config = load_config()
+    scene_type = scene.get('type', 'ai_image')
+    keyword = scene.get('keyword', 'news background')
+    description = scene.get('description', keyword)
+
+    # --- 1. Graph Generation ---
+    if scene_type == 'graph':
+        graph_data = scene.get('data', {})
+        if graph_data and isinstance(graph_data, dict):
+            path = os.path.join(bg_dir, f"bg_{index}_graph.png")
+            result = create_graph_image(graph_data, keyword, path)
+            if result:
+                return result
+        print(f"Graph generation failed or no data. Fallback to AI image.")
+        scene_type = 'ai_image'
+
+    # --- 2. Search (Web) ---
+    if scene_type == 'search':
+        if cancel_check and cancel_check():
+            raise InterruptedError("User requested cancellation")
+        # 2-1. Web Search
+        web_image_url = search_web_image(keyword, cancel_check=cancel_check)
+        if web_image_url:
+            try:
+                path = os.path.join(bg_dir, f"bg_{index}_web.jpg")
+                response = requests.get(web_image_url, timeout=10)
+                if response.status_code == 200:
+                    with open(path, "wb") as f:
+                        f.write(response.content)
+                    return path
+            except Exception as e:
+                print(f"Web image download failed: {e}")
+
+        print("Search failed. Fallback to AI image.")
+        scene_type = 'ai_image'
+
+    # --- 3. AI Image Generation ---
+    prompt_base = description if len(description) > len(keyword) else keyword
+    
+    img_conf = config.get('image_gen', {})
+    
+    # Determine model first to pass to refine_ai_prompt
+    model_type = "pollinations"
+    if img_conf.get('use_zimage', False): model_type = "zimage"
+    elif img_conf.get('use_cloudflare', False): model_type = "cloudflare"
+    elif img_conf.get('use_local_sd', False): model_type = "local_sd"
+    elif img_conf.get('use_ai_horde', False): model_type = "horde"
+    
+    refined_prompt = refine_ai_prompt(prompt_base, keyword, model=model_type)
+
+    if img_conf.get('use_zimage', False):
+        path = os.path.join(bg_dir, f"bg_{index}_zimage.jpg")
+        zimage_model_id = img_conf.get('zimage_model_id', "Tongyi-MAI/Z-Image-Turbo")
+        zimage_steps = int(img_conf.get('zimage_steps', 9))
+        res = generate_image_zimage(refined_prompt, path, model_id=zimage_model_id, width=1280, height=720, steps=zimage_steps)
+        if res: return res
+
+    if img_conf.get('use_cloudflare', False):
+        path = os.path.join(bg_dir, f"bg_{index}_cf.jpg")
+        res = generate_image_cloudflare(refined_prompt, path, img_conf.get('cloudflare_account_id'), img_conf.get('cloudflare_api_token'))
+        if res: return res
+        
+    if img_conf.get('use_local_sd', False):
+        path = os.path.join(bg_dir, f"bg_{index}_local.jpg")
+        res = generate_image_local_sd(refined_prompt, path, img_conf.get('local_sd_url', "http://127.0.0.1:7860"))
+        if res: return res
+
+    if img_conf.get('use_pollinations', True):
+        path = os.path.join(bg_dir, f"bg_{index}_pollinations.jpg")
+        res = generate_image_pollinations(refined_prompt, path)
+        if res: return res
+
+    if img_conf.get('use_ai_horde', True):
+        path = os.path.join(bg_dir, f"bg_{index}_horde.jpg")
+        res = generate_image_ai_horde(refined_prompt, path)
+        if res: return res
+
+    return None
+
+
+async def generate_scene_candidates(scene, index, project_id="default", ai_count=1, search_count=5, generate_ai=True, generate_search=True, width=1280, height=720, style="", ai_model="pollinations", search_engine="bing", topic="", visual_guide="", cancel_check=None):
+    """
+    UI 미리보기용으로 AI 후보(ai_count)와 검색 후보(search_count)를 생성/수집하여 반환합니다.
+    """
+    if cancel_check and cancel_check():
+        raise InterruptedError("User requested cancellation")
+
+    # 프로젝트별 하위 폴더 생성하여 이미지 충돌 방지
+    preview_base = os.path.join(get_asset_dir(), "previews")
+    preview_dir = os.path.join(preview_base, project_id)
+    os.makedirs(preview_dir, exist_ok=True)
+
+    config = load_config()
+    img_conf = config.get('image_gen', {})
+    
+    # [수정] 장면 번호나 불필요한 수식어 제거
+    keyword = clean_keyword(scene.get('keyword', 'news'))
+    description = clean_keyword(scene.get('description', keyword))
+    
+    # [추가] 주제어(topic)와 비주얼 가이드(visual_guide) 정제
+    clean_topic = clean_keyword(topic) if topic else ""
+    # visual_guide에서 original keyword만 추출 시도 (괄호 안의 내용 등)
+    clean_visual = visual_guide
+    if visual_guide and "(" in visual_guide and ")" in visual_guide:
+        # "Original: (Keyword)" 패턴 대응
+        match = re.search(r'\((.*?)\)', visual_guide)
+        if match:
+            clean_visual = match.group(1)
+    clean_visual = clean_keyword(clean_visual) if clean_visual else ""
+
+    selected_ai_model = ai_model
+    if selected_ai_model == "pollinations" and img_conf.get('use_zimage', False) and not img_conf.get('use_pollinations', True):
+        selected_ai_model = "zimage"
+
+    candidates = {'ai': [], 'search': [], 'graph': []}
+
+    # 0. Graph Candidate (if data exists)
+    if 'data' in scene and scene['data']:
+         try:
+            # 1. Light Theme
+            path1 = os.path.join(preview_dir, f"scene_{index}_graph_light.png")
+            result1 = create_graph_image(scene['data'], keyword, path1, theme='light')
+            if result1:
+                candidates['graph'].append(result1)
+
+            # 2. Dark Theme
+            path2 = os.path.join(preview_dir, f"scene_{index}_graph_dark.png")
+            result2 = create_graph_image(scene['data'], keyword, path2, theme='dark')
+            if result2:
+                candidates['graph'].append(result2)
+         except Exception as e:
+            print(f"Graph gen error: {e}")
+
+    # [수정] 장면 번호나 불필요한 수식어 제거 (AI 프롬프트용)
+    keyword = clean_keyword(scene.get('keyword', 'news'))
+    description = clean_keyword(scene.get('description', keyword))
+
+    # 1. AI Image Candidates
+    if generate_ai:
+        for i in range(ai_count):
+            if cancel_check and cancel_check():
+                raise InterruptedError("User requested cancellation")
+            # 파일명에 시드나 랜덤값을 추가하여 갱신 시 새로운 이미지가 보이도록 유도
+            seed = random.randint(1, 1000000)
+            path = os.path.join(preview_dir, f"scene_{index}_ai_{i}_{seed}.jpg")
+
+            refined = refine_ai_prompt(description, keyword, style, model=selected_ai_model)
+
+            res = None
+            if selected_ai_model == "pollinations":
+                res = generate_image_pollinations(refined, path, seed=seed, width=width, height=height)
+            elif selected_ai_model == "zimage":
+                zimage_model_id = img_conf.get('zimage_model_id', "Tongyi-MAI/Z-Image-Turbo")
+                zimage_steps = int(img_conf.get('zimage_steps', 9))
+                res = generate_image_zimage(refined, path, model_id=zimage_model_id, width=width, height=height, seed=seed, steps=zimage_steps)
+            elif selected_ai_model in ("local", "local_sd"):
+                res = generate_image_local_sd(refined, path, img_conf.get('local_sd_url', "http://127.0.0.1:7860"), width=width, height=height)
+            elif selected_ai_model == "cloudflare":
+                cf_acc = img_conf.get('cloudflare_account_id')
+                cf_token = img_conf.get('cloudflare_api_token')
+                res = generate_image_cloudflare(refined, path, cf_acc, cf_token, width=width, height=height)
+            elif selected_ai_model == "horde":
+                res = generate_image_ai_horde(refined, path, width=width, height=height)
+
+            if not res and selected_ai_model != "pollinations":
+                res = generate_image_pollinations(refined, path, seed=seed, width=width, height=height)
+
+            if res:
+                candidates['ai'].append(res)
+            else:
+                 print(f"Failed to generate AI image for scene {index}, iteration {i} (All methods failed)")
+
+    # 2. Search Candidates
+    if generate_search:
+        # [수정] 검색용 키워드는 너무 과하게 정제하면 핵심 단어(지하철, 출근길 등)가 사라질 수 있음
+        # [개편] 사용자 요청: TOPIC과 Visual Guide(original keyword) 우선 사용
+        raw_keyword = scene.get('keyword', '')
+        desc = scene.get('description', '')
+        
+        # 0. 우선순위: topic + visual_guide 조합
+        if clean_topic or clean_visual:
+            # topic과 visual에서 핵심 단어만 추출 (중복 제거)
+            combined_words = []
+            for text in [clean_topic, clean_visual]:
+                if not text: continue
+                for w in text.split():
+                    if w.lower() not in [x.lower() for x in combined_words] and len(w) > 1:
+                        combined_words.append(w)
+            
+            search_base = " ".join(combined_words[:5])
+            print(f"[Search] Using Topic/Visual based keywords: {search_base}")
+        else:
+            # 기존 추출 로직 (fallback)
+            # Montage: 접두어 제거 및 문장 정리
+            desc_clean = re.sub(r'^Montage:\s*', '', desc, flags=re.I)
+            
+            # 1. 인물(Who) 추출 - 더 유연한 패턴으로 개선 (Korean 위치 상관없이 추출)
+            # 먼저 인물 유형(Role)을 추출
+            roles = r'(middle\s*age|adult|woman|man|lady|gentleman|office\s+worker|child|parent|elderly|family|elder|senior|grandparent|grandmother|grandfather|중년|성인|여성|남성|직장인|사람|아이|부모|노인|할머니|할아버지|가족)'
+            role_matches = re.findall(roles, f"{raw_keyword} {desc_clean}", re.I)
+            
+            # 중복 제거 및 "Korean" 접두어 부여
+            who_list = []
+            is_korean_context = bool(re.search(r'(Korean|한국|서울|South\s*Korea)', f"{raw_keyword} {desc_clean}", re.I))
+            
+            for r in role_matches:
+                r_clean = r.strip()
+                if not r_clean: continue
+                
+                # "Korean" 접두어가 없으면 붙여줌 (한국 맥락인 경우)
+                if is_korean_context and not re.search(r'(Korean|한국)', r_clean, re.I):
+                    # 영문인 경우 Korean 붙임, 한글인 경우 한국 붙임
+                    if re.search(r'[a-zA-Z]', r_clean):
+                        r_clean = f"Korean {r_clean}"
+                    else:
+                        r_clean = f"한국 {r_clean}"
+                
+                if r_clean.lower() not in [x.lower() for x in who_list]:
+                    who_list.append(r_clean)
+            
+            # [수정] elderly(노인), parent(부모), middle age(중년) 키워드가 있으면 우선순위를 높임
+            priority_keywords = ['elderly', 'parent', 'middle', 'senior', 'grand', '노인', '부모', '중년', '할머니', '할아버지']
+            who_list.sort(key=lambda x: any(pk in x.lower() for pk in priority_keywords), reverse=True)
+            
+            who = " ".join(who_list[:4]) # 인물 키워드 추출 개수 확대
+            
+            # 2. 장소(Where) 추출 - 더 포괄적인 패턴으로 확장
+            where_pattern = r'(office|subway|street|home|desk|park|table|kitchen|city|seoul|korea|building|skyscraper|사무실|지하철|거리|집|책상|공원|식탁|주방|서울|한국|빌딩|건물)s?'
+            where_matches = re.findall(where_pattern, f"{raw_keyword} {desc_clean}", re.I)
+            where_list = []
+            for w in where_matches:
+                if w.lower() not in [x.lower() for x in where_list]: where_list.append(w)
+            where = " ".join(where_list[:3])
+            
+            # 3. 상황/감정(What/How) 추출 - 더 포괄적인 패턴으로 확장
+            how_pattern = r'(tired|exhausted|stressed|overwhelmed|night|dark|glowing|emergency|situation|disengaged|burden|studying|walking|looking|bill|role|지친|피곤한|힘든|야근|야경|긴급|상황|스트레스|부담|공부|산책|보는|고지서|역할)s?'
+            how_matches = re.findall(how_pattern, f"{raw_keyword} {desc_clean}", re.I)
+            how_list = []
+            for h in how_matches:
+                if h.lower() not in [x.lower() for x in how_list]: how_list.append(h)
+            how = " ".join(how_list[:5]) # 상황 키워드 비중 확대
+            
+            # 핵심 키워드 조합 (Who + Where + How)
+            combined_base = f"{who} {where} {how}".strip()
+            
+            # [추가] 추출된 키워드가 너무 부실하거나 (예: "office" 한 단어) 특정 핵심 단어가 누락된 경우 보완
+            # 특히 "Seoul", "skyline", "night", "city" 등 풍경/도시 관련 키워드 보존
+            if len(combined_base.split()) < 2 or (len(combined_base.split()) < 3 and "office" in combined_base.lower()) or "skyline" in f"{raw_keyword} {desc_clean}".lower():
+                # 장소/상황 관련 추가 패턴
+                extra_pattern = r'(skyline|cityscape|landscape|night\s*view|building|skyscraper|emergency|situation|야경|도시|풍경|긴급|상황|office\s*windows|dramatic\s*lighting)s?'
+                extra_matches = re.findall(extra_pattern, f"{raw_keyword} {desc_clean}", re.I)
+                extra_list = []
+                for ex in extra_matches:
+                    if ex.lower() not in [x.lower() for x in extra_list]: extra_list.append(ex)
+                
+                if extra_list:
+                    # 기존 combined_base와 합치되 중복 제거
+                    for item in extra_list:
+                        if item.lower() not in combined_base.lower():
+                            combined_base = f"{combined_base} {item}".strip()
+
+            # 영문 변환 (검색 엔진 최적화)
+            if combined_base:
+                # 한글이 포함되어 있다면 영문 핵심 키워드로 변환 시도 (이미지 검색 품질 향상)
+                translation_map = {
+                    "한국 여성": "Korean woman", "한국 남성": "Korean man", "직장인": "office worker",
+                    "사무실": "office", "지하철": "subway", "야근": "night work", "지친": "tired", "피곤한": "exhausted",
+                    "아이": "child", "부모": "parents", "노인": "elderly", "성인": "adult", "가족": "family",
+                    "공원": "park", "식탁": "table", "공부": "studying", "산책": "walking", "부담": "burden", "고지서": "bills",
+                    "중년": "middle aged", "역할": "role", "할머니": "grandmother", "할아버지": "grandfather",
+                    "노인": "senior", "어르신": "elderly", "야경": "night view", "도시": "city", "풍경": "landscape",
+                    "긴급": "emergency", "상황": "situation"
+                }
+                for ko, en in translation_map.items():
+                    combined_base = combined_base.replace(ko, en)
+                
+                search_base = combined_base
+            else:
+                # 위 패턴으로 추출 실패 시 기존 방식(앞 6단어) 사용하되 불용어 제거
+                clean_text = re.sub(r'\b(of|a|the|an|is|are|at|in|on|with|by|from)\b', '', f"{raw_keyword} {desc_clean}", flags=re.I).strip()
+                # Montage 같은 단어 제거
+                clean_text = re.sub(r'\b(Montage|Scene|Shot)\b', '', clean_text, flags=re.I).strip()
+                search_base = " ".join(clean_text.split()[:6])
+
+        if not search_base or search_base.lower() in ['news', 'none']:
+            search_base = "Korean office worker tired"
+        
+        # [수정] 너무 짧으면 추가 보강
+        if len(search_base.split()) < 3:
+            # 감정/장소 단어만 살짝 보강
+            emotion_pattern = r'([가-힣]{2,}(?:한|된|은|는)|tired|exhausted|stressed|burden|struggling)'
+            context_pattern = r'([가-힣]{2,}(?:역|실|길|장|처)|subway|office|street|park|home)'
+            
+            emotions = re.findall(emotion_pattern, desc_clean)
+            contexts = re.findall(context_pattern, desc_clean)
+            
+            added_terms = []
+            for emo in emotions[:1]:
+                if emo not in search_base: added_terms.append(emo)
+            for ctx in contexts[:1]:
+                if ctx not in search_base: added_terms.append(ctx)
+                
+            if added_terms:
+                search_base = f"{search_base} {' '.join(added_terms)}"
+
+        # " - " (공백 포함 대시)만 분리하여 부가 정보 제거
+        search_base = search_base.split(' - ')[0].replace(',', ' ').strip()
+        
+        # [추가] 중복 단어 제거 (예: "Korean woman Korean woman")
+        search_base_words = []
+        for w in search_base.split():
+            if w.lower() not in [x.lower() for x in search_base_words]:
+                search_base_words.append(w)
+        search_base = " ".join(search_base_words)
+        
+        if not search_base or search_base.lower() == 'news':
+            # description에서 최소한의 키워드만 추출 시도 (뉴스 대신 더 구체적인 키워드)
+            desc = scene.get('description', 'news')
+            search_base = clean_keyword(desc)
+            if not search_base or search_base.lower() == 'news':
+                # 여전히 news면 description의 첫 3개 단어라도 사용
+                search_base = " ".join(desc.split()[:3])
+
+        # Determine language
+        is_korean = bool(re.search(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', search_base))
+        
+        if is_korean:
+            # 한국어/영어 모두 Bing 최우선 (사용자 요청: Google/Naver 제거)
+            search_engine = "bing"
+            # [수정] 무조건 한글로 정제 (사용자 요청) + 강력한 부정어 추가 (손, 인체 등)
+            search_keyword = f"{search_base} -자막 -워터마크 -손 -손가락 -팔 -사람 -인물 -기자 -뉴스룸 -스튜디오"
+        else:
+            # 영어여도 Bing/DDG를 위해 한국어 정제어 추가 + 강력한 부정어 추가
+            search_engine = "bing"
+            search_keyword = f"{search_base} -hands -fingers -arms -human -person -reporter -newsroom -studio -자막 -워터마크"
+        
+        # [추가] 데이터 시각화나 추상적 이미지인 경우 부정어 강화
+        if any(word in search_base.lower() for word in ["data", "visualization", "graph", "chart", "abstract", "network", "digital"]):
+            search_keyword += " -interaction -touching -pointing -monitor -screen"
+        
+        print(f"[Search] Scene {index} - Original Keyword: {scene.get('keyword')}")
+        print(f"[Search] Scene {index} - Base Query: {search_base}")
+        print(f"[Search] Enhanced search query for scene {index}: {search_keyword} using {search_engine}")
+        
+        # [수정] 한국어/영어 모두 구글을 기본으로, 사용자 요청에 따라 정제된 키워드 사용
+        res_list = await search_web_images_list(search_keyword, count=search_count, engine=search_engine, cancel_check=cancel_check)
+
+        # Download the images to local preview dir
+        for idx, img_url in enumerate(res_list):
+            if cancel_check and cancel_check():
+                raise InterruptedError("User requested cancellation")
+            try:
+                # Basic validation of URL (Allow http and data:image/)
+                if not img_url or (not img_url.startswith("http") and not img_url.startswith("data:image/")):
+                    continue
+
+                ext = "jpg"
+                if ".png" in img_url: ext = "png"
+                elif ".webp" in img_url: ext = "webp"
+                elif "data:image/png" in img_url: ext = "png"
+                elif "data:image/webp" in img_url: ext = "webp"
+
+                import time
+                import uuid
+                
+                # Use timestamp and short UUID for uniqueness to avoid browser caching
+                unique_id = f"{int(time.time())}_{uuid.uuid4().hex[:4]}"
+                path = os.path.join(preview_dir, f"scene_{index}_search_{idx}_{unique_id}.{ext}")
+
+                print(f"[Search] Processing candidate {idx} for scene {index}: {img_url[:60]}...")
+                
+                if img_url.startswith("data:image/"):
+                    # Handle Base64 image
+                    try:
+                        header, data = img_url.split(",", 1)
+                        image_data = base64.b64decode(data)
+                        with open(path, "wb") as f:
+                            f.write(image_data)
+                        candidates['search'].append(path)
+                        print(f"[Search] Successfully saved base64 candidate {idx}")
+                    except Exception as b64e:
+                        print(f"[Search] Base64 decode error for candidate {idx}: {b64e}")
+                else:
+                    # Download with timeout and User-Agent (to avoid blocking)
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                        "Referer": "https://www.bing.com/" # Bing 출처인 척 하여 hotlinking 방지 우회 시도
+                    }
+                    try:
+                        response = requests.get(img_url, timeout=7, headers=headers)
+                        if response.status_code == 200:
+                            with open(path, "wb") as f:
+                                f.write(response.content)
+                            
+                            # Store as dictionary with timestamp for cache busting if needed
+                            candidates['search'].append(path)
+                        else:
+                            print(f"[Search] Failed to download candidate {idx}: HTTP {response.status_code} for {img_url[:60]}")
+                            
+                            # [추가] 원본 다운로드 실패 시 썸네일 URL이라도 시도 (Bing 등에서 원본 링크가 깨진 경우 대비)
+                            # 썸네일 URL은 보통 assets_downloader에서 함께 가져오지 않으므로, 
+                            # 현재는 로깅만 하고 추후 assets_downloader 구조 변경 시 연동 가능
+                    except requests.exceptions.Timeout:
+                        print(f"[Search] Timeout downloading candidate {idx}: {img_url[:60]}")
+                    except Exception as download_err:
+                        print(f"[Search] Error downloading candidate {idx}: {download_err}")
+            except Exception as e:
+                print(f"Search image download error for scene {index}, candidate {idx}: {e}")
+
+    return candidates
+
+def get_visual_source(scene_or_keyword):
+    # Backward compatibility
+    if isinstance(scene_or_keyword, dict):
+        scene = scene_or_keyword
+        keyword = scene.get('keyword', 'news')
+    else:
+        keyword = scene_or_keyword
+        scene = {'type': 'ai_image', 'keyword': keyword}
+
+    # Just return one candidate using download_visual_content
+    # Use hash for cache
+    hash_key = hashlib.md5(f"{keyword}".encode('utf-8')).hexdigest()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    preview_dir = os.path.join(base_dir, "assets", "previews")
+    return download_visual_content(scene, hash_key, output_dir=preview_dir)
