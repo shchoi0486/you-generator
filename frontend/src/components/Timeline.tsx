@@ -23,7 +23,7 @@ import {
   Wand2
 } from 'lucide-react';
 import { motion } from 'framer-motion';
-import { type AppContent, type SceneCandidates, type ScriptItem } from '../services/api';
+import { type AppContent, type SceneCandidates, type ScriptItem, assetUrl } from '../services/api';
 
 interface TimelineItemProps {
   id: string | number;
@@ -252,6 +252,7 @@ interface TimelineProps {
   setCurrentTime: (time: number) => void;
   srtData: { id: number; start: number; end: number; text: string }[];
   setSrtData: React.Dispatch<React.SetStateAction<{ id: number; start: number; end: number; text: string }[]>>;
+  setSrtScriptSig: (sig: string | null) => void;
   setEditingSrtId: (id: number | null) => void;
   content: AppContent | null;
   setContent: React.Dispatch<React.SetStateAction<AppContent | null>>;
@@ -271,8 +272,8 @@ interface TimelineProps {
     sfx_list: { path: string; time: number; volume: number }[];
   }>>;
   getTimelineRange: (script: ScriptItem[] | undefined, idx: number) => { start: string; end: string; duration: string };
-  selectedItem: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' } | null;
-  setSelectedItem: (item: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' } | null) => void;
+  selectedItem: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' } | null;
+  setSelectedItem: (item: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' } | null) => void;
   onDelete: (id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm') => void;
 }
 
@@ -284,6 +285,7 @@ const Timeline: React.FC<TimelineProps> = ({
   setCurrentTime,
   srtData,
   setSrtData,
+  setSrtScriptSig,
   setEditingSrtId,
   content,
   setContent,
@@ -385,11 +387,13 @@ const Timeline: React.FC<TimelineProps> = ({
       targetSrtIdx = srtData.findIndex(s => timeToUse >= s.start && timeToUse <= s.end);
     }
 
-    if (targetSrtIdx !== -1 && content) {
-      const targetSrt = srtData[targetSrtIdx];
-      
-      if (timeToUse > targetSrt.start && timeToUse < targetSrt.end) {
-        if (mode === 'left') {
+      if (targetSrtIdx !== -1 && content) {
+        const targetSrt = srtData[targetSrtIdx];
+        // 자막 분할로 srt 인덱스와 씬 인덱스가 다를 수 있음 → 씬 연산은 scene 필드 기준
+        const si = (targetSrt as { scene?: number }).scene ?? targetSrtIdx;
+
+        if (timeToUse > targetSrt.start && timeToUse < targetSrt.end) {
+          if (mode === 'left') {
           if (timeToUse >= targetSrt.end) return;
           const updatedSrtData = [...srtData];
           updatedSrtData[targetSrtIdx] = { ...targetSrt, start: timeToUse };
@@ -403,7 +407,7 @@ const Timeline: React.FC<TimelineProps> = ({
                 next[i] = parseFloat(r.duration);
               });
             }
-            next[targetSrtIdx] = targetSrt.end - timeToUse;
+            next[si] = targetSrt.end - timeToUse;
             return next;
           });
           return;
@@ -421,7 +425,7 @@ const Timeline: React.FC<TimelineProps> = ({
                 next[i] = parseFloat(r.duration);
               });
             }
-            next[targetSrtIdx] = timeToUse - targetSrt.start;
+            next[si] = timeToUse - targetSrt.start;
             return next;
           });
           return;
@@ -434,27 +438,38 @@ const Timeline: React.FC<TimelineProps> = ({
           id: newSrtId,
           start: timeToUse,
           end: targetSrt.end,
-          text: targetSrt.text // Initially same text
+          text: targetSrt.text, // Initially same text
+          scene: si + 1
         };
 
         const updatedSrtData = [...srtData];
         updatedSrtData[targetSrtIdx] = { ...targetSrt, end: timeToUse };
         updatedSrtData.splice(targetSrtIdx + 1, 0, newSrt);
-        setSrtData(updatedSrtData);
+        // 같은 씬의 뒤쪽 조각들과 이후 씬들의 scene 번호 +1
+        const shifted = updatedSrtData.map((s, i) => {
+          if (i === targetSrtIdx + 1) return s;
+          const sc = (s as { scene?: number }).scene;
+          if (sc === undefined) return s;
+          if (sc > si || (sc === si && i > targetSrtIdx + 1)) {
+            return { ...s, scene: sc + 1 };
+          }
+          return s;
+        });
+        setSrtData(shifted);
 
         // B. Update Content (Script & Scenes)
         const updatedScript = [...content.script];
         const updatedScenes = [...content.scenes];
-        
-        const scriptItem = updatedScript[targetSrtIdx];
-        const sceneItem = updatedScenes[targetSrtIdx];
+
+        const scriptItem = updatedScript[si];
+        const sceneItem = updatedScenes[si];
 
         if (scriptItem && sceneItem) {
           const newScriptItem = { ...scriptItem };
           const newSceneItem = { ...sceneItem };
 
-          updatedScript.splice(targetSrtIdx + 1, 0, newScriptItem);
-          updatedScenes.splice(targetSrtIdx + 1, 0, newSceneItem);
+          updatedScript.splice(si + 1, 0, newScriptItem);
+          updatedScenes.splice(si + 1, 0, newSceneItem);
 
           // Update scene_index for all items
           updatedScript.forEach((item, idx) => {
@@ -465,6 +480,8 @@ const Timeline: React.FC<TimelineProps> = ({
             script: updatedScript,
             scenes: updatedScenes
           });
+          // 자막 데이터와 대본이 함께 바뀌었으므로 서명 동기화 (오경고 방지)
+          setSrtScriptSig(updatedScript.map((s) => `${s.speaker}:${s.text}`).join('\n'));
 
           // C. Update Selected Visuals & Candidates
           // Shift all indices after targetSrtIdx
@@ -473,25 +490,25 @@ const Timeline: React.FC<TimelineProps> = ({
 
           Object.entries(selectedVisuals).forEach(([idxStr, visuals]) => {
             const idx = parseInt(idxStr);
-            if (idx <= targetSrtIdx) {
+            if (idx <= si) {
               newSelectedVisuals[idx] = visuals;
             } else {
               newSelectedVisuals[idx + 1] = visuals;
             }
           });
           // Duplicate visual for the new split part
-          newSelectedVisuals[targetSrtIdx + 1] = selectedVisuals[targetSrtIdx] || [];
+          newSelectedVisuals[si + 1] = selectedVisuals[si] || [];
 
           Object.entries(visualCandidates).forEach(([idxStr, candidates]) => {
             const idx = parseInt(idxStr);
-            if (idx <= targetSrtIdx) {
+            if (idx <= si) {
               newVisualCandidates[idx] = candidates;
             } else {
               newVisualCandidates[idx + 1] = candidates;
             }
           });
           // Duplicate candidates for the new split part
-          newVisualCandidates[targetSrtIdx + 1] = visualCandidates[targetSrtIdx] || { ai: [], search: [], graph: [] };
+          newVisualCandidates[si + 1] = visualCandidates[si] || { ai: [], search: [], graph: [] };
 
           setSelectedVisuals(newSelectedVisuals);
           setVisualCandidates(newVisualCandidates);
@@ -506,9 +523,9 @@ const Timeline: React.FC<TimelineProps> = ({
               });
             }
             // Insert new duration
-            next.splice(targetSrtIdx + 1, 0, targetSrt.end - timeToUse);
+            next.splice(si + 1, 0, targetSrt.end - timeToUse);
             // Update current duration
-            next[targetSrtIdx] = timeToUse - targetSrt.start;
+            next[si] = timeToUse - targetSrt.start;
             return next;
           });
           
@@ -602,34 +619,43 @@ const Timeline: React.FC<TimelineProps> = ({
         setSrtData(updatedSrtData);
 
         if (content) {
-          const updatedScript = [...content.script];
-          const updatedScenes = [...content.scenes];
-          updatedScript.splice(targetIdx + 1, 0, { ...updatedScript[targetIdx] });
-          updatedScenes.splice(targetIdx + 1, 0, { ...updatedScenes[targetIdx] });
-          
-          updatedScript.forEach((item, idx) => item.scene_index = idx);
-          setContent({ script: updatedScript, scenes: updatedScenes });
+          // 자막 분할로 한 씬에 여러 조각이 있을 수 있음 → 씬 연산은 scene 기준
+          const siDup = (target as { scene?: number }).scene ?? targetIdx;
+          const chunkCount = srtData.filter((s) => (s as { scene?: number }).scene === siDup).length;
+          if (chunkCount <= 1) {
+            // 기존 동작: 자막+씬 함께 복제
+            const updatedScript = [...content.script];
+            const updatedScenes = [...content.scenes];
+            updatedScript.splice(siDup + 1, 0, { ...updatedScript[siDup] });
+            updatedScenes.splice(siDup + 1, 0, { ...updatedScenes[siDup] });
 
-          const newSelectedVisuals: Record<number, string[]> = {};
-          const newVisualCandidates: Record<number, SceneCandidates> = {};
-          
-          Object.entries(selectedVisuals).forEach(([idxStr, visuals]) => {
-            const idx = parseInt(idxStr);
-            if (idx <= targetIdx) newSelectedVisuals[idx] = visuals;
-            else newSelectedVisuals[idx + 1] = visuals;
-          });
-          newSelectedVisuals[targetIdx + 1] = selectedVisuals[targetIdx] || [];
+            updatedScript.forEach((item, idx) => item.scene_index = idx);
+            setContent({ script: updatedScript, scenes: updatedScenes });
+            // 자막 데이터와 대본이 함께 바뀌었으므로 서명 동기화 (오경고 방지)
+            setSrtScriptSig(updatedScript.map((s) => `${s.speaker}:${s.text}`).join('\n'));
 
-          Object.entries(visualCandidates).forEach(([idxStr, candidates]) => {
-            const idx = parseInt(idxStr);
-            if (idx <= targetIdx) newVisualCandidates[idx] = candidates;
-            else newVisualCandidates[idx + 1] = candidates;
-          });
-          newVisualCandidates[targetIdx + 1] = visualCandidates[targetIdx] || { ai: [], search: [], graph: [] };
+            const newSelectedVisuals: Record<number, string[]> = {};
+            const newVisualCandidates: Record<number, SceneCandidates> = {};
 
-          setSelectedVisuals(newSelectedVisuals);
-          setVisualCandidates(newVisualCandidates);
-          setSceneDurations([]);
+            Object.entries(selectedVisuals).forEach(([idxStr, visuals]) => {
+              const idx = parseInt(idxStr);
+              if (idx <= siDup) newSelectedVisuals[idx] = visuals;
+              else newSelectedVisuals[idx + 1] = visuals;
+            });
+            newSelectedVisuals[siDup + 1] = selectedVisuals[siDup] || [];
+
+            Object.entries(visualCandidates).forEach(([idxStr, candidates]) => {
+              const idx = parseInt(idxStr);
+              if (idx <= siDup) newVisualCandidates[idx] = candidates;
+              else newVisualCandidates[idx + 1] = candidates;
+            });
+            newVisualCandidates[siDup + 1] = visualCandidates[siDup] || { ai: [], search: [], graph: [] };
+
+            setSelectedVisuals(newSelectedVisuals);
+            setVisualCandidates(newVisualCandidates);
+            setSceneDurations([]);
+          }
+          // 분할된 조각 복제는 자막만 복제 (씬은 그대로)
         }
       }
     } else if (selectedItem.type === 'sfx') {
@@ -737,7 +763,18 @@ const Timeline: React.FC<TimelineProps> = ({
         handleSplit();
       } else if (e.code === 'Delete' || e.code === 'Backspace') {
         if (selectedItem && !isPlaying) {
-          onDelete(selectedItem.id, selectedItem.type === 'scene' ? undefined : selectedItem.type as 'subtitle' | 'sfx' | 'bgm');
+          if (selectedItem.type === 'caption') {
+            const sceneIdx = typeof selectedItem.id === 'number' ? selectedItem.id : parseInt(String(selectedItem.id));
+            setContent((prev) => {
+              if (!prev?.scenes?.[sceneIdx]) return prev;
+              const newScenes = [...prev.scenes];
+              newScenes[sceneIdx] = { ...newScenes[sceneIdx], subtitle: '' };
+              return { ...prev, scenes: newScenes };
+            });
+            setSelectedItem(null);
+          } else {
+            onDelete(selectedItem.id, selectedItem.type === 'scene' ? undefined : selectedItem.type as 'subtitle' | 'sfx' | 'bgm');
+          }
         }
       }
     };
@@ -1066,8 +1103,9 @@ const Timeline: React.FC<TimelineProps> = ({
                         });
                       });
 
-                      // 2. Sync with Scene Durations
+                      // 2. Sync with Scene Durations (자막 분할 시 scene 기준)
                       const srtIdx = srtData.findIndex(s => s.id === srt.id);
+                      const srtScene = (srt as { scene?: number }).scene ?? srtIdx;
                       if (srtIdx !== -1) {
                         setSceneDurations(prev => {
                           const next = [...prev];
@@ -1077,17 +1115,17 @@ const Timeline: React.FC<TimelineProps> = ({
                               next[i] = parseFloat(r.duration);
                             });
                           }
-                          next[srtIdx] = newDuration;
+                          next[srtScene] = newDuration;
                           return next;
                         });
 
                         // If start changed, adjust previous scene (only if not ripple editing)
-                        if (!rippleEdit && Math.abs(startDiff) > 0.01 && srtIdx > 0) {
+                        if (!rippleEdit && Math.abs(startDiff) > 0.01 && srtScene > 0) {
                           setSceneDurations(prev => {
                             const next = [...prev];
-                            const prevRange = getTimelineRange(content?.script, srtIdx - 1);
+                            const prevRange = getTimelineRange(content?.script, srtScene - 1);
                             const prevStart = parseFloat(prevRange.start);
-                            next[srtIdx - 1] = Math.max(0.1, newStart - prevStart);
+                            next[srtScene - 1] = Math.max(0.1, newStart - prevStart);
                             return next;
                           });
                         }
@@ -1131,10 +1169,21 @@ const Timeline: React.FC<TimelineProps> = ({
                       });
 
                       if (sceneIdx !== -1) {
-                        setSelectedVisuals(prev => ({
-                          ...prev,
-                          [sceneIdx]: [data.path]
-                        }));
+                        const r = getTimelineRange(content?.script, sceneIdx);
+                        const dur = parseFloat(r.duration);
+                        setSelectedVisuals(prev => {
+                          const cur = prev[sceneIdx] ?? [];
+                          if (cur.includes(data.path)) return prev;
+                          if (cur.length >= 3) {
+                            alert('한 장면당 최대 3개까지 선택할 수 있습니다.');
+                            return prev;
+                          }
+                          if (dur > 0 && dur / (cur.length + 1) < 1.5) {
+                            alert(`씬 길이(${dur.toFixed(1)}초)로는 클립당 최소 1.5초가 안 나옵니다.`);
+                            return prev;
+                          }
+                          return { ...prev, [sceneIdx]: [...cur, data.path] };
+                        });
                       }
                     }
                   } catch (err) {
@@ -1146,36 +1195,34 @@ const Timeline: React.FC<TimelineProps> = ({
                   const range = getTimelineRange(content?.script, idx);
                   const start = parseFloat(range.start);
                   const duration = parseFloat(range.duration);
-                  const selected = selectedVisuals[idx];
-                  const firstImgPath = selected?.[0];
-                  
-                  // Image Preview Resolution
-                  let previewSrc = null;
-                  if (firstImgPath) {
-                    const candidate = visualCandidates[idx]?.ai?.find((v: { path: string; url?: string }) => v.path === firstImgPath || v.url === firstImgPath) || 
-                                      visualCandidates[idx]?.search?.find((v: { path: string; url?: string }) => v.path === firstImgPath || v.url === firstImgPath);
-                    
+                  const clips = selectedVisuals[idx] ?? [];
+
+                  // Visual Preview Resolution (per clip)
+                  const resolveOne = (rawPath: string): string | null => {
+                    const candidate = visualCandidates[idx]?.ai?.find((v: { path: string; url?: string }) => v.path === rawPath || v.url === rawPath) ||
+                                      visualCandidates[idx]?.search?.find((v: { path: string; url?: string }) => v.path === rawPath || v.url === rawPath);
+
+                    let out: string | null = null;
                     if (candidate && candidate.url) {
-                      previewSrc = candidate.url.startsWith('http') ? candidate.url : `http://localhost:8000${candidate.url.startsWith('/') ? '' : '/'}${candidate.url}`;
-                    } else if (firstImgPath.startsWith('http')) {
-                      previewSrc = firstImgPath;
+                      out = assetUrl(candidate.url);
+                    } else if (rawPath.startsWith('http')) {
+                      out = rawPath;
                     } else {
                       // Normalize path and ensure it starts with /assets/ if it's a relative path
-                      const normalizedPath = firstImgPath.replace(/\\/g, '/');
+                      const normalizedPath = rawPath.replace(/\\/g, '/');
                       const assetsMatch = normalizedPath.match(/.*(\/assets\/.*)/);
                       if (assetsMatch) {
-                        previewSrc = `http://localhost:8000${assetsMatch[1]}`;
+                        out = assetUrl(assetsMatch[1]);
                       } else {
-                        const pathWithAssets = normalizedPath.startsWith('assets/') ? normalizedPath : 
+                        const pathWithAssets = normalizedPath.startsWith('assets/') ? normalizedPath :
                                               (normalizedPath.startsWith('/assets/') ? normalizedPath.substring(1) : `assets/${normalizedPath}`);
-                        previewSrc = `http://localhost:8000/${pathWithAssets}`;
+                        out = assetUrl(`/${pathWithAssets}`);
                       }
                     }
-                    
-                    if (previewSrc && previewSrc.includes('/assets/assets/')) {
-                      previewSrc = previewSrc.replace('/assets/assets/', '/assets/');
-                    }
-                  }
+
+                    return out;
+                  };
+                  const clipSrcs = clips.map(resolveOne);
 
                   return (
                     <TimelineItem
@@ -1191,10 +1238,19 @@ const Timeline: React.FC<TimelineProps> = ({
                       snapPoints={autoSnap ? snapPoints.filter(p => p !== start && p !== (start + duration)) : []}
                       onDrop={(data) => {
                         if (data.type === 'media') {
-                          setSelectedVisuals(prev => ({
-                            ...prev,
-                            [idx]: [data.path]
-                          }));
+                          setSelectedVisuals(prev => {
+                            const cur = prev[idx] ?? [];
+                            if (cur.includes(data.path)) return prev;
+                            if (cur.length >= 3) {
+                              alert('한 장면당 최대 3개까지 선택할 수 있습니다.');
+                              return prev;
+                            }
+                            if (duration > 0 && duration / (cur.length + 1) < 1.5) {
+                              alert(`씬 길이(${duration.toFixed(1)}초)로는 클립당 최소 1.5초가 안 나옵니다.`);
+                              return prev;
+                            }
+                            return { ...prev, [idx]: [...cur, data.path] };
+                          });
                         }
                       }}
                       onUpdate={(newStart, newDuration) => {
@@ -1235,9 +1291,28 @@ const Timeline: React.FC<TimelineProps> = ({
                       }}
                       className="inset-y-1 h-[calc(100%-8px)] rounded-md overflow-hidden"
                     >
-                      <div className="relative w-full h-full group/scene">
-                        {previewSrc ? (
-                          <img src={previewSrc} className="w-full h-full object-cover opacity-60 group-hover/scene:opacity-100 transition-opacity duration-500" alt="" />
+                      <div className="relative w-full h-full group/scene flex">
+                        {clipSrcs.length > 0 ? (
+                          clipSrcs.map((previewSrc, cIdx) => (
+                            <div key={cIdx} className="relative h-full min-w-0" style={{ flex: 1 }}>
+                              {previewSrc ? (
+                                /\.(mp4|webm|mov)(\?|$)/i.test(previewSrc) ? (
+                                  <video src={previewSrc} className="w-full h-full object-cover opacity-60 group-hover/scene:opacity-100 transition-opacity duration-500" muted loop playsInline preload="metadata" autoPlay />
+                                ) : (
+                                  <img src={previewSrc} className="w-full h-full object-cover opacity-60 group-hover/scene:opacity-100 transition-opacity duration-500" alt="" />
+                                )
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center bg-zinc-100">
+                                  <ImageIcon size={14} className="text-zinc-400" />
+                                </div>
+                              )}
+                              {clipSrcs.length > 1 && (
+                                <span className="absolute bottom-0.5 left-0.5 text-[6px] font-black text-white bg-black/50 rounded px-0.5">
+                                  {cIdx + 1}/{clipSrcs.length}
+                                </span>
+                              )}
+                            </div>
+                          ))
                         ) : (
                           <div className="w-full h-full flex items-center justify-center bg-zinc-100">
                             <ImageIcon size={14} className="text-zinc-400" />

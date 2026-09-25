@@ -23,7 +23,7 @@ import {
   Settings2
 } from 'lucide-react';
 import type { LucideProps } from 'lucide-react';
-import { type AppContent, type SceneCandidates, type ScriptItem, type ProjectMeta } from '../services/api';
+import { type AppContent, type SceneCandidates, type ScriptItem, type ProjectMeta, type SceneLayout, type CaptionStyle, assetUrl } from '../services/api';
 import Timeline from './Timeline';
 import PropertiesPanel from './PropertiesPanel';
 
@@ -42,6 +42,13 @@ interface VideoEditorProps {
   gapDuration: number;
   selectedVisuals: Record<number, string[]>;
   setSelectedVisuals: React.Dispatch<React.SetStateAction<Record<number, string[]>>>;
+  clipTrims: Record<number, Record<string, { in: number; out: number | null }>>;
+  sceneLayouts: Record<number, SceneLayout>;
+  setSceneLayouts: React.Dispatch<React.SetStateAction<Record<number, SceneLayout>>>;
+  showSceneCaptions: boolean;
+  setShowSceneCaptions: (v: boolean) => void;
+  captionStyle: CaptionStyle;
+  setCaptionStyle: React.Dispatch<React.SetStateAction<CaptionStyle>>;
   visualCandidates: Record<number, SceneCandidates>;
   setVisualCandidates: React.Dispatch<React.SetStateAction<Record<number, SceneCandidates>>>;
   subtitleStyle: {
@@ -72,6 +79,7 @@ interface VideoEditorProps {
   }>>;
   srtData: { id: number; start: number; end: number; text: string }[];
   setSrtData: React.Dispatch<React.SetStateAction<{ id: number; start: number; end: number; text: string }[]>>;
+  setSrtScriptSig: (sig: string | null) => void;
   editingSrtId: number | null;
   setEditingSrtId: (id: number | null) => void;
   setSceneDurations: React.Dispatch<React.SetStateAction<number[]>>;
@@ -114,6 +122,36 @@ interface GeneratedImageItem {
   };
 }
 
+export const isVideoSrc = (src: string) =>
+  /\.(mp4|webm|mov)(\?|$)/i.test(src);
+
+export const resolveVisualSrc = (
+  rawPath: string | undefined,
+  idx: number,
+  visualCandidates: Record<number, SceneCandidates>
+): string => {
+  if (!rawPath) return "";
+  const candidate = visualCandidates[idx]?.ai?.find((v) => v.path === rawPath || v.url === rawPath) ||
+                    visualCandidates[idx]?.search?.find((v) => v.path === rawPath || v.url === rawPath);
+  let src = "";
+  if (candidate && candidate.url) {
+    src = assetUrl(candidate.url);
+  } else if (rawPath.startsWith('http')) {
+    src = rawPath;
+  } else {
+    const normalizedPath = rawPath.replace(/\\/g, '/');
+    const assetsMatch = normalizedPath.match(/.*(\/assets\/.*)/);
+    if (assetsMatch) {
+      src = assetUrl(assetsMatch[1]);
+    } else {
+      const pathWithAssets = normalizedPath.startsWith('assets/') ? normalizedPath :
+                             (normalizedPath.startsWith('/assets/') ? normalizedPath.substring(1) : `assets/${normalizedPath}`);
+      src = assetUrl(`/${pathWithAssets}`);
+    }
+  }
+  return src;
+};
+
 const AssetTabButton: React.FC<AssetTabButtonProps> = ({ active, onClick, icon, label }) => (
   <button
     onClick={onClick}
@@ -147,12 +185,20 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
   setCurrentTime,
   selectedVisuals,
   setSelectedVisuals,
+  clipTrims,
+  sceneLayouts,
+  setSceneLayouts,
+  showSceneCaptions,
+  setShowSceneCaptions,
+  captionStyle,
+  setCaptionStyle,
   visualCandidates,
   setVisualCandidates,
   subtitleStyle,
   setSubtitleStyle,
   srtData,
   setSrtData,
+  setSrtScriptSig,
   setEditingSrtId,
   setSceneDurations,
   audioEdit,
@@ -175,7 +221,9 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<EditorTab>('media');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedItem, setSelectedItem] = useState<{ id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' } | null>(null);
+  const [selectedItem, setSelectedItem] = useState<{ id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' } | null>(null);
+  const [dragScene, setDragScene] = useState<number | null>(null);
+  const dragRef = useRef<{ idx: number; startX: number; startY: number; baseX: number; baseY: number } | null>(null);
   const [showProjectModal, setShowProjectModal] = useState(showInitialProjectModal);
 
   // Sync state with prop
@@ -363,61 +411,81 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
     console.error('Failed to parse projects list', e);
   }
 
-  const handleDeleteItem = useCallback((id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm') => {
+  const handleDeleteItem = useCallback((id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm' | 'caption') => {
     const targetType = type || selectedItem?.type;
     const targetId = id !== undefined ? id : selectedItem?.id;
 
     if (!targetType || targetId === undefined) return;
 
+    if (targetType === 'caption' && content) {
+      const sceneIdx = typeof targetId === 'number' ? targetId : parseInt(String(targetId));
+      setContent((prev) => {
+        if (!prev?.scenes?.[sceneIdx]) return prev;
+        const newScenes = [...prev.scenes];
+        newScenes[sceneIdx] = { ...newScenes[sceneIdx], subtitle: '' };
+        return { ...prev, scenes: newScenes };
+      });
+      setSelectedItem(null);
+      return;
+    }
+
     if (targetType === 'subtitle' && content) {
       const targetIdx = srtData.findIndex(s => s.id === targetId);
       if (targetIdx !== -1) {
-        // A. Update SRT Data
+        const target = srtData[targetIdx];
+        const si = (target as { scene?: number }).scene ?? targetIdx;
+        const chunkCount = srtData.filter((s) => (s as { scene?: number }).scene === si).length;
+        // A. Update SRT Data (자막 조각만 삭제)
         const updatedSrtData = srtData.filter(s => s.id !== targetId);
-        
-        // B. Update Content
-        const updatedScript = content.script.filter((_, idx) => idx !== targetIdx);
-        const updatedScenes = content.scenes.filter((_, idx) => idx !== targetIdx);
-        
         setSrtData(updatedSrtData);
         setEditingSrtId(null);
 
-        updatedScript.forEach((item, idx) => {
-          item.scene_index = idx;
-        });
+        // 분할되지 않은 단일 자막이면 기존처럼 씬까지 함께 삭제
+        if (chunkCount <= 1) {
+          // B. Update Content
+          const updatedScript = content.script.filter((_, idx) => idx !== si);
+          const updatedScenes = content.scenes.filter((_, idx) => idx !== si);
 
-        setContent({
-          script: updatedScript,
-          scenes: updatedScenes
-        });
+          updatedScript.forEach((item, idx) => {
+            item.scene_index = idx;
+          });
 
-        // Update Selected Visuals & Candidates
-        const newSelectedVisuals: Record<number, string[]> = {};
-        const newVisualCandidates: Record<number, SceneCandidates> = {};
+          setContent({
+            script: updatedScript,
+            scenes: updatedScenes
+          });
+          // 자막 데이터와 대본이 함께 바뀌었으므로 서명 동기화 (오경고 방지)
+          setSrtScriptSig(updatedScript.map((s) => `${s.speaker}:${s.text}`).join('\n'));
 
-        Object.entries(selectedVisuals).forEach(([idxStr, visuals]) => {
-          const idx = parseInt(idxStr);
-          if (idx < targetIdx) {
-            newSelectedVisuals[idx] = visuals;
-          } else if (idx > targetIdx) {
-            newSelectedVisuals[idx - 1] = visuals;
-          }
-        });
+          // Update Selected Visuals & Candidates
+          const newSelectedVisuals: Record<number, string[]> = {};
+          const newVisualCandidates: Record<number, SceneCandidates> = {};
 
-        Object.entries(visualCandidates).forEach(([idxStr, candidates]) => {
-          const idx = parseInt(idxStr);
-          if (idx < targetIdx) {
-            newVisualCandidates[idx] = candidates;
-          } else if (idx > targetIdx) {
-            newVisualCandidates[idx - 1] = candidates;
-          }
-        });
+          Object.entries(selectedVisuals).forEach(([idxStr, visuals]) => {
+            const idx = parseInt(idxStr);
+            if (idx < si) {
+              newSelectedVisuals[idx] = visuals;
+            } else if (idx > si) {
+              newSelectedVisuals[idx - 1] = visuals;
+            }
+          });
 
-        setSelectedVisuals(newSelectedVisuals);
-        setVisualCandidates(newVisualCandidates);
+          Object.entries(visualCandidates).forEach(([idxStr, candidates]) => {
+            const idx = parseInt(idxStr);
+            if (idx < si) {
+              newVisualCandidates[idx] = candidates;
+            } else if (idx > si) {
+              newVisualCandidates[idx - 1] = candidates;
+            }
+          });
 
-        // D. Reset Scene Durations
-        setSceneDurations([]);
+          setSelectedVisuals(newSelectedVisuals);
+          setVisualCandidates(newVisualCandidates);
+
+          // D. Reset Scene Durations
+          setSceneDurations([]);
+        }
+        // 분할된 조각 삭제는 자막만 제거 (씬·대본 유지)
       }
     } else if (targetType === 'sfx') {
       const idx = typeof targetId === 'string' ? parseInt(targetId.split('-')[1]) : (targetId as number);
@@ -815,18 +883,18 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                             .map((img, idx) => {
                               let src = "";
                               if (img.candidate && img.candidate.url) {
-                                src = img.candidate.url.startsWith('http') ? img.candidate.url : `http://localhost:8000${img.candidate.url.startsWith('/') ? '' : '/'}${img.candidate.url}`;
+                                src = assetUrl(img.candidate.url);
                               } else if (img.path.startsWith('http')) {
                                 src = img.path;
                               } else {
                                 const normalizedPath = img.path.replace(/\\/g, '/');
                                 const assetsMatch = normalizedPath.match(/.*(\/assets\/.*)/);
                                 if (assetsMatch) {
-                                  src = `http://localhost:8000${assetsMatch[1]}`;
+                                  src = assetUrl(assetsMatch[1]);
                                 } else {
-                                  const pathWithAssets = normalizedPath.startsWith('assets/') ? normalizedPath : 
+                                  const pathWithAssets = normalizedPath.startsWith('assets/') ? normalizedPath :
                                                         (normalizedPath.startsWith('/assets/') ? normalizedPath.substring(1) : `assets/${normalizedPath}`);
-                                  src = `http://localhost:8000/${pathWithAssets}`;
+                                  src = assetUrl(`/${pathWithAssets}`);
                                 }
                               }
                               return (
@@ -1009,43 +1077,121 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                 const endTime = parseFloat(range.end);
                 
                 if (currentTime >= startTime && currentTime <= endTime) {
-                  const firstImgPath = selectedVisuals[idx]?.[0];
-                  let src = "";
-                  
-                  if (firstImgPath) {
-                    const candidate = visualCandidates[idx]?.ai?.find((v) => v.path === firstImgPath || v.url === firstImgPath) || 
-                                     visualCandidates[idx]?.search?.find((v) => v.path === firstImgPath || v.url === firstImgPath);
-                    
-                    if (candidate && candidate.url) {
-                      src = candidate.url.startsWith('http') ? candidate.url : `http://localhost:8000${candidate.url.startsWith('/') ? '' : '/'}${candidate.url}`;
-                    } else if (firstImgPath.startsWith('http')) {
-                      src = firstImgPath;
-                    } else {
-                      const normalizedPath = firstImgPath.replace(/\\/g, '/');
-                      const assetsMatch = normalizedPath.match(/.*(\/assets\/.*)/);
-                      if (assetsMatch) {
-                        src = `http://localhost:8000${assetsMatch[1]}`;
-                      } else {
-                        const pathWithAssets = normalizedPath.startsWith('assets/') ? normalizedPath : 
-                                              (normalizedPath.startsWith('/assets/') ? normalizedPath.substring(1) : `assets/${normalizedPath}`);
-                        src = `http://localhost:8000/${pathWithAssets}`;
-                      }
-                    }
-                    
-                    // Replace /assets/assets/ with /assets/
-                    if (src.includes('/assets/assets/')) {
-                      src = src.replace('/assets/assets/', '/assets/');
-                    }
-                  }
+                  const visuals = selectedVisuals[idx] ?? [];
+                  // 씬 구간을 선택된 클립 수만큼 등분 → 현재 재생 위치의 클립을 표시
+                  const segCount = Math.max(1, visuals.length);
+                  const segLen = (endTime - startTime) / segCount;
+                  const segIdx = Math.min(segCount - 1, Math.max(0, Math.floor((currentTime - startTime) / segLen)));
+                  const segUrl = visuals[segIdx];
+                  const src = resolveVisualSrc(segUrl, idx, visualCandidates);
+                  const trim = (segUrl && clipTrims[idx]?.[segUrl]) || { in: 0, out: null };
+                  const trimIn = Math.max(0, trim.in || 0);
+                  const trimOut = trim.out != null && trim.out > trimIn ? trim.out : null;
+                  const layout = sceneLayouts[idx] || { scale: 1, x: 0, y: 0 };
+                  const layoutModified = Math.abs(layout.scale - 1) > 1e-6 || Math.abs(layout.x) > 1e-6 || Math.abs(layout.y) > 1e-6;
 
+                  const isSceneSelected = selectedItem?.type === 'scene' && selectedItem.id === idx;
                   return (
-                    <div key={idx} className="absolute inset-0 flex items-center justify-center overflow-hidden">
+                    <div
+                      key={idx}
+                      className="absolute inset-0 flex items-center justify-center overflow-hidden bg-black"
+                      onClick={(e) => { e.stopPropagation(); setSelectedItem({ id: idx, type: 'scene' }); }}
+                    >
+                      {isSceneSelected && (
+                        <div className="absolute inset-0 z-[80] pointer-events-none ring-2 ring-inset ring-indigo-400" />
+                      )}
                       {src ? (
-                        <img 
-                          src={src} 
-                          className="w-full h-full object-cover animate-in fade-in zoom-in-110 duration-1000" 
-                          alt={`Scene ${idx + 1}`} 
-                        />
+                        <>
+                          <div
+                            className="absolute inset-0 flex items-center justify-center touch-none select-none"
+                            style={{
+                              transform: `translate(${layout.x * 100}%, ${layout.y * 100}%) scale(${layout.scale})`,
+                              cursor: dragScene === idx ? 'grabbing' : 'grab',
+                            }}
+                            title="드래그로 이동 · 휠로 확대/축소 · 더블클릭 초기화"
+                            onPointerDown={(e) => {
+                              (e.target as Element).setPointerCapture?.(e.pointerId);
+                              dragRef.current = { idx, startX: e.clientX, startY: e.clientY, baseX: layout.x, baseY: layout.y };
+                              setDragScene(idx);
+                            }}
+                            onPointerMove={(e) => {
+                              const d = dragRef.current;
+                              if (!d || d.idx !== idx) return;
+                              const frame = (e.currentTarget.parentElement as HTMLElement | null)?.getBoundingClientRect();
+                              if (!frame || frame.width <= 0 || frame.height <= 0) return;
+                              const nx = Math.min(0.5, Math.max(-0.5, d.baseX + (e.clientX - d.startX) / frame.width));
+                              const ny = Math.min(0.5, Math.max(-0.5, d.baseY + (e.clientY - d.startY) / frame.height));
+                              setSceneLayouts((prev) => ({
+                                ...prev,
+                                [idx]: { scale: prev[idx]?.scale ?? 1, x: nx, y: ny },
+                              }));
+                            }}
+                            onPointerUp={() => { dragRef.current = null; setDragScene(null); }}
+                            onPointerCancel={() => { dragRef.current = null; setDragScene(null); }}
+                            onWheel={(e) => {
+                              const ns = Math.min(3, Math.max(1, layout.scale * Math.exp(-e.deltaY * 0.0015)));
+                              setSceneLayouts((prev) => ({
+                                ...prev,
+                                [idx]: { scale: ns, x: prev[idx]?.x ?? 0, y: prev[idx]?.y ?? 0 },
+                              }));
+                            }}
+                            onDoubleClick={() => {
+                              setSceneLayouts((prev) => {
+                                const next = { ...prev };
+                                delete next[idx];
+                                return next;
+                              });
+                            }}
+                          >
+                            {isVideoSrc(src) ? (
+                              <video
+                                key={`${src}#${trimIn}-${trimOut ?? ''}`}
+                                src={src}
+                                className="w-full h-full object-contain pointer-events-none"
+                                muted loop playsInline preload="auto" autoPlay
+                                ref={(el) => {
+                                  if (!el) return;
+                                  if (el.currentTime < trimIn || (trimOut != null && el.currentTime >= trimOut)) {
+                                    try { el.currentTime = trimIn; } catch {}
+                                  }
+                                  if (isPlaying) {
+                                    el.play().catch(() => {});
+                                  } else {
+                                    el.pause();
+                                  }
+                                }}
+                                onTimeUpdate={(e) => {
+                                  const el = e.currentTarget;
+                                  if (trimOut != null && el.currentTime >= trimOut) {
+                                    try { el.currentTime = trimIn; } catch {}
+                                  }
+                                }}
+                              />
+                            ) : (
+                              <img
+                                src={src}
+                                className="w-full h-full object-contain pointer-events-none"
+                                alt={`Scene ${idx + 1}`}
+                                draggable={false}
+                              />
+                            )}
+                          </div>
+                          {layoutModified && (
+                            <button
+                              onClick={() => {
+                                setSceneLayouts((prev) => {
+                                  const next = { ...prev };
+                                  delete next[idx];
+                                  return next;
+                                });
+                              }}
+                              className="absolute bottom-2 left-2 z-10 px-2 py-0.5 bg-black/60 hover:bg-black/80 text-white text-[10px] font-bold rounded-md"
+                              title="배치 초기화"
+                            >
+                              {Math.round(layout.scale * 100)}% · 초기화
+                            </button>
+                          )}
+                        </>
                       ) : (
                         <div className="w-full h-full bg-zinc-100 flex flex-col items-center justify-center gap-4 border border-zinc-300">
                           <ImageIcon size={48} className="text-zinc-400 animate-pulse" />
@@ -1121,6 +1267,47 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                 }
                 return null;
               })}
+
+              {/* Scene Caption Band (상단): 씬별 subtitle을 나레이션 자막과 다른 스타일로 */}
+              {showSceneCaptions && (() => {
+                const sceneIdx = (content?.scenes || []).findIndex((_, idx) => {
+                  const r = getTimelineRange(content?.script, idx);
+                  return currentTime >= parseFloat(r.start) && currentTime <= parseFloat(r.end);
+                });
+                const capText = sceneIdx !== -1 ? (content?.scenes[sceneIdx]?.subtitle || '').trim() : '';
+                if (!capText) return null;
+                const isCapSelected = selectedItem?.type === 'caption' && selectedItem.id === sceneIdx;
+                return (
+                  <div
+                    key={`scenecap-${sceneIdx}`}
+                    className="absolute flex justify-center text-center z-[90] pointer-events-none"
+                    style={{ top: `${captionStyle.y_offset ?? 7}%`, left: '50%', transform: 'translate(-50%, -50%)', width: 'max-content', maxWidth: '80%' }}
+                  >
+                    <span
+                      onMouseDown={(e) => { e.stopPropagation(); setSelectedItem({ id: sceneIdx, type: 'caption' }); }}
+                      onClick={(e) => { e.stopPropagation(); setSelectedItem({ id: sceneIdx, type: 'caption' }); }}
+                      title="씬 자막 (클릭해서 수정)"
+                      className={`pointer-events-auto cursor-pointer ${isCapSelected ? 'ring-1 ring-amber-300 ring-offset-0 border border-amber-300 border-dashed bg-black/20' : ''}`}
+                      style={{
+                        fontSize: `${captionStyle.font_size}px`,
+                        color: captionStyle.color,
+                        fontFamily: subtitleStyle.font,
+                        WebkitTextStroke: '1px black',
+                        backgroundColor: captionStyle.bg_color !== 'transparent' ? captionStyle.bg_color : undefined,
+                        padding: captionStyle.bg_color !== 'transparent' ? '3px 10px' : '0',
+                        borderRadius: '8px',
+                        lineHeight: 1.4,
+                        fontWeight: 'bold',
+                        textShadow: '0 2px 8px rgba(0,0,0,0.6)',
+                        display: 'inline-block',
+                        maxWidth: '100%'
+                      }}
+                    >
+                      {capText}
+                    </span>
+                  </div>
+                );
+              })()}
             </div>
 
             </div>
@@ -1178,6 +1365,10 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                   selectedItem={selectedItem}
                   subtitleStyle={subtitleStyle}
                   setSubtitleStyle={setSubtitleStyle}
+                  showSceneCaptions={showSceneCaptions}
+                  setShowSceneCaptions={setShowSceneCaptions}
+                  captionStyle={captionStyle}
+                  setCaptionStyle={setCaptionStyle}
                   audioEdit={audioEdit}
                   setAudioEdit={setAudioEdit}
                   onDelete={handleDeleteItem}
@@ -1209,6 +1400,7 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
               setCurrentTime={setCurrentTime}
               srtData={srtData}
               setSrtData={setSrtData}
+              setSrtScriptSig={setSrtScriptSig}
               setEditingSrtId={setEditingSrtId}
               content={content}
               setContent={setContent}

@@ -1,0 +1,7 @@
+# MSVC Build Tools 없이 Tauri 빌드하기 위한 임시 설정.
+# llvm-mingw의 gcc 드라이버를 링커로 직접 사용한다 (관리자 권한·Windows SDK 불필요).
+# gcc 드라이버가 CRT 시작파일/라이브러리 경로를 알아서 처리하고,
+# GNU ld가 .def / -l:파일명 / -Wl, 옵션을 네이티브로 이해한다.
+# MSVC 설치 후에는 이 파일을 삭제하고 stable-x86_64-pc-windows-msvc로 복귀.
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/CHOI/.cargo/gcc-link.bat"

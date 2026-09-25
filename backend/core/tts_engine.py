@@ -2,7 +2,10 @@ import edge_tts
 try:
     import azure.cognitiveservices.speech as speechsdk
     AZURE_SPEECH_AVAILABLE = True
-except ImportError:
+except Exception:
+    # ImportError 외 PyInstaller 동적 DLL 누락(PyInstallerImportError) 등도 수용.
+    # Azure 미사용 환경·번들에서 안전하게 폴백한다.
+    speechsdk = None  # type: ignore
     AZURE_SPEECH_AVAILABLE = False
 import asyncio
 import os
@@ -490,7 +493,30 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
             speaker = line_item.get('speaker', 'Narrator')
             raw_text = line_item.get('text', '')
             text_to_speak = clean_text(raw_text)
+            # 빈 내레이션 = 의도된 무음 홀드 구간 (ASMR용). hold_sec만큼 무음 + 자막 표시
+            hold_sec = 0
+            try:
+                hold_sec = float(line_item.get('hold_sec') or 0)
+            except (TypeError, ValueError):
+                hold_sec = 0
+            hold_sec = min(max(hold_sec, 0), 15.0)
             if not text_to_speak:
+                if hold_sec >= 1.0:
+                    hold_subtitle = str(line_item.get('subtitle') or '').strip()
+                    hold_seg = AudioSegment.silent(duration=int(hold_sec * 1000))
+                    combined_audio += hold_seg
+                    start_time = current_time_offset
+                    end_time = current_time_offset + timedelta(seconds=hold_sec)
+                    if hold_subtitle:
+                        srt_line = f"{idx+1}\n{delta_to_time_str(start_time)} --> {delta_to_time_str(end_time)}\n{hold_subtitle}\n\n"
+                        combined_srt_lines.append(srt_line)
+                    if idx < total_lines - 1:
+                        combined_audio += silence
+                        current_time_offset = end_time + timedelta(seconds=gap_duration)
+                    else:
+                        current_time_offset = end_time
+                    print(f"DEBUG: Silent hold {hold_sec}s at index {idx} (subtitle: {hold_subtitle[:20] if hold_subtitle else '-'})")
+                    continue
                 print(f"DEBUG: Skipping empty text at index {idx}")
                 continue
 

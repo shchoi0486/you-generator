@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions (backend is spawned from Rust, no JS shell access needed)",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

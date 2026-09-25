@@ -1,10 +1,12 @@
 from moviepy import (
-    AudioFileClip, ImageClip, concatenate_videoclips, vfx,
+    AudioFileClip, ImageClip, VideoFileClip, concatenate_videoclips, vfx,
     TextClip, CompositeVideoClip, CompositeAudioClip
 )
 import os
 import re
-from .config_utils import get_export_dir
+import subprocess
+import tempfile
+from .config_utils import get_export_dir, load_config
 
 
 def get_audio_duration(audio_path):
@@ -55,6 +57,245 @@ def _resize_and_crop(clip, target_size=(1920, 1080)):
     return new_clip
 
 
+def _resolve_media_path(p):
+    """URL(/assets/..., http://localhost:8000/assets/...) → 절대 경로 변환."""
+    if not p or not isinstance(p, str):
+        return p
+    if os.path.exists(p):
+        return p
+    q = p
+    for prefix in ("http://localhost:8000", "http://127.0.0.1:8000"):
+        if q.startswith(prefix):
+            q = q[len(prefix):]
+            break
+    q = q.lstrip("/")
+    if q.startswith("assets/"):
+        q = q[len("assets/"):]
+    try:
+        from .config_utils import get_asset_dir
+    except (ImportError, ValueError):
+        from config_utils import get_asset_dir
+    candidate = os.path.join(get_asset_dir(), q)
+    if os.path.exists(candidate):
+        return candidate
+    return p
+
+
+_VIDEO_EXTS = (".mp4", ".webm", ".mov", ".avi", ".mkv")
+
+
+def _split_media_entry(entry):
+    """bg_images 항목 정규화 → (path, trim_in, trim_out, layout).
+
+    entry는 str 경로이거나 {"path":..., "in":..., "out":...,
+    "scale":..., "x":..., "y":...} dict. layout은
+    {"scale": 배율(1=핏), "x"/"y": 화면 비율 단위 오프셋} 또는 None.
+    """
+    if isinstance(entry, dict):
+        p = entry.get("path", "")
+        try:
+            tin = float(entry.get("in", 0) or 0)
+        except (TypeError, ValueError):
+            tin = 0.0
+        try:
+            tout = entry.get("out", None)
+            tout = float(tout) if tout is not None else None
+        except (TypeError, ValueError):
+            tout = None
+        if tin < 0:
+            tin = 0.0
+        if tout is not None and tout <= tin:
+            tout = None
+        layout = None
+        try:
+            s = float(entry.get("scale", 1) or 1)
+            x = float(entry.get("x", 0) or 0)
+            y = float(entry.get("y", 0) or 0)
+        except (TypeError, ValueError):
+            s, x, y = 1.0, 0.0, 0.0
+        s = min(max(s, 1.0), 3.0)
+        x = min(max(x, -0.5), 0.5)
+        y = min(max(y, -0.5), 0.5)
+        if abs(s - 1.0) > 1e-6 or abs(x) > 1e-6 or abs(y) > 1e-6:
+            layout = {"scale": s, "x": x, "y": y}
+        return p, tin, tout, layout
+    return entry, 0.0, None, None
+
+
+def _resize_and_fit(clip, target_size=(1920, 1080), duration=None, layout=None):
+    """전면이 최대한 보이게(Fit) 배치 + 블러 배경 합성.
+
+    layout={"scale": 배율(>=1), "x"/"y": 화면 비율 단위 오프셋}.
+    """
+    import numpy as np
+    tw, th = int(target_size[0]), int(target_size[1])
+    w, h = clip.size
+    scale = 1.0
+    ox, oy = 0.0, 0.0
+    if isinstance(layout, dict):
+        try:
+            scale = min(max(float(layout.get("scale", 1) or 1), 1.0), 3.0)
+            ox = min(max(float(layout.get("x", 0) or 0), -0.5), 0.5)
+            oy = min(max(float(layout.get("y", 0) or 0), -0.5), 0.5)
+        except (TypeError, ValueError):
+            scale, ox, oy = 1.0, 0.0, 0.0
+    s = min(tw / w, th / h) * scale
+    nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    fg = clip.resized(height=nh)
+    fw, fh = fg.size
+    dur = duration or clip.duration or 1.0
+    # 블러 배경 (실패 시 검은 배경)
+    try:
+        from PIL import Image, ImageFilter
+        src_dur = clip.duration or 0
+        t = src_dur / 2 if src_dur > 0.02 else 0
+        frame = clip.get_frame(min(max(t, 0), max(src_dur - 0.01, 0)))
+        img = Image.fromarray(frame).convert("RGB")
+        cs = max(tw / img.width, th / img.height)
+        bg_img = img.resize(
+            (max(1, int(img.width * cs)), max(1, int(img.height * cs))),
+            Image.BILINEAR,
+        )
+        x0 = max(0, (bg_img.width - tw) // 2)
+        y0 = max(0, (bg_img.height - th) // 2)
+        bg_img = bg_img.crop((x0, y0, x0 + tw, y0 + th)).filter(
+            ImageFilter.GaussianBlur(25)
+        )
+        bg = ImageClip(np.array(bg_img)).with_duration(dur)
+    except Exception as e:
+        print(f"Warning: Blur background failed, using black: {e}")
+        bg = ImageClip(np.zeros((th, tw, 3), dtype=np.uint8)).with_duration(dur)
+    px = (tw - fw) / 2 + ox * tw
+    py = (th - fh) / 2 + oy * th
+    comp = CompositeVideoClip(
+        [bg, fg.with_position((px, py))], size=(tw, th)
+    ).with_duration(dur)
+    return comp
+# 장면마다 줌인/줌아웃/좌우 팬을 순환 적용해 스틸 이미지에 카메라 움직임을 부여합니다.
+_KENBURNS_EFFECTS = ("zoom_in", "zoom_out", "pan_lr", "pan_rl")
+_KENBURNS_ZOOM_RANGE = 0.12  # 줌 배율 변화폭 (1.0 <-> 1.12, 방송용으로 은은하게)
+
+
+def _get_ffmpeg_exe():
+    """시스템 ffmpeg 우선, 없으면 imageio-ffmpeg 내장 바이너리 사용."""
+    import shutil
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _render_kenburns_clip(img_path, duration, target_size, effect, fps, tmpdir):
+    """단일 이미지를 Ken Burns 효과가 적용된 임시 mp4로 렌더링. 실패 시 예외 발생."""
+    tw, th = int(target_size[0]), int(target_size[1])
+    import math
+    # 올림으로 프레임 수를 잡아야 요청 길이보다 짧아지지 않음 (싱크 드리프트 방지)
+    frames = max(1, int(math.ceil(duration * fps)))
+    zr = _KENBURNS_ZOOM_RANGE
+
+    # 입력 analytical: 2배로 키워 crop (zoompan 떨림 방지)
+    uw, uh = tw * 2, th * 2
+    if effect == "zoom_in":
+        z_expr, x_expr, y_expr = f"1+{zr}*on/{frames}", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+    elif effect == "zoom_out":
+        z_expr, x_expr, y_expr = f"{1 + zr}-{zr}*on/{frames}", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+    elif effect == "pan_lr":
+        z_expr, x_expr, y_expr = f"{1 + zr}", f"(iw-iw/zoom)*on/{frames}", "(ih-ih/zoom)/2"
+    else:  # pan_rl
+        z_expr, x_expr, y_expr = f"{1 + zr}", f"(iw-iw/zoom)*(1-on/{frames})", "(ih-ih/zoom)/2"
+
+    vf = (
+        f"scale={uw}:{uh}:force_original_aspect_ratio=increase,"
+        f"crop={uw}:{uh},"
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={tw}x{th}:fps={fps}"
+    )
+    fd, tmp_path = tempfile.mkstemp(prefix="kb_", suffix=".mp4", dir=tmpdir)
+    os.close(fd)
+    cmd = [
+        _get_ffmpeg_exe(), "-y",
+        "-loop", "1", "-framerate", str(fps), "-i", img_path,
+        "-vf", vf,
+        "-frames:v", str(frames),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+        "-pix_fmt", "yuv420p",
+        tmp_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=duration * 10 + 90)
+    except subprocess.TimeoutExpired:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(f"Ken Burns render timeout ({effect})")
+    if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        err = (proc.stderr or "")[-500:]
+        raise RuntimeError(f"Ken Burns render failed ({effect}): {err}")
+    return tmp_path
+
+
+def _make_bg_clip(img_path, duration, target_size, effect_idx, fps, tmpdir, tmp_files, kb_enabled, trim_in=0.0, trim_out=None, layout=None):
+    """배경 클립 생성. Ken Burns 실패/비활성 시 핏(fit) 방식으로 폴백.
+
+    trim_in/trim_out: 영상 소스 내 사용할 구간(초). out이 None이면 in+duration까지.
+    layout: {"scale","x","y"} 전면 배치 조정. None이면 중앙 핏.
+    """
+    img_path = _resolve_media_path(img_path)
+    # 동영상 배경: 트림 구간 추출 후 길이 맞춤(루프/자름) + 리사이즈, Ken Burns 불필요
+    if isinstance(img_path, str) and img_path.lower().endswith(_VIDEO_EXTS):
+        try:
+            vclip = VideoFileClip(img_path)
+            start = max(0.0, trim_in or 0.0)
+            if vclip.duration and start >= vclip.duration:
+                start = 0.0
+            end = trim_out if (trim_out is not None and trim_out > start) else None
+            if end is not None and vclip.duration:
+                end = min(end, vclip.duration)
+            if start > 0 or end is not None:
+                vclip = vclip.subclipped(start, end) if end is not None else vclip.subclipped(start)
+            if vclip.duration and vclip.duration >= duration:
+                vclip = vclip.subclipped(0, duration)
+            else:
+                import math
+                n = max(2, math.ceil(duration / (vclip.duration or duration)))
+                vclip = concatenate_videoclips([vclip] * n).subclipped(0, duration)
+            vclip = _resize_and_fit(vclip, target_size, duration, layout)
+            print(f"DEBUG: Video background used: {os.path.basename(img_path)} (trim {start}-{end})")
+            return vclip
+        except Exception as e:
+            print(f"Warning: Video background failed, trying first frame: {e}")
+            try:
+                tmp = VideoFileClip(img_path)
+                frame = tmp.get_frame(0)
+                tmp.close()
+                clip = ImageClip(frame).with_duration(duration)
+                return _resize_and_fit(clip, target_size, duration, layout)
+            except Exception as e2:
+                print(f"Warning: First-frame fallback failed: {e2}")
+                raise
+    if kb_enabled and duration >= 1.0:
+        effect = _KENBURNS_EFFECTS[effect_idx % len(_KENBURNS_EFFECTS)]
+        try:
+            tmp_path = _render_kenburns_clip(img_path, duration, target_size, effect, fps, tmpdir)
+            tmp_files.append(tmp_path)
+            clip = VideoFileClip(tmp_path)
+            # 프레임 단위 반올림 오차를 잘라 정확한 길이로 맞춤 (누적 싱크 방지)
+            if clip.duration and clip.duration > duration + 1e-3:
+                clip = clip.subclipped(0, duration)
+            print(f"DEBUG: Ken Burns applied ({effect}) to {os.path.basename(img_path)}")
+            return clip
+        except Exception as e:
+            print(f"Warning: Ken Burns failed, using static image: {e}")
+    clip = ImageClip(img_path)
+    clip = clip.with_duration(duration)
+    clip = _resize_and_fit(clip, target_size, duration, layout)
+    return clip
+
+
 def parse_srt(srt_path=None, srt_content=None):
     """SRT 파일 또는 내용을 파싱하여 (start, end, text) 리스트를 반환합니다."""
     content = ""
@@ -92,6 +333,8 @@ def assemble_final_video(
     audio_path, srt_path, bg_images, output_path,
     subtitle_style=None, audio_edit=None, edited_srt=None,
     aspect_ratio="16:9 (Youtube)",  # 추가
+    scene_captions=None,  # [{start, end, text}] 씬별 상단 자막 밴드 (나레이션 자막과 별도 스타일)
+    caption_style=None,  # {font_size, color, bg_color, y_offset} 상단 밴드 스타일
     progress_callback=None, cancel_check=None
 ):
     """
@@ -191,11 +434,26 @@ def assemble_final_video(
         target_size = ASPECT_RATIOS.get(aspect_ratio, (1280, 720))
         # 만약 (1280, 720) 처럼 작다면 고품질을 위해 1.5배 스케일링 (1920x1080급)
         if target_size[0] < 1920 and target_size[1] < 1920:
-             if target_size[0] > target_size[1]: # Landscape
-                 scale = 1920 / target_size[0]
-             else: # Portrait
-                 scale = 1920 / target_size[1]
-             target_size = (int(target_size[0] * scale), int(target_size[1] * scale))
+            if target_size[0] > target_size[1]: # Landscape
+                scale = 1920 / target_size[0]
+            else: # Portrait
+                scale = 1920 / target_size[1]
+            target_size = (int(target_size[0] * scale), int(target_size[1] * scale))
+
+        # Ken Burns 설정 로드 (video_settings.kenburns / fps)
+        try:
+            _vconf = (load_config().get('video_settings', {}) or {})
+        except Exception:
+            _vconf = {}
+        kb_enabled = _vconf.get('kenburns', True)
+        fps = int(_vconf.get('fps', 24) or 24)
+        kb_tmpdir = os.path.join(get_export_dir(), ".kb_tmp")
+        os.makedirs(kb_tmpdir, exist_ok=True)
+        kb_tmp_files = []
+        if kb_enabled:
+            print(f"DEBUG: Ken Burns enabled (fps={fps})")
+        else:
+            print("DEBUG: Ken Burns disabled, using static images")
 
         print(f"DEBUG: Rendering video with aspect_ratio: {aspect_ratio}, size: {target_size}")
         print(f"DEBUG: Received bg_images type: {type(bg_images)}, length: {len(bg_images)}")
@@ -235,12 +493,16 @@ def assemble_final_video(
                     continue
                 
                 duration_per_image = duration_per_scene / len(paths)
-                for img_path in paths:
-                    if img_path and os.path.exists(img_path):
+                for entry in paths:
+                    img_path, trim_in, trim_out, layout = _split_media_entry(entry)
+                    resolved = _resolve_media_path(img_path)
+                    if resolved and os.path.exists(resolved):
                         try:
-                            clip = ImageClip(img_path)
-                            clip = clip.with_duration(duration_per_image)
-                            clip = _resize_and_crop(clip, target_size)
+                            clip = _make_bg_clip(
+                                resolved, duration_per_image, target_size,
+                                idx, fps, kb_tmpdir, kb_tmp_files, kb_enabled,
+                                trim_in, trim_out, layout
+                            )
                             clips.append(clip)
                         except Exception as e:
                             print(f"Error: Failed to process image {img_path}: {e}")
@@ -263,11 +525,16 @@ def assemble_final_video(
                     continue
                 
                 duration_per_image = duration / len(paths)
-                for img_path in paths:
-                    if img_path and os.path.exists(img_path):
+                for entry in paths:
+                    img_path, trim_in, trim_out, layout = _split_media_entry(entry)
+                    resolved = _resolve_media_path(img_path)
+                    if resolved and os.path.exists(resolved):
                         try:
-                            clip = ImageClip(img_path).with_duration(duration_per_image)
-                            clip = _resize_and_crop(clip, target_size)
+                            clip = _make_bg_clip(
+                                resolved, duration_per_image, target_size,
+                                idx, fps, kb_tmpdir, kb_tmp_files, kb_enabled,
+                                trim_in, trim_out, layout
+                            )
                             # concatenate 대신 start_time을 지정하여 Composite에 넣을 수도 있지만
                             # 여기서는 순서대로 concatenate 하기 위해 clips에 추가
                             clips.append(clip)
@@ -499,6 +766,93 @@ def assemble_final_video(
 
                 final_clips.append(txt_clip)
 
+        # 씬 자막 밴드 (상단, 독립 레이어): Step2의 씬별 subtitle을
+        # caption_style(프론트 편집값)로 표시, 없으면 기본값
+        if scene_captions:
+            _cs = caption_style if isinstance(caption_style, dict) else {}
+            try:
+                _cap_base = float(_cs.get('font_size', 13) or 13)
+            except (TypeError, ValueError):
+                _cap_base = 13.0
+            # 미리보기 px 기준 → 출력 해상도 스케일
+            # (미리보기 컨테이너 대비 1080p 비율 보정, 기존 렌더 결과와 동일 수준 유지)
+            _scale = target_size[1] / 1080.0
+            cap_font_size = max(14, min(int(_cap_base * _scale * 1.5), 48))
+            try:
+                cap_y_ratio = float(_cs.get('y_offset', 7) or 0) / 100.0
+            except (TypeError, ValueError):
+                cap_y_ratio = 0.07
+            cap_y = target_size[1] * min(max(cap_y_ratio, 0.0), 0.4)
+            cap_color = str(_cs.get('color', '#FFD76A') or '#FFD76A')
+            cap_bg = _cs.get('bg_color', 'rgba(0,0,0,0.45)')
+            cap_font = _ss.get('font', 'Noto Sans KR')
+            try:
+                from PIL import ImageFont
+                try:
+                    ImageFont.truetype(cap_font, 10)
+                except Exception:
+                    import platform as _pf
+                    if _pf.system() == 'Windows':
+                        _wd = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
+                        for _cand in ('malgun.ttf', 'NotoSansKR-Regular.otf', 'arial.ttf'):
+                            _fp = os.path.join(_wd, _cand)
+                            if os.path.exists(_fp):
+                                try:
+                                    ImageFont.truetype(_fp, 10)
+                                    cap_font = _fp
+                                    break
+                                except Exception:
+                                    continue
+            except Exception:
+                pass
+
+            def _cap_wrap(text, fsize, max_w):
+                words = text.split()
+                lines, cur, cur_len = [], [], 0
+                limit = max(1, int(max_w / max(1, fsize * 0.7)))
+                for w in words:
+                    if cur_len + len(w) > limit and cur:
+                        lines.append(' '.join(cur))
+                        cur, cur_len = [w], len(w)
+                    else:
+                        cur.append(w)
+                        cur_len += len(w) + 1
+                if cur:
+                    lines.append(' '.join(cur))
+                return '\n'.join(lines)
+
+            for c_idx, cap in enumerate(scene_captions):
+                try:
+                    c_start = float(cap.get("start", 0))
+                    c_end = float(cap.get("end", 0))
+                    c_text = str(cap.get("text", "")).strip()
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if not c_text or c_end <= c_start:
+                    continue
+                c_wrapped = _cap_wrap(c_text, cap_font_size, target_size[0] * 0.8)
+                try:
+                    _cap_kwargs = dict(
+                        text=c_wrapped,
+                        font=cap_font,
+                        font_size=cap_font_size,
+                        color=cap_color,
+                        stroke_color='black',
+                        stroke_width=1,
+                        method='label',
+                        text_align='center'
+                    )
+                    if cap_bg and cap_bg != 'transparent':
+                        _cap_kwargs['bg_color'] = cap_bg
+                    cap_clip = TextClip(**_cap_kwargs).with_duration(
+                        c_end - c_start
+                    ).with_start(c_start).with_position(
+                        ('center', cap_y)
+                    )
+                    final_clips.append(cap_clip)
+                except Exception as cap_e:
+                    print(f"Warning: Scene caption {c_idx} failed: {cap_e}")
+
         # 최종 영상 합성
         final_video = CompositeVideoClip(
             final_clips, size=target_size
@@ -595,6 +949,19 @@ def assemble_final_video(
         if len(audio_clips) > 1:
             final_audio.close()
         final_video.close()
+        for _c in clips:
+            try:
+                _c.close()
+            except Exception:
+                pass
+
+        # Ken Burns 임시 파일 정리
+        for _tmp in kb_tmp_files:
+            try:
+                if os.path.exists(_tmp):
+                    os.remove(_tmp)
+            except Exception:
+                pass
 
         return True
 

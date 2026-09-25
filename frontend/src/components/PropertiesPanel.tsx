@@ -1,5 +1,5 @@
 import React from 'react';
-import { type AppContent } from '../services/api';
+import { type AppContent, type CaptionStyle } from '../services/api';
 import { 
   Type, 
   Music, 
@@ -10,7 +10,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 
-type SelectedItemType = 'subtitle' | 'scene' | 'sfx' | 'bgm';
+type SelectedItemType = 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption';
 type SelectedItem = { id: string | number; type: SelectedItemType } | null;
 type SubtitlePreset = {
   label: string;
@@ -49,6 +49,10 @@ interface PropertiesPanelProps {
   setSrtData: React.Dispatch<React.SetStateAction<SrtItem[]>>;
   content: AppContent | null;
   setContent: React.Dispatch<React.SetStateAction<AppContent | null>>;
+  showSceneCaptions: boolean;
+  setShowSceneCaptions: (v: boolean) => void;
+  captionStyle: CaptionStyle;
+  setCaptionStyle: React.Dispatch<React.SetStateAction<CaptionStyle>>;
 }
 
 const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
@@ -62,7 +66,11 @@ const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
   srtData,
   setSrtData,
   content,
-  setContent
+  setContent,
+  showSceneCaptions,
+  setShowSceneCaptions,
+  captionStyle,
+  setCaptionStyle
 }) => {
   if (!content) {
     return (
@@ -100,6 +108,10 @@ const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
             subtitleStyle={subtitleStyle} 
             setSubtitleStyle={setSubtitleStyle} 
             subtitlePresets={subtitlePresets}
+            showSceneCaptions={showSceneCaptions}
+            setShowSceneCaptions={setShowSceneCaptions}
+            captionStyle={captionStyle}
+            setCaptionStyle={setCaptionStyle}
           />
         </div>
       </div>
@@ -141,14 +153,15 @@ const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
                     s.id === selectedItem.id ? { ...s, text: newText } : s
                   ));
                   
-                  // Sync back to content.script if it exists
+                  // Sync back to content.script if it exists (자막 분할 시 scene 기준)
                   if (content?.script) {
                     const srtIdx = srtData.findIndex(s => s.id === selectedItem.id);
-                    if (srtIdx !== -1 && content.script[srtIdx]) {
+                    const sc = srtIdx !== -1 ? ((srtData[srtIdx] as { scene?: number }).scene ?? srtIdx) : -1;
+                    if (sc !== -1 && content.script[sc]) {
                       setContent(prev => {
                         if (!prev) return prev;
                         const newScript = [...prev.script];
-                        newScript[srtIdx] = { ...newScript[srtIdx], text: newText };
+                        newScript[sc] = { ...newScript[sc], text: newText };
                         return { ...prev, script: newScript };
                       });
                     }
@@ -163,6 +176,10 @@ const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
               subtitleStyle={subtitleStyle} 
               setSubtitleStyle={setSubtitleStyle} 
               subtitlePresets={subtitlePresets}
+              showSceneCaptions={showSceneCaptions}
+              setShowSceneCaptions={setShowSceneCaptions}
+              captionStyle={captionStyle}
+              setCaptionStyle={setCaptionStyle}
             />
 
             <button
@@ -171,6 +188,54 @@ const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
               title="Remove Subtitle"
             >
               <Trash2 size={14} className="group-hover:rotate-12 transition-transform" /> REMOVE SUBTITLE
+            </button>
+          </div>
+        );
+      }
+
+      case 'caption': {
+        const sceneIdx = typeof selectedItem.id === 'number' ? selectedItem.id : parseInt(String(selectedItem.id));
+        const capValue = content?.scenes?.[sceneIdx]?.subtitle || '';
+        return (
+          <div className="space-y-8">
+            <div className="space-y-3">
+              <label className="text-[10px] font-black text-zinc-500 uppercase tracking-widest flex items-center gap-2" title="Scene Caption Content">
+                <Type size={12} className="text-amber-500" /> Scene Caption (Scene {sceneIdx + 1})
+              </label>
+              <p className="text-[9px] text-zinc-400 font-bold">상단 밴드에 표시되는 씬 요약 자막입니다. 하단 내레이션 자막과 별개입니다.</p>
+              <textarea
+                value={capValue}
+                onChange={(e) => {
+                  const newText = e.target.value;
+                  setContent((prev) => {
+                    if (!prev) return prev;
+                    const newScenes = [...prev.scenes];
+                    if (!newScenes[sceneIdx]) return prev;
+                    newScenes[sceneIdx] = { ...newScenes[sceneIdx], subtitle: newText };
+                    return { ...prev, scenes: newScenes };
+                  });
+                }}
+                className="w-full p-4 bg-amber-50/50 border border-amber-200 rounded-2xl text-xs focus:ring-1 focus:ring-amber-500 focus:border-amber-500 outline-none transition-all resize-none h-24 text-zinc-700 placeholder:text-zinc-400"
+                placeholder="씬 자막을 입력하세요 (비우면 표시 안 됨)"
+              />
+            </div>
+
+            <CaptionStyleSettings captionStyle={captionStyle} setCaptionStyle={setCaptionStyle} />
+
+            <button
+              onClick={() => {
+                setContent((prev) => {
+                  if (!prev) return prev;
+                  const newScenes = [...prev.scenes];
+                  if (!newScenes[sceneIdx]) return prev;
+                  newScenes[sceneIdx] = { ...newScenes[sceneIdx], subtitle: '' };
+                  return { ...prev, scenes: newScenes };
+                });
+              }}
+              className="w-full py-4 bg-rose-500/5 hover:bg-rose-500/10 text-rose-500/80 hover:text-rose-500 rounded-2xl text-[10px] font-black flex items-center justify-center gap-3 transition-all border border-rose-500/10 hover:border-rose-500/30 group"
+              title="Clear Scene Caption"
+            >
+              <Trash2 size={14} className="group-hover:rotate-12 transition-transform" /> CLEAR CAPTION
             </button>
           </div>
         );
@@ -442,10 +507,122 @@ interface SubtitleSettingsProps {
   subtitleStyle: SubtitleStyle;
   setSubtitleStyle: React.Dispatch<React.SetStateAction<SubtitleStyle>>;
   subtitlePresets: Record<string, SubtitlePreset>;
+  showSceneCaptions: boolean;
+  setShowSceneCaptions: (v: boolean) => void;
+  captionStyle: CaptionStyle;
+  setCaptionStyle: React.Dispatch<React.SetStateAction<CaptionStyle>>;
 }
 
-const SubtitleSettings: React.FC<SubtitleSettingsProps> = ({ subtitleStyle, setSubtitleStyle, subtitlePresets }) => (
+const CaptionStyleSettings: React.FC<{
+  captionStyle: CaptionStyle;
+  setCaptionStyle: React.Dispatch<React.SetStateAction<CaptionStyle>>;
+}> = ({ captionStyle, setCaptionStyle }) => (
+  <div className="space-y-3 rounded-xl border border-amber-200/60 bg-amber-50/40 p-3">
+    <div className="space-y-3">
+      <label className="text-[9px] font-black text-zinc-500 uppercase tracking-widest flex justify-between" title="Caption Font Size">
+        Caption Size
+        <span className="text-amber-600">{captionStyle.font_size}px</span>
+      </label>
+      <input
+        title="Caption Font Size"
+        placeholder="Caption Font Size"
+        type="range"
+        min="8"
+        max="40"
+        value={captionStyle.font_size}
+        onChange={(e) => setCaptionStyle({ ...captionStyle, font_size: parseInt(e.target.value) })}
+        className="w-full h-1.5 bg-zinc-200 rounded-full appearance-none cursor-pointer accent-amber-500"
+      />
+    </div>
+
+    <div className="space-y-3">
+      <label className="text-[9px] font-black text-zinc-500 uppercase tracking-widest flex justify-between" title="Caption Y Position">
+        Caption Y
+        <span className="text-amber-600">{captionStyle.y_offset}%</span>
+      </label>
+      <input
+        title="Caption Y Position"
+        placeholder="Caption Y Position"
+        type="range"
+        min="0"
+        max="40"
+        value={captionStyle.y_offset}
+        onChange={(e) => setCaptionStyle({ ...captionStyle, y_offset: parseInt(e.target.value) })}
+        className="w-full h-1.5 bg-zinc-200 rounded-full appearance-none cursor-pointer accent-amber-500"
+      />
+    </div>
+
+    <div className="space-y-3">
+      <label className="text-[9px] font-black text-zinc-500 uppercase tracking-widest flex justify-between" title="Caption Text Color">Caption Color</label>
+      <div className="flex items-center gap-2.5 bg-white p-2.5 rounded-xl border border-zinc-200">
+        <div className="w-8 h-8 rounded-lg overflow-hidden border border-zinc-300 shadow-sm shrink-0">
+          <input
+            title="Caption Text Color"
+            placeholder="Caption Text Color"
+            type="color"
+            value={captionStyle.color}
+            onChange={(e) => setCaptionStyle({ ...captionStyle, color: e.target.value })}
+            className="w-[150%] h-[150%] -translate-x-[15%] -translate-y-[15%] cursor-pointer border-none p-0 bg-transparent"
+          />
+        </div>
+        <div className="flex-1">
+          <span className="text-[10px] font-mono text-zinc-600 uppercase tracking-wider">{captionStyle.color}</span>
+          <p className="text-[8px] text-zinc-500 font-bold uppercase mt-0.5">Hex Code</p>
+        </div>
+      </div>
+    </div>
+
+    <div className="space-y-3">
+      <label className="text-[9px] font-black text-zinc-500 uppercase tracking-widest flex justify-between" title="Caption Background">
+        Caption BG
+        <button
+          onClick={() => setCaptionStyle({ ...captionStyle, bg_color: captionStyle.bg_color === 'transparent' ? 'rgba(0,0,0,0.45)' : 'transparent' })}
+          className="text-amber-600 hover:text-amber-700"
+          title="배경 투명 전환"
+        >
+          {captionStyle.bg_color === 'transparent' ? '투명 → 배경켬' : '배경끔'}
+        </button>
+      </label>
+      {captionStyle.bg_color !== 'transparent' && (
+        <div className="flex items-center gap-2.5 bg-white p-2.5 rounded-xl border border-zinc-200">
+          <div className="w-8 h-8 rounded-lg overflow-hidden border border-zinc-300 shadow-sm shrink-0">
+            <input
+              title="Caption Background Color"
+              placeholder="Caption Background Color"
+              type="color"
+              value={(captionStyle.bg_color || '').startsWith('#') ? captionStyle.bg_color as string : '#000000'}
+              onChange={(e) => setCaptionStyle({ ...captionStyle, bg_color: e.target.value })}
+              className="w-[150%] h-[150%] -translate-x-[15%] -translate-y-[15%] cursor-pointer border-none p-0 bg-transparent"
+            />
+          </div>
+          <div className="flex-1">
+            <span className="text-[10px] font-mono text-zinc-600 uppercase tracking-wider">{captionStyle.bg_color}</span>
+            <p className="text-[8px] text-zinc-500 font-bold uppercase mt-0.5">Hex Code</p>
+          </div>
+        </div>
+      )}
+    </div>
+  </div>
+);
+
+const SubtitleSettings: React.FC<SubtitleSettingsProps> = ({ subtitleStyle, setSubtitleStyle, subtitlePresets, showSceneCaptions, setShowSceneCaptions, captionStyle, setCaptionStyle }) => (
   <div className="space-y-6">
+    <div className="flex items-center justify-between bg-amber-50/60 border border-amber-200/60 rounded-xl px-3 py-2.5">
+      <div>
+        <p className="text-[10px] font-black text-zinc-700">씬 자막 밴드</p>
+        <p className="text-[9px] text-zinc-500 font-bold">Step2 씬 subtitle을 상단에 별도 표시</p>
+      </div>
+      <button
+        onClick={() => setShowSceneCaptions(!showSceneCaptions)}
+        title="씬 자막 표시 전환"
+        className={`relative w-9 h-5 rounded-full transition-all shrink-0 ${showSceneCaptions ? 'bg-amber-500' : 'bg-zinc-300'}`}
+      >
+        <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all ${showSceneCaptions ? 'left-[18px]' : 'left-0.5'}`} />
+      </button>
+    </div>
+    {showSceneCaptions && (
+      <CaptionStyleSettings captionStyle={captionStyle} setCaptionStyle={setCaptionStyle} />
+    )}
     <div className="space-y-3">
       <label className="text-[9px] font-black text-zinc-500 uppercase tracking-widest" title="Subtitle Presets">Subtitle Presets</label>
       <div className="grid grid-cols-2 gap-2.5">

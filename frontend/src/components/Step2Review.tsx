@@ -10,6 +10,7 @@ interface Step2ReviewProps {
   handleGenerate: () => void;
   setContent: (content: AppContent | null) => void;
   setAudio: (audio: { url?: string; srtUrl?: string; audio_path?: string; srt_path?: string; [key: string]: unknown } | null) => void;
+  setAudioScriptSig: (sig: string | null) => void;
   getTimelineRange: (data: ScriptItem[] | undefined, idx: number) => { start: string, end: string, duration: string };
   setCurrentStep: (step: number) => void;
   loading: boolean;
@@ -23,6 +24,7 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
   handleGenerate,
   setContent,
   setAudio,
+  setAudioScriptSig,
   getTimelineRange,
   setCurrentStep,
   loading
@@ -107,6 +109,62 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
           </div>
 
           <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-3 min-h-0 pb-10">
+            {(() => {
+              const lastEnd = content.scenes.length > 0
+                ? Number((content.scenes[content.scenes.length - 1] as unknown as Record<string, unknown>).time_end || 0)
+                : 0;
+              const total = content.total_duration ?? lastEnd;
+              const target = content.target_duration ?? duration;
+              const short = target > 0 && total < target * 0.7;
+              return (
+                <div className={`rounded-xl px-4 py-2.5 border text-xs font-bold flex items-center gap-2 ${short ? 'bg-amber-50 border-amber-200 text-amber-700' : 'bg-indigo-50/60 border-indigo-100 text-indigo-700'}`}>
+                  <Clock size={14} />
+                  <span>실제 분량: 약 {Math.round(total)}초 / 요청 {target}초 ({content.scenes.length}개 장면)</span>
+                  {short && <span>— 분량 미달. 다시 생성을 눌러 보완하세요.</span>}
+                </div>
+              );
+            })()}
+            {content.warning && (
+              <div className="rounded-xl px-4 py-2.5 border text-xs font-bold bg-amber-50 border-amber-200 text-amber-700">
+                {content.warning}
+              </div>
+            )}
+            {(content.title || content.hook_idea || (content.hashtags?.length ?? 0) > 0) && (
+              <div className="rounded-xl px-4 py-3 border border-purple-100 bg-purple-50/50 space-y-1.5">
+                {content.title && <p className="text-sm font-black text-gray-900">{content.title}</p>}
+                {(content.servings || (content.tools?.length ?? 0) > 0 || (content.total_cost_krw ?? 0) > 0) && (
+                  <p className="text-[11px] text-gray-500">
+                    {[content.servings,
+                      (content.tools?.length ?? 0) > 0 ? `도구: ${content.tools!.join('·')}` : '',
+                      (content.total_cost_krw ?? 0) > 0 ? `예상 비용: ${Number(content.total_cost_krw).toLocaleString()}원` : '',
+                    ].filter(Boolean).join(' · ')}
+                  </p>
+                )}
+                {content.hook_idea && <p className="text-xs text-gray-600"><span className="font-black text-purple-600">HOOK </span>{content.hook_idea}</p>}
+                {content.tone_and_manner && <p className="text-[11px] text-gray-500">톤앤매너: {content.tone_and_manner}</p>}
+                {content.grounded !== undefined && (
+                  <p className={`text-[11px] font-bold ${content.grounded ? 'text-green-600' : 'text-gray-400'}`}>
+                    {content.grounded ? `웹 자료 ${(content.sources || []).length}건 기반` : '웹 근거 없음 (일반 지식 기반)'}
+                  </p>
+                )}
+                {(content.sources?.length ?? 0) > 0 && (
+                  <div className="space-y-0.5 pt-0.5">
+                    {content.sources!.slice(0, 6).map((s, i) => (
+                      <a key={i} href={s.link} target="_blank" rel="noreferrer" className="block text-[10px] text-indigo-500 hover:underline truncate">
+                        [{i + 1}] {s.title || s.link}
+                      </a>
+                    ))}
+                  </div>
+                )}
+                {(content.hashtags?.length ?? 0) > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pt-0.5">
+                    {content.hashtags!.map((h, i) => (
+                      <span key={i} className="text-[10px] font-bold text-purple-700 bg-white px-2 py-0.5 rounded-md border border-purple-100">{h.startsWith('#') ? h : `#${h}`}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             {content.scenes.map((scene, idx) => (
               <div key={idx} className="bg-white rounded-xl p-3.5 border border-gray-100 hover:border-indigo-100 transition-all shadow-sm space-y-2.5">
                 <div className="flex items-center justify-between border-b border-gray-50 pb-1.5">
@@ -114,6 +172,11 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
                     <span className="px-2 py-0.5 bg-indigo-600 text-white rounded-full text-[10px] font-black uppercase tracking-wider">
                       Scene {idx + 1}
                     </span>
+                    {scene.section && (
+                      <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full text-[10px] font-black uppercase tracking-wider">
+                        {scene.section}
+                      </span>
+                    )}
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Speaker:</span>
                       <span className="text-[11px] font-bold text-indigo-600">
@@ -160,11 +223,30 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
                           newScript[scriptIdx].text = e.target.value;
                           setContent({ ...content, script: newScript });
                           setAudio(null);
+                          setAudioScriptSig(null);
                         }
                       }}
                       className="w-full bg-indigo-50/30 border border-indigo-100 rounded-lg p-2.5 text-[15px] text-gray-900 font-bold leading-relaxed italic focus:ring-2 focus:ring-indigo-500/5 focus:border-indigo-500 outline-none resize-none h-23 custom-scrollbar transition-all"
-                      placeholder="대본 내용을 입력하세요..."
+                      placeholder="대본 내용을 입력하세요... (비우면 무음 구간)"
                     />
+                    {(() => {
+                      const item = content.script.find((s) => s.scene_index === idx);
+                      if (!item || (!item.subtitle && !item.sfx)) return null;
+                      return (
+                        <div className="space-y-1 pt-1">
+                          {item.subtitle ? (
+                            <p className="text-[11px] text-gray-600 font-medium leading-relaxed">
+                              <span className="font-black text-teal-600">자막 </span>{item.subtitle}
+                            </p>
+                          ) : null}
+                          {item.sfx ? (
+                            <p className="text-[11px] text-gray-500 font-medium leading-relaxed">
+                              <span className="font-black text-amber-600">효과음 </span>{item.sfx}
+                            </p>
+                          ) : null}
+                        </div>
+                      );
+                    })()}
                   </div>
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">

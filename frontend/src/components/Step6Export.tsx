@@ -1,5 +1,6 @@
 import React from 'react';
 import { RefreshCw, Download } from 'lucide-react';
+import { assetUrl } from '../services/api';
 
 interface Step6ExportProps {
   renderResult: { video_path?: string; videoUrl?: string; [key: string]: string | number | undefined } | null;
@@ -14,7 +15,7 @@ const Step6Export: React.FC<Step6ExportProps> = ({
 
   const videoPath = renderResult.video_path || renderResult.videoUrl || '';
   const videoFilename = videoPath.split(/[\\/]/).pop();
-  const videoUrl = `http://localhost:8000/exports/${videoFilename}`;
+  const videoUrl = assetUrl(`/exports/${videoFilename}`);
 
   return (
     <div className="flex-1 w-full flex flex-col items-center overflow-hidden min-h-0 bg-gray-900 rounded-3xl p-4 md:p-6 animate-in fade-in zoom-in-95 duration-500">

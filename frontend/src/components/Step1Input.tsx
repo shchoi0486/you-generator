@@ -1,5 +1,19 @@
 import React from 'react';
-import { Edit2, FileText, ExternalLink, Clock, Sparkles } from 'lucide-react';
+import { Edit2, FileText, ExternalLink, Clock, Sparkles, Users, Clapperboard, ChefHat, ShoppingBag, Lightbulb, Plane } from 'lucide-react';
+import ShortsLab from './ShortsLab';
+import type { AppContent, Article, ShortsReport } from '../services/api';
+
+const NEWS_SUBMODES = [
+  { id: 'news_duo', name: '2인 대화', desc: 'BJ 이슈왕 vs 박 앵커' },
+  { id: 'news_solo', name: '1인 브리핑', desc: 'BJ 혼자 직설 브리핑 (숏폼 겸용)' },
+];
+
+const SHORTS_CATEGORIES = [
+  { id: 'recipe_short', name: '요리 / 레시피', desc: '계량·조리 순서까지 따라 만드는 레시피', icon: ChefHat },
+  { id: 'review_short', name: '제품 리뷰 / 추천', desc: '스펙·가격·장단점 솔직 리뷰', icon: ShoppingBag },
+  { id: 'knowledge_short', name: '지식 / 정보 전달', desc: '통념 깨고 3포인트 정리', icon: Lightbulb },
+  { id: 'travel_short', name: '여행 / 브이로그', desc: '장소·코스·꿀팁 담는 여행 숏폼', icon: Plane },
+];
 
 interface Step1InputProps {
   projectName: string;
@@ -12,6 +26,24 @@ interface Step1InputProps {
   setDirectText: (text: string) => void;
   duration: number;
   setDuration: (duration: number) => void;
+  templateId: string;
+  setTemplateId: (id: string) => void;
+  shortsMode: 'file' | 'youtube';
+  setShortsMode: (m: 'file' | 'youtube') => void;
+  shortsYtUrl: string;
+  setShortsYtUrl: (v: string) => void;
+  shortsHint: string;
+  setShortsHint: (v: string) => void;
+  shortsReport: ShortsReport | null;
+  setShortsReport: (r: ShortsReport | null) => void;
+  shortsTopic: string;
+  setShortsTopic: (v: string) => void;
+  shortsDuration: number;
+  setShortsDuration: (v: number) => void;
+  shortsCategory: string;
+  setShortsCategory: (v: string) => void;
+  onShortsComplete: (article: Article, content: AppContent) => void;
+  onShortsDirectCreate: (topic: string, duration: number, category: string) => void;
   handleScrape: () => void;
   loading: boolean;
 }
@@ -27,9 +59,30 @@ const Step1Input: React.FC<Step1InputProps> = ({
   setDirectText,
   duration,
   setDuration,
+  templateId,
+  setTemplateId,
+  shortsMode,
+  setShortsMode,
+  shortsYtUrl,
+  setShortsYtUrl,
+  shortsHint,
+  setShortsHint,
+  shortsReport,
+  setShortsReport,
+  shortsTopic,
+  setShortsTopic,
+  shortsDuration,
+  setShortsDuration,
+  shortsCategory,
+  setShortsCategory,
+  onShortsComplete,
+  onShortsDirectCreate,
   handleScrape,
   loading
 }) => {
+  const isNews = templateId === 'news_duo' || templateId === 'news_solo';
+  const isShortsCat = templateId === 'recipe_short' || templateId === 'review_short' || templateId === 'knowledge_short' || templateId === 'travel_short';
+  const isShortsLab = templateId === 'shorts_lab' || isShortsCat;
   return (
     <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar pb-10">
       <div className="space-y-8 max-w-4xl mx-auto">
@@ -40,6 +93,98 @@ const Step1Input: React.FC<Step1InputProps> = ({
       </div>
       
       <div className="space-y-6">
+        {/* Template Select */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button
+            onClick={() => setTemplateId(templateId === 'news_solo' ? 'news_solo' : 'news_duo')}
+            className={`flex items-center gap-3 p-4 rounded-xl border-2 text-left transition-all ${
+              isNews
+                ? 'border-indigo-500 bg-indigo-50/60 shadow-md shadow-indigo-100'
+                : 'border-gray-200 bg-white hover:border-gray-300'
+            }`}
+          >
+            <div className={`p-2 rounded-lg ${isNews ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-500'}`}>
+              <Users size={18} />
+            </div>
+            <div>
+              <p className={`text-sm font-bold ${isNews ? 'text-indigo-700' : 'text-gray-700'}`}>뉴스 / 이슈 브리핑</p>
+              <p className="text-[11px] text-gray-400 font-medium">기사 URL로 대본 생성</p>
+            </div>
+          </button>
+          <button
+            onClick={() => setTemplateId('shorts_lab')}
+            className={`flex items-center gap-3 p-4 rounded-xl border-2 text-left transition-all ${
+              isShortsLab
+                ? 'border-indigo-500 bg-indigo-50/60 shadow-md shadow-indigo-100'
+                : 'border-gray-200 bg-white hover:border-gray-300'
+            }`}
+          >
+            <div className={`p-2 rounded-lg ${isShortsLab ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-500'}`}>
+              <Clapperboard size={18} />
+            </div>
+            <div>
+              <p className={`text-sm font-bold ${isShortsLab ? 'text-indigo-700' : 'text-gray-700'}`}>숏폼 분석·재창작</p>
+              <p className="text-[11px] text-gray-400 font-medium">파일/유튜브 분석 후 패턴으로 새로 만들기</p>
+            </div>
+          </button>
+        </div>
+
+        {isShortsLab && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {SHORTS_CATEGORIES.map((c) => {
+              const Icon = c.icon;
+              const active = shortsCategory === c.id;
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => setShortsCategory(c.id)}
+                  title={c.desc}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${active ? 'bg-indigo-50 border-indigo-200 text-indigo-600' : 'bg-white border-gray-100 text-gray-400'}`}
+                >
+                  <Icon size={14} />
+                  {c.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {isNews && (
+          <div className="flex items-center gap-1.5">
+            {NEWS_SUBMODES.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setTemplateId(m.id)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${templateId === m.id ? 'bg-indigo-50 border-indigo-200 text-indigo-600' : 'bg-white border-gray-100 text-gray-400'}`}
+                title={m.desc}
+              >
+                {m.name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {isShortsLab ? (
+          <ShortsLab
+            onComplete={onShortsComplete}
+            mode={shortsMode}
+            setMode={setShortsMode}
+            ytUrl={shortsYtUrl}
+            setYtUrl={setShortsYtUrl}
+            hint={shortsHint}
+            setHint={setShortsHint}
+            report={shortsReport}
+            setReport={setShortsReport}
+            topic={shortsTopic}
+            setTopic={setShortsTopic}
+            duration={shortsDuration}
+            setDuration={setShortsDuration}
+            category={shortsCategory}
+            setCategory={setShortsCategory}
+            onDirectCreate={onShortsDirectCreate}
+          />
+        ) : (
+        <>
         {/* Project Name Input */}
         <div className="relative group">
           <div className="absolute left-4 top-1/2 -translate-y-1/2 flex items-center gap-2 text-gray-400">
@@ -159,6 +304,8 @@ const Step1Input: React.FC<Step1InputProps> = ({
             </button>
           </div>
         </div>
+        </>
+        )}
       </div>
     </div>
   </div>

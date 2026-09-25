@@ -7,6 +7,7 @@ import base64
 import time
 import asyncio
 import re
+import uuid
 try:
     from . import assets_downloader
     from .assets_downloader import clean_keyword
@@ -372,26 +373,327 @@ def _build_news_broll_scene(description, keyword):
     return base_prompt
 
 
-def refine_ai_prompt(description, keyword="", style="", model=""): 
-    style_prompt_prefix = f"({style}), " if style else "" 
+# --- FLUX / SDXL-Turbo prose 프롬프트 빌더 ---
+# 근거: BFL 공식 프롬프팅 가이드 + SDXL-Turbo 특성
+#  - 자연어 산문, 주제 우선 배치 (앞 토큰 가중치가 높음)
+#  - 30~80단어, 60단어 이하 권장 (SDXL-Turbo CLIP 77토큰 컷 대응)
+#  - 네거티브 프롬프트 미지원 → 긍정 서술로만 구성
+#  - 품질 수식어 1~2개로 제한 (filler는 오히려 독)
+_FLUX_FILLER_PATTERNS = [
+    r'cinematic lighting', r'dramatic lighting', r'soft lighting',
+    r'ultra\s*realistic', r'hyper\s*realistic', r'photo\s*realistic', r'realistic',
+    r'documentary photography', r'professional photography', r'professional cinematography',
+    r'editorial quality', r'highly detailed texture', r'highly detailed', r'sharp texture detail',
+    r'sharp focus', r'\b4k\b', r'\b8k\b', r'detailed environment', r'storytelling scene',
+    r'highly aesthetic[^,]*', r'purely visual[^,]*', r'purely scenic[^,]*', r'pure landscape[^,]*',
+    r'vast environment[^,]*', r'full scene view', r'full screen[^,]*', r'full frame[^,]*',
+    r'wide establishing shot', r'extreme long shot', r'distant third-person camera',
+    r'pure documentary scene', r'natural daily life', r'real world location',
+    r'cinematic composition', r'realistic environment', r'cinematic detail',
+    r'textless', r'wordless', r'blank surfaces', r'clean background', r'clean composition',
+    r'unobstructed foreground', r'eye-level perspective',
+]
+
+_FLUX_SHOT_HEAD_PATTERN = r'^\s*(wide shot|medium shot|establishing shot|aerial view|aerial shot|bird[\s-]?eye view|close-up|close up|over-the-shoulder shot|low-angle shot|high-angle shot|dutch angle|point-of-view shot|wide[\s-]angle shot|full body shot)\s+of\s+([^,]+),?\s*'
+
+_KO_TO_EN_LOCATION = {
+    "서울": "Seoul", "한국": "South Korea", "대한민국": "South Korea",
+    "아파트": "apartment complex", "시장": "traditional market", "마트": "grocery store",
+    "사무실": "office", "지하철": "subway station", "거리": "street", "정부": "government",
+    "청사": "government building", "시민": "citizens", "쇼핑객": "shoppers", "상인": "merchants",
+    "물가": "rising prices", "가격": "prices", "야경": "at night", "도시": "city",
+    "공장": "factory", "식료품": "groceries", "채소": "vegetables", "주택": "residential houses",
+    "도심": "downtown", "광장": "public plaza", "지도": "map", "가정": "family home",
+    "출근": "morning commute", "퇴근": "evening commute", "국회": "National Assembly",
+    "은행": "bank", "상점": "shops", "식당": "restaurant", "학교": "school",
+    "병원": "hospital", "공원": "park", "다리": "bridge", "강": "river", "산": "mountain",
+}
+
+
+# 모델별 프롬프트 프리셋 라우팅
+#  flux   : FLUX.1-schnell 계열 (pollinations-flux/deepinfra/cloudflare) - 산문 60단어, 네거티브 없음
+#  turbo  : SDXL-Turbo (pollinations-turbo) - 더 짧고 단순하게 40단어, 네거티브 없음
+#  gemini : Nano Banana - 90단어, 짧은 인용문구 허용, 네거티브 없음
+#  sd     : SD 계열 (local/horde/zimage) - 태그형 + 네거티브 프롬프트 유효
+MODEL_FAMILY_MAP = {
+    "pollinations": "turbo",  # 기본 순서 turbo 우선 (설정에서 변경 가능)
+    "turbo": "turbo",
+    "flux": "flux",
+    "cloudflare": "flux",
+    "deepinfra": "flux",
+    "gemini": "gemini",
+}
+
+# 간판/자막 등 문자 렌더링 위험 요소 (약한 모델은 blank로 회피)
+TEXT_RISK_PATTERN = r'signage|billboards?|scoreboards?|\blabels?|banner|poster|marquee|간판|전광판|표지판|현수막|플래카드'
+
+
+# 카테고리별 비주얼 프리셋 (대본 카테고리 ID와 공유: templates.py)
+# - style_booster: AI 생성 프롬프트에 주제 바로 뒤에 붙는 긍정 서술
+# - search_neg_ko/en: 웹 이미지 검색 부정어 (Bing -연산자)
+# - junk_words: 검색어에서 제거하는 마케팅 수식어 (정확 토큰 매치)
+# - sd_negative_add: SD 계열 네거티브 프롬프트 추가분
+CATEGORY_VISUAL = {
+    "recipe": {
+        "style_booster": "mouth-watering 8k food photography, steam rising, vibrant colors",
+        "search_neg_ko": "-자막 -워터마크 -로고 -글자",
+        "search_neg_en": "-watermark -logo -caption -text",
+        "junk_words": ["배달비", "아끼는", "초간단", "충격적인", "극강의", "미친", "대박", "초스피드", "핵꿀팁", "간단", "쉬운", "맛있는", "맛집", "꿀맛", "존맛"],
+        "sd_negative_add": "text, watermark, logo, human face, blurry",
+    },
+    "review": {
+        "style_booster": "commercial product photography, clean studio lighting, sharp focus",
+        "search_neg_ko": "-자막 -워터마크 -로고 -합성",
+        "search_neg_en": "-watermark -logo -caption -text",
+        "junk_words": ["솔직", "리얼", "찐", "후기", "추천", "대박", "가성비", "꿀템", "내돈내산"],
+        "sd_negative_add": "text, watermark, logo, messy background, blurry",
+    },
+    "knowledge": {
+        "style_booster": "clean 3D isometric illustration, infographic style, minimal background",
+        "search_neg_ko": "-자막 -워터마크 -로고",
+        "search_neg_en": "-watermark -logo -caption",
+        "junk_words": [],
+        "sd_negative_add": "text, watermark, photorealistic human, blurry",
+    },
+    "news": {
+        "style_booster": "",
+        "search_neg_ko": "-자막 -워터마크 -손 -손가락 -팔 -사람 -인물 -기자 -뉴스룸 -스튜디오",
+        "search_neg_en": "-hands -fingers -arms -human -person -reporter -newsroom -studio -자막 -워터마크",
+        "junk_words": [],
+        "sd_negative_add": "",
+    },
+    "travel": {
+        "style_booster": "breathtaking travel photography, golden hour glow, vivid natural colors",
+        "search_neg_ko": "-자막 -워터마크 -로고 -글자",
+        "search_neg_en": "-watermark -logo -caption -text",
+        "junk_words": ["초대박", "극강", "미친", "대박", "핵꿀팁", "인생샷", "여기안가면후회"],
+        "sd_negative_add": "text, watermark, logo, blurry",
+    },
+}
+
+
+# 장면 무드 → 조명/팔레트 부스터. LLM이 visual.mood에 적는 영문 태그와 매칭.
+# (대사 감정과 장면 내용에 맞는 분위기를 이미지 프롬프트에 주입)
+MOOD_LIGHTING = [
+    (("warm", "cozy", "happy", "joy", "comfort", "homely", "따뜻", "기쁨", "행복", "포근"),
+     "warm golden lighting, cozy atmosphere"),
+    (("tense", "urgent", "dramatic", "intense", "suspense", "긴장", "긴급", "극적"),
+     "dramatic high-contrast lighting, tense atmosphere"),
+    (("sad", "melancholy", "gloomy", "lonely", "슬픔", "우울", "쓸쓸"),
+     "soft overcast lighting, melancholic blue-gray tones"),
+    (("mysterious", "dark", "eerie", "noir", "신비", "미스터리", "어두운"),
+     "moody low-key lighting, mysterious shadows"),
+    (("fresh", "bright", "energetic", "lively", "활기", "상쾌", "밝은", "생기"),
+     "bright airy daylight, vibrant energetic mood"),
+    (("calm", "peaceful", "serene", "quiet", "평온", "고요", "평화"),
+     "soft diffused lighting, calm serene mood"),
+    (("romantic", "로맨틱", "설렘"),
+     "soft romantic lighting, warm pink tones"),
+    (("scary", "horror", "fear", "공포", "무서운"),
+     "dark horror lighting, deep shadows"),
+    (("funny", "comic", "playful", "유머", "재미", "익살"),
+     "bright playful lighting, cheerful vivid colors"),
+    (("luxury", "premium", "elegant", "고급", "럭셔리"),
+     "luxurious soft spotlight, elegant premium mood"),
+]
+
+
+def mood_booster(mood):
+    """무드 태그에서 조명/팔레트 부스터 문자열 반환. 매칭 없으면 빈 문자열."""
+    m = (mood or "").lower()
+    if not m.strip():
+        return ""
+    for keywords, booster in MOOD_LIGHTING:
+        if any(k in m for k in keywords):
+            return booster
+    return ""
+
+
+def normalize_visual_category(cat):
+    """대본 템플릿 ID/한글명 → visual 카테고리 키. 모르면 news(기존 동작)."""
+    c = (cat or "").strip().lower()
+    if c in ("recipe", "recipe_short", "요리", "레시피"):
+        return "recipe"
+    if c in ("review", "review_short", "리뷰", "제품"):
+        return "review"
+    if c in ("knowledge", "knowledge_short", "지식", "정보"):
+        return "knowledge"
+    if c in ("travel", "travel_short", "여행", "브이로그", "vlog"):
+        return "travel"
+    return "news"
+
+
+def _build_flux_prose_prompt(description, keyword="", style="", family="flux", category="news", mood=""):
+    """FLUX / SDXL-Turbo용 짧은 산문 프롬프트 (주제 우선, 60단어 이하)."""
+    text = " ".join(str(description or "").replace("\n", " ").split())
+
+    # 1. 샷 헤드 1개만 보존 (다양성은 Gemini가 담당, 여기선 중복만 제거)
+    shot_head = ""
+    m = re.match(_FLUX_SHOT_HEAD_PATTERN, text, flags=re.IGNORECASE)
+    if m:
+        shot_head = m.group(1).strip().lower()
+        subject_lead = m.group(2).strip()
+        text = (subject_lead + ", " + text[m.end():].strip()).strip(" ,")
+
+    # 2. POV/손 관련 단어 삭제 (네거티브 대신 그냥 뺌)
+    pov_terms = [
+        r'\bPOV\b', r'\bfirst person\b', r'\b1st person\b', r'\bpoint of view\b',
+        r'\bholding\b', r'\btouching\b', r'\bpointing\b', r'\bhands\b', r'\bfingers\b',
+        r'\barms\b', r'\bhand\b', r'\bfinger\b', r'\barm\b',
+    ]
+    for term in pov_terms:
+        text = re.sub(term, '', text, flags=re.IGNORECASE)
+
+    # 2b. 읽을 수 있는 문자 묘사는 blank 라벨로 치환 (약한 모델의 가짜 글리프 방지)
+    text = re.sub(
+        r'[A-Za-z ]*language text on [^,]+', 'blank labels with no readable text',
+        text, flags=re.IGNORECASE,
+    )
+
+    # 3. filler 품질 수식어 삭제
+    for pat in _FLUX_FILLER_PATTERNS:
+        text = re.sub(pat, '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', ' ', text).replace(' ,', ',').strip(' ,.')
+
+    # 문장 조각들을 쉼표 기준으로 정리 (빈 조각 제거)
+    parts = [p.strip(' .') for p in text.split(',')]
+    parts = [p for p in parts if len(p.split()) >= 2]
+    text = ", ".join(parts)
+
+    # 4. 한글 키워드 → 영문 로케이션 큐 (description에 없는 것만)
+    lowered = text.lower()
+    loc_terms = []
+    for ko, en in _KO_TO_EN_LOCATION.items():
+        if len(ko) == 1:
+            ko_hit = re.search(r'(?<![가-힣])' + ko + r'(?![가-힣])', keyword or '')
+        else:
+            ko_hit = ko in (keyword or '')
+        if ko_hit and en.lower() not in lowered:
+            loc_terms.append(en)
+            lowered += " " + en.lower()
+    # 그래프/데이터 장면은 추상 시각화로 명시 (한글 잔재 제거)
+    if re.search(r'그래프|차트|통계|\bgraph\b|\bchart\b|\bstatistics\b', (keyword or "") + " " + str(description or ""), flags=re.IGNORECASE):
+        if "data visualization" not in lowered:
+            loc_terms.append("abstract 3D data visualization with glowing lines on dark background")
+
+    if loc_terms:
+        text = f"{text}, {', '.join(loc_terms)}" if text else ", ".join(loc_terms)
+
+    # 4c. 카테고리 스타일 부스터 (주제 바로 뒤, 앞 토큰 가중치 활용)
+    booster = CATEGORY_VISUAL.get(category, CATEGORY_VISUAL["news"])["style_booster"]
+    if booster and booster.lower() not in text.lower():
+        text = f"{text}, {booster}" if text else booster
+
+    # 4d. 무드 부스터 (대사 감정·장면 분위기에 맞는 조명/팔레트)
+    mb = mood_booster(mood)
+    if mb and mb.lower() not in text.lower():
+        text = f"{text}, {mb}" if text else mb
+
+    # 4b. 간판/전광판 등 문자 위험 요소가 있으면 blank 명시 (긍정 서술)
+    #     Nano Banana는 인용된 짧은 문구까지만 허용, 그 외는 전부 blank
+    text_has_risk = re.search(TEXT_RISK_PATTERN, text, flags=re.IGNORECASE) is not None
+    if text_has_risk and "blank" not in text.lower():
+        text = f"{text}, blank signs and billboards with no readable text" if text else "blank signs with no readable text"
+
+    # 5. 조립: [샷 헤드] + 주제 산문 + [스타일] + 짧은 품질 꼬리 1개
+    segments = []
+    if shot_head:
+        segments.append(shot_head + " of")
+    if text:
+        segments.append(text.rstrip('.'))
+    if style:
+        segments.append(f"{style} style")
+    segments.append("documentary film still, natural light")
+    prompt = ", ".join(s for s in segments if s)
+
+    # 6. 단어 캡 (앞=주제 유지, turbo는 더 짧게)
+    cap = 40 if family == "turbo" else 60
+    words = prompt.split()
+    if len(words) > cap:
+        prompt = " ".join(words[:cap])
+    return prompt.strip()
+
+
+def _build_gemini_prompt(description, keyword="", style="", category="news", mood=""):
+    """Nano Banana용 프롬프트 (공식 가이드: 산문 + 짧은 인용문구 + 폰트 지정, 90단어 이하).
+
+    Nano Banana 2는 한글 포함 다국어 렌더링이 되므로, description에 이미
+    따옴표로 묶인 짧은 문구가 있을 때만 살리고 나머지는 blank 처리한다.
+    """
+    text = " ".join(str(description or "").replace("\n", " ").split())
+
+    # 따옴표 인용문구 추출 (25자 초과면 잘라서 blank扱い)
+    quoted = re.findall(r'"([^"]{1,25})"', text)
+    text = re.sub(r'"[^"]*"', '', text)
+
+    # POV/손 단어 삭제
+    for term in [r'\bPOV\b', r'\bfirst person\b', r'\bholding\b', r'\bhands\b', r'\bfingers\b', r'\barms\b']:
+        text = re.sub(term, '', text, flags=re.IGNORECASE)
+    # filler 정리 (Gemini는 이해력이 좋아 과도한 삭제 불필요, 품질구만 솎음)
+    for pat in [r'\b4k\b', r'\b8k\b', r'storytelling scene', r'detailed environment']:
+        text = re.sub(pat, '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', ' ', text).replace(' ,', ',').strip(' ,.')
+    parts = [p.strip(' .') for p in text.split(',')]
+    parts = [p for p in parts if len(p.split()) >= 2]
+    text = ", ".join(parts)
+
+    segments = [text.rstrip('.')] if text else []
+    # 카테고리 스타일 부스터 (주제 바로 뒤)
+    booster = CATEGORY_VISUAL.get(category, CATEGORY_VISUAL["news"])["style_booster"]
+    if booster and booster.lower() not in " ".join(segments).lower():
+        segments.append(booster)
+    # 무드 부스터 (대사 감정·장면 분위기에 맞는 조명/팔레트)
+    mb = mood_booster(mood)
+    if mb and mb.lower() not in " ".join(segments).lower():
+        segments.append(mb)
+    # 짧은 인용문구는 폰트 지정과 함께 유지 (25자 이하만)
+    for q in quoted[:2]:
+        segments.append(f'a sign reading "{q}" in bold sans-serif, high contrast')
+    if re.search(TEXT_RISK_PATTERN, text, flags=re.IGNORECASE) and not quoted:
+        segments.append("all other signs and billboards blank with no readable text")
+    if style:
+        segments.append(f"{style} style")
+    segments.append("photorealistic, natural light")
+    prompt = ", ".join(s for s in segments if s)
+
+    words = prompt.split()
+    if len(words) > 90:
+        prompt = " ".join(words[:90])
+    return prompt.strip()
+
+
+def refine_ai_prompt(description, keyword="", style="", model="", category="news", mood=""):
+    category = normalize_visual_category(category)
+    style_prompt_prefix = f"({style}), " if style else ""
+    mood_text = mood_booster(mood)
     
-    # [유지] 뉴스룸, 기자 등 특정 키워드 강제 제거 
-    news_keywords = [ 
-        "newsroom", "studio", "reporter", "journalist", "anchor", "announcer", 
-        "news desk", "breaking news", "broadcast", "television station", "tv studio", 
-        "news set", "anchor desk", "news ticker", "press conference", 
-        "뉴스룸", "기자", "아나운서", "뉴스 데스크", "방송국", "스튜디오", "앵커", 
-        "기자 회견", "속보", "뉴스 세트" 
-    ] 
-    
-    for nk in news_keywords: 
-        if re.search(r'[a-zA-Z]', nk): 
-            pattern = rf'\b{nk}\b' 
-        else: 
-            pattern = rf'{nk}' 
-        description = re.sub(pattern, '', description, flags=re.IGNORECASE).strip() 
-        if keyword: 
-            keyword = re.sub(pattern, '', keyword, flags=re.IGNORECASE).strip() 
+    # [유지] 뉴스룸, 기자 등 특정 키워드 강제 제거 (뉴스 카테고리만.
+    # 요리/리뷰의 "studio lighting" 같은 정상 표현까지 지워버리는 것 방지)
+    if category == "news":
+        news_keywords = [ 
+            "newsroom", "studio", "reporter", "journalist", "anchor", "announcer", 
+            "news desk", "breaking news", "broadcast", "television station", "tv studio", 
+            "news set", "anchor desk", "news ticker", "press conference", 
+            "뉴스룸", "기자", "아나운서", "뉴스 데스크", "방송국", "스튜디오", "앵커", 
+            "기자 회견", "속보", "뉴스 세트" 
+        ] 
+        
+        for nk in news_keywords: 
+            if re.search(r'[a-zA-Z]', nk): 
+                pattern = rf'\b{nk}\b' 
+            else: 
+                pattern = rf'{nk}' 
+            description = re.sub(pattern, '', description, flags=re.IGNORECASE).strip() 
+            if keyword: 
+                keyword = re.sub(pattern, '', keyword or "", flags=re.IGNORECASE).strip() 
+
+    # --- 모델별 프리셋 라우팅 ---
+    # 구형 태그 조립 경로(아래)는 local_sd/horde/zimage 전용으로 유지.
+    family = MODEL_FAMILY_MAP.get(model, "sd")
+    if family in ("flux", "turbo"):
+        return _build_flux_prose_prompt(description, keyword, style, family=family, category=category, mood=mood)
+    if family == "gemini":
+        return _build_gemini_prompt(description, keyword, style, category=category, mood=mood)
 
     # [수정] 뉴스룸 억제 구문도 부정어 대신 긍정어(풍경/사물 집중)로 변경 
     if not any(word in description.lower() for word in ["nature", "landscape", "abstract"]): 
@@ -484,13 +786,18 @@ def refine_ai_prompt(description, keyword="", style="", model=""):
     if "anime" in style_lower or "comic" in style_lower or "illustration" in style_lower: 
         negative_prompt = base_negative + ", photorealistic, realistic, photograph" 
     else: 
-        negative_prompt = base_negative + ", cartoon, illustration, drawing, painting, anime, sketch" 
+        negative_prompt = base_negative + ", cartoon, illustration, drawing, painting, anime, sketch"
+    # 카테고리별 SD 네거티브 추가
+    sd_add = CATEGORY_VISUAL.get(category, CATEGORY_VISUAL["news"])["sd_negative_add"]
+    if sd_add:
+        negative_prompt = negative_prompt + ", " + sd_add 
 
-    if is_flux: 
-        refined = f"{flux_text_suppression}, {style_prompt_prefix}{broll_scene_prompt}, {korean_identity_boost}, {quality_boost}" 
-    else: 
-        refined = f"{style_prompt_prefix}{broll_scene_prompt}, {korean_identity_boost}, {quality_boost}" 
-    
+    mood_suffix = f", {mood_text}" if mood_text and mood_text.lower() not in broll_scene_prompt.lower() else ""
+    if is_flux:
+        refined = f"{flux_text_suppression}, {style_prompt_prefix}{broll_scene_prompt}, {korean_identity_boost}, {quality_boost}{mood_suffix}"
+    else:
+        refined = f"{style_prompt_prefix}{broll_scene_prompt}, {korean_identity_boost}, {quality_boost}{mood_suffix}"
+
     return f"{refined} --no {negative_prompt}"
 
 
@@ -576,6 +883,143 @@ def generate_image_zimage(prompt, output_path, model_id="Tongyi-MAI/Z-Image-Turb
         print(f"Z-Image generation failed: {e}")
     return None
 
+# --- Google Gemini 이미지 생성 (Nano Banana) ---
+# 같은 Gemini API 키로 호출. 가성비: 2.5-flash-image 공식 $0.039/장,
+# 3.1-flash-lite-image가 그보다 저렴·빠름 (정확한 과금은 AI Studio 청구서 확인).
+# 모델 ID가 키/리전에서 막히면(404) 구 모델로 자동 폴백.
+GEMINI_IMAGE_MODELS_FALLBACK = [
+    "gemini-3.1-flash-lite-image",
+    "gemini-3.1-flash-image",
+]
+
+
+def generate_image_gemini(prompt, output_path, api_key, model=None, width=1280, height=720):
+    """
+    Google Gemini API 네이티브 이미지 생성.
+    REST generateContent → inlineData(base64) 디코딩 저장. 워터마크 없음(SynthID만 내장).
+    """
+    try:
+        if not api_key:
+            print("Gemini API key missing for image generation.")
+            return None
+
+        positive, _neg = _split_positive_negative_prompt(prompt)
+        # 화면비 힌트는 프롬프트에 자연어로 (씬은 보통 16:9)
+        if width >= height and "16:9" not in positive and "widescreen" not in positive.lower():
+            positive = f"{positive}, 16:9 widescreen aspect ratio"
+
+        candidates = []
+        if model:
+            candidates.append(model)
+        for m in GEMINI_IMAGE_MODELS_FALLBACK:
+            if m not in candidates:
+                candidates.append(m)
+
+        last_err = ""
+        for m in candidates:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+                body = {
+                    "contents": [{"parts": [{"text": positive}]}],
+                    "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+                }
+                resp = requests.post(
+                    url,
+                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=120,
+                )
+                if resp.status_code == 404:
+                    last_err = f"{m}: not available (404), trying next"
+                    print(f"Gemini image model {m} unavailable, fallback...")
+                    continue
+                if resp.status_code != 200:
+                    last_err = f"{m}: HTTP {resp.status_code} - {resp.text[:200]}"
+                    print(f"Gemini image failed: {last_err}")
+                    break  # 키/과금 문제는 다른 모델로도 동일하므로 중단
+                data = resp.json()
+                for cand in data.get("candidates", []):
+                    content = cand.get("content", {}) or {}
+                    for part in content.get("parts", []):
+                        inline = part.get("inlineData") or part.get("inline_data")
+                        if inline and inline.get("data"):
+                            with open(output_path, "wb") as f:
+                                f.write(base64.b64decode(inline["data"]))
+                            if os.path.getsize(output_path) > 1000:
+                                print(f"Generated with Gemini ({m}) - Saved to {output_path}")
+                                return output_path
+                            print("Gemini output too small.")
+                            return None
+                last_err = f"{m}: no image in response"
+                print(f"Gemini image ({m}): response had no image data.")
+                return None
+            except requests.exceptions.Timeout:
+                last_err = f"{m}: timeout"
+                print(f"Gemini image ({m}) timeout (120s).")
+                return None
+            except Exception as e:
+                last_err = f"{m}: {e}"
+                print(f"Gemini image ({m}) error: {e}")
+                return None
+        print(f"Gemini image generation failed: {last_err}")
+    except Exception as e:
+        print(f"Gemini image error: {e}")
+    return None
+
+
+def generate_image_deepinfra(prompt, output_path, api_key, model=None, width=1280, height=720):
+    """
+    DeepInfra OpenAI-호환 이미지 API (FLUX.1-schnell 기본).
+    요금: schnell $0.0005 × (w/1024) × (h/1024) → 1280×720 ≈ $0.00044 (약 0.6원/장).
+    """
+    try:
+        if not api_key:
+            print("DeepInfra API key missing.")
+            return None
+
+        positive, _neg = _split_positive_negative_prompt(prompt)
+        model_id = model or "black-forest-labs/FLUX-1-schnell"
+
+        sizes_to_try = [f"{width}x{height}", "1024x1024"]
+        last_err = ""
+        for size in sizes_to_try:
+            try:
+                resp = requests.post(
+                    "https://api.deepinfra.com/v1/openai/images/generations",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"prompt": positive, "model": model_id, "size": size, "n": 1},
+                    timeout=120,
+                )
+                if resp.status_code == 401:
+                    print("DeepInfra: invalid API key (401).")
+                    return None
+                if resp.status_code != 200:
+                    last_err = f"HTTP {resp.status_code} - {resp.text[:200]}"
+                    print(f"DeepInfra ({size}) failed: {last_err}")
+                    continue
+                data = resp.json()
+                items = data.get("data", []) if isinstance(data, dict) else []
+                if items and items[0].get("b64_json"):
+                    with open(output_path, "wb") as f:
+                        f.write(base64.b64decode(items[0]["b64_json"]))
+                    if os.path.getsize(output_path) > 1000:
+                        print(f"Generated with DeepInfra ({model_id}, {size}) - Saved to {output_path}")
+                        return output_path
+                    print("DeepInfra output too small.")
+                    return None
+                last_err = "no image in response"
+                print("DeepInfra: response had no image data.")
+                return None
+            except requests.exceptions.Timeout:
+                last_err = "timeout"
+                print("DeepInfra timeout (120s).")
+                return None
+        print(f"DeepInfra generation failed: {last_err}")
+    except Exception as e:
+        print(f"DeepInfra error: {e}")
+    return None
+
+
 def generate_image_local_sd(prompt, output_path, sd_url="http://127.0.0.1:7860", width=1280, height=720):
     """
     Local Stable Diffusion (Automatic1111) API
@@ -628,12 +1072,8 @@ def generate_image_cloudflare(prompt, output_path, account_id, api_token, width=
         # Split negative prompt if present
         positive, negative = _split_positive_negative_prompt(prompt)
 
-        payload = {
-            "prompt": positive,
-            "num_steps": 4,  # Flux Schnell is optimized for 4 steps
-            "width": width,
-            "height": height
-        }
+        # [수정] flux-1-schnell 스키마는 prompt 외 속성 거부 → prompt만 전송
+        payload = {"prompt": positive}
 
         response = requests.post(url, headers=headers, json=payload, timeout=90)
 
@@ -730,6 +1170,33 @@ def generate_image_pollinations(prompt, output_path, seed=None, width=1280, heig
 
     # 2. Fallback to Requests (Old method)
     try:
+        # [설정] Pollinations 모델 순서 + 요청 간 최소 간격 (무료 티어: IP당 15초에 1요청)
+        global _pollinations_last_request
+        try:
+            _pollinations_last_request
+        except NameError:
+            _pollinations_last_request = 0.0
+        try:
+            _img_conf = load_config().get('image_gen', {})
+        except Exception:
+            _img_conf = {}
+        _models_cfg = _img_conf.get('pollinations_models', ["turbo", "flux"])
+        if isinstance(_models_cfg, str):
+            _models_cfg = [m.strip() for m in _models_cfg.split(",") if m.strip()]
+        if not _models_cfg:
+            _models_cfg = ["turbo", "flux"]
+        try:
+            _min_interval = float(_img_conf.get('pollinations_min_interval', 16))
+        except (TypeError, ValueError):
+            _min_interval = 16.0
+
+        def _pace_pollinations():
+            global _pollinations_last_request
+            wait = _min_interval - (time.time() - _pollinations_last_request)
+            if wait > 0:
+                print(f"[Pollinations] Pacing: waiting {wait:.0f}s (free tier 1 req / 15s)...")
+                time.sleep(wait)
+
         # 1. Clean up prompt
         final_prompt = prompt
         negative = ""
@@ -738,55 +1205,73 @@ def generate_image_pollinations(prompt, output_path, seed=None, width=1280, heig
             final_prompt = parts[0]
             negative = parts[1]
 
+        # [수정] 과도하게 긴 프롬프트는 Pollinations 500 유발 → 단어 경계에서 450자로 단축
+        final_prompt = " ".join(final_prompt.split())
+        if len(final_prompt) > 450:
+            cut = final_prompt[:450].rsplit(" ", 1)[0]
+            final_prompt = cut if cut else final_prompt[:450]
+            print(f"[Pollinations] Prompt truncated to {len(final_prompt)} chars")
+
         safe_prompt = requests.utils.quote(final_prompt)
         safe_negative = requests.utils.quote(negative)
 
         if seed is None:
             seed = random.randint(1, 100000)
 
-        # 2. Construct URL
-        # Try flux first, then turbo
-        models = ["flux", "turbo"]
+        # 2. Construct URL (모델 순서 + 요청 간격은 설정에서 관리)
+        models = [m for m in _models_cfg if m]
 
-        for model in models:
-            try:
-                # Base URL
-                url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width={width}&height={height}&seed={seed}&nologo=true&model={model}"
-                if negative:
-                     url += f"&negative={safe_negative}"
+        for mi, model in enumerate(models):
+            # [수정] 연속 요청 rate-limit(429) 완화: 매 요청 전 최소 간격 강제
+            _pace_pollinations()
+            # 429 시 같은 모델 1회 재시도 (대기 후)
+            for attempt in range(2):
+                try:
+                    # Base URL
+                    url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width={width}&height={height}&seed={seed}&nologo=true&model={model}"
+                    if negative:
+                         url += f"&negative={safe_negative}"
 
-                # 3. Request
-                print(f"Requesting Pollinations (Web/{model}): {url[:100]}...")
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Referer': 'https://pollinations.ai/',
-                    'Origin': 'https://pollinations.ai'
-                }
+                    # 3. Request
+                    print(f"Requesting Pollinations (Web/{model}): {url[:100]}...")
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Referer': 'https://pollinations.ai/',
+                        'Origin': 'https://pollinations.ai'
+                    }
 
-                # Increase timeout to 60s for Flux
-                response = requests.get(url, headers=headers, timeout=60)
+                    # Increase timeout to 60s for Flux
+                    _pollinations_last_request = time.time()
+                    response = requests.get(url, headers=headers, timeout=60)
 
-                if response.status_code == 200:
-                    content_type = response.headers.get('Content-Type', '')
-                    if 'image' in content_type:
-                        with open(output_path, "wb") as f:
-                            f.write(response.content)
+                    if response.status_code == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        if 'image' in content_type:
+                            with open(output_path, "wb") as f:
+                                f.write(response.content)
 
-                        # Check file size
-                        if os.path.getsize(output_path) > 1000:
-                            print(f"Generated with Pollinations ({model}) - Saved to {output_path}")
-                            return output_path
+                            # Check file size
+                            if os.path.getsize(output_path) > 1000:
+                                print(f"Generated with Pollinations ({model}) - Saved to {output_path}")
+                                return output_path
+                            else:
+                                print(f"Pollinations output too small: {os.path.getsize(output_path)} bytes")
                         else:
-                            print(f"Pollinations output too small: {os.path.getsize(output_path)} bytes")
+                            print(f"Pollinations returned non-image: {content_type}")
+                        break  # 200이면 재시도 불필요
+                    elif response.status_code == 429:
+                        print(f"Pollinations ({model}) rate limited (429). Waiting {max(8, int(_min_interval))}s before retry {attempt + 1}/2...")
+                        time.sleep(max(8, int(_min_interval)))
+                        continue  # 같은 모델 재시도
+                    elif response.status_code == 530:
+                         print(f"Pollinations ({model}) failed with status 530 (Server Error/Blocked). Skipping other models.")
+                         return None  # 서버 차단/다운 시 다른 모델 시도 중단
                     else:
-                        print(f"Pollinations returned non-image: {content_type}")
-                elif response.status_code == 530:
-                     print(f"Pollinations ({model}) failed with status 530 (Server Error/Blocked). Skipping other models.")
-                     break # Skip other models if server is blocking/down
-                else:
-                    print(f"Pollinations ({model}) failed with status {response.status_code}")
-            except Exception as e:
-                 print(f"Pollinations ({model}) error: {e}")
+                        print(f"Pollinations ({model}) failed with status {response.status_code}")
+                        break  # 500 등은 다음 모델로
+                except Exception as e:
+                     print(f"Pollinations ({model}) error: {e}")
+                     break
 
     except Exception as e:
         print(f"Pollinations failed: {e}")
@@ -1013,7 +1498,70 @@ def download_visual_content(scene, index, output_dir=None, cancel_check=None):
     return None
 
 
-async def generate_scene_candidates(scene, index, project_id="default", ai_count=1, search_count=5, generate_ai=True, generate_search=True, width=1280, height=720, style="", ai_model="pollinations", search_engine="bing", topic="", visual_guide="", cancel_check=None):
+def search_pexels_videos(keyword, count=4):
+    """Pexels 스톡 비디오 검색 → mp4 로컬 다운로드. [{url, path, preview}]"""
+    config = load_config()
+    img_conf = config.get("image_gen", {})
+    api_key = img_conf.get("pexels_api_key")
+    if not api_key:
+        raise ValueError("Pexels API 키가 없습니다. 설정 화면에서 입력하세요 (pexels.com 무료 발급).")
+
+    preview_base = os.path.join(get_asset_dir(), "previews", "stock")
+    os.makedirs(preview_base, exist_ok=True)
+
+    def _query(q):
+        resp = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": api_key},
+            params={"query": q, "per_page": count, "orientation": "landscape", "size": "medium"},
+            timeout=20,
+        )
+        if resp.status_code == 401:
+            raise ValueError("Pexels API 키가 유효하지 않습니다 (401).")
+        if resp.status_code != 200:
+            raise ValueError(f"Pexels 검색 실패: HTTP {resp.status_code}")
+        return resp.json().get("videos", [])
+
+    videos = _query(keyword)
+    if not videos and re.search(r"[ㄱ-힣]", keyword or ""):
+        # 한글 쿼리 실패 시 영문 변환 재시도
+        en_q = keyword
+        for ko, en in _KO_TO_EN_LOCATION.items():
+            en_q = en_q.replace(ko, f" {en} ")
+        en_q = " ".join(en_q.split())
+        print(f"[Pexels] Retry with English query: {en_q}")
+        videos = _query(en_q)
+
+    results = []
+    import time as _t
+    for idx, v in enumerate(videos[:count]):
+        files = [f for f in (v.get("video_files") or []) if (f.get("link") or "").endswith(".mp4")]
+        if not files:
+            continue
+        big = [f for f in files if (f.get("width") or 0) >= 1280]
+        pick = min(big, key=lambda f: f["width"]) if big else max(files, key=lambda f: f.get("width") or 0)
+        try:
+            dl = requests.get(pick["link"], timeout=60)
+            if dl.status_code != 200 or len(dl.content) < 50000:
+                continue
+            # 씬이 달라도 같은 초에 저장하면 파일명이 겹쳐 덮어써지므로 uuid 포함
+            fname = f"stock_{int(_t.time())}_{idx}_{uuid.uuid4().hex[:6]}.mp4"
+            path = os.path.join(preview_base, fname)
+            with open(path, "wb") as f:
+                f.write(dl.content)
+            rel = os.path.relpath(path, get_asset_dir())
+            results.append({
+                "url": f"/assets/{rel.replace(os.sep, '/')}",
+                "path": path,
+                "preview": v.get("image", ""),
+            })
+            print(f"[Pexels] Saved {fname} ({len(dl.content)//1024}KB)")
+        except Exception as e:
+            print(f"[Pexels] Download failed: {e}")
+    return results
+
+
+async def generate_scene_candidates(scene, index, project_id="default", ai_count=1, search_count=5, generate_ai=True, generate_search=True, width=1280, height=720, style="", ai_model="pollinations", search_engine="bing", topic="", visual_guide="", cancel_check=None, category=""):
     """
     UI 미리보기용으로 AI 후보(ai_count)와 검색 후보(search_count)를 생성/수집하여 반환합니다.
     """
@@ -1042,6 +1590,9 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
         if match:
             clean_visual = match.group(1)
     clean_visual = clean_keyword(clean_visual) if clean_visual else ""
+
+    # 카테고리 정규화 (대본 템플릿 ID와 공유, 모르면 news = 기존 동작)
+    vcat = normalize_visual_category(category)
 
     selected_ai_model = ai_model
     if selected_ai_model == "pollinations" and img_conf.get('use_zimage', False) and not img_conf.get('use_pollinations', True):
@@ -1079,7 +1630,7 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             seed = random.randint(1, 1000000)
             path = os.path.join(preview_dir, f"scene_{index}_ai_{i}_{seed}.jpg")
 
-            refined = refine_ai_prompt(description, keyword, style, model=selected_ai_model)
+            refined = refine_ai_prompt(description, keyword, style, model=selected_ai_model, category=vcat, mood=scene.get('mood', ''))
 
             res = None
             if selected_ai_model == "pollinations":
@@ -1096,6 +1647,20 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
                 res = generate_image_cloudflare(refined, path, cf_acc, cf_token, width=width, height=height)
             elif selected_ai_model == "horde":
                 res = generate_image_ai_horde(refined, path, width=width, height=height)
+            elif selected_ai_model == "gemini":
+                res = generate_image_gemini(
+                    refined, path,
+                    config.get('gemini_api_key'),
+                    model=img_conf.get('gemini_image_model'),
+                    width=width, height=height,
+                )
+            elif selected_ai_model == "deepinfra":
+                res = generate_image_deepinfra(
+                    refined, path,
+                    img_conf.get('deepinfra_api_key'),
+                    model=img_conf.get('deepinfra_image_model'),
+                    width=width, height=height,
+                )
 
             if not res and selected_ai_model != "pollinations":
                 res = generate_image_pollinations(refined, path, seed=seed, width=width, height=height)
@@ -1109,20 +1674,40 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
     if generate_search:
         # [수정] 검색용 키워드는 너무 과하게 정제하면 핵심 단어(지하철, 출근길 등)가 사라질 수 있음
         # [개편] 사용자 요청: TOPIC과 Visual Guide(original keyword) 우선 사용
-        raw_keyword = scene.get('keyword', '')
-        desc = scene.get('description', '')
+        raw_keyword = scene.get('keyword') or ''
+        if not raw_keyword:
+            # 구 프론트 호환: keywords 리스트(첫 원소가 실제 짧은 키워드) 폴백
+            kw_list = [k for k in (scene.get('keywords') or []) if k and str(k).strip()]
+            if kw_list:
+                raw_keyword = str(kw_list[0])
+        desc = scene.get('description', '') or ''
+
+        # [수정] generic topic(기본 프로젝트명 등)은 검색어 오염원이므로 무시
+        GENERIC_TOPICS = {'새 프로젝트', '프로젝트', '새프로젝트', 'new project', 'untitled', 'project', 'test', '제목 없음'}
+        if clean_topic and (clean_topic.strip().lower() in GENERIC_TOPICS or len(clean_topic.strip()) <= 1):
+            clean_topic = ''
+        # [수정] visual_guide가 긴 영문 description 그대로면 앞 5단어 잘라쓰기 금지 → 아래 추출 로직으로 넘김
+        clean_visual_for_combo = clean_visual
+        if clean_visual and len(clean_visual.split()) > 8 and not raw_keyword:
+            clean_visual_for_combo = ''
         
-        # 0. 우선순위: topic + visual_guide 조합
-        if clean_topic or clean_visual:
+        # 0. 우선순위: scene keyword를 맨 앞에 (가장 중요), topic/visual은 보조
+        if raw_keyword or clean_topic or clean_visual_for_combo:
             # topic과 visual에서 핵심 단어만 추출 (중복 제거)
             combined_words = []
-            for text in [clean_topic, clean_visual]:
+            for text in [raw_keyword, clean_topic, clean_visual_for_combo]:
                 if not text: continue
                 for w in text.split():
                     if w.lower() not in [x.lower() for x in combined_words] and len(w) > 1:
                         combined_words.append(w)
+
+            # 카테고리별 검색 오염어 제거 (요리/리뷰: 마케팅 수식어)
+            junk = CATEGORY_VISUAL.get(vcat, CATEGORY_VISUAL["news"])["junk_words"]
+            if junk:
+                junk_lower = {j.lower() for j in junk}
+                combined_words = [w for w in combined_words if w.lower() not in junk_lower]
             
-            search_base = " ".join(combined_words[:5])
+            search_base = " ".join(combined_words[:8])
             print(f"[Search] Using Topic/Visual based keywords: {search_base}")
         else:
             # 기존 추출 로직 (fallback)
@@ -1131,7 +1716,7 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             
             # 1. 인물(Who) 추출 - 더 유연한 패턴으로 개선 (Korean 위치 상관없이 추출)
             # 먼저 인물 유형(Role)을 추출
-            roles = r'(middle\s*age|adult|woman|man|lady|gentleman|office\s+worker|child|parent|elderly|family|elder|senior|grandparent|grandmother|grandfather|중년|성인|여성|남성|직장인|사람|아이|부모|노인|할머니|할아버지|가족)'
+            roles = r'(middle\s*age|adult|woman|man|lady|gentleman|office\s+worker|shoppers?|merchants?|citizens?|child|parent|elderly|family|elder|senior|grandparent|grandmother|grandfather|중년|성인|여성|남성|직장인|쇼핑객|상인|시민|사람|아이|부모|노인|할머니|할아버지|가족)'
             role_matches = re.findall(roles, f"{raw_keyword} {desc_clean}", re.I)
             
             # 중복 제거 및 "Korean" 접두어 부여
@@ -1160,7 +1745,7 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             who = " ".join(who_list[:4]) # 인물 키워드 추출 개수 확대
             
             # 2. 장소(Where) 추출 - 더 포괄적인 패턴으로 확장
-            where_pattern = r'(office|subway|street|home|desk|park|table|kitchen|city|seoul|korea|building|skyscraper|사무실|지하철|거리|집|책상|공원|식탁|주방|서울|한국|빌딩|건물)s?'
+            where_pattern = r'(office|subway|street|home|desk|park|table|kitchen|city|seoul|korea|building|skyscraper|markets?|mart|store|apartment|사무실|지하철|거리|집|책상|공원|식탁|주방|서울|한국|빌딩|건물|시장|마트|상점|아파트)s?'
             where_matches = re.findall(where_pattern, f"{raw_keyword} {desc_clean}", re.I)
             where_list = []
             for w in where_matches:
@@ -1168,7 +1753,7 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             where = " ".join(where_list[:3])
             
             # 3. 상황/감정(What/How) 추출 - 더 포괄적인 패턴으로 확장
-            how_pattern = r'(tired|exhausted|stressed|overwhelmed|night|dark|glowing|emergency|situation|disengaged|burden|studying|walking|looking|bill|role|지친|피곤한|힘든|야근|야경|긴급|상황|스트레스|부담|공부|산책|보는|고지서|역할)s?'
+            how_pattern = r'(tired|exhausted|stressed|overwhelmed|night|dark|glowing|emergency|situation|disengaged|burden|studying|walking|looking|bill|role|prices?|rising|vegetables?|tax|graph|지친|피곤한|힘든|야근|야경|긴급|상황|스트레스|부담|공부|산책|보는|고지서|역할|물가|가격|상승|채소|세금|그래프)s?'
             how_matches = re.findall(how_pattern, f"{raw_keyword} {desc_clean}", re.I)
             how_list = []
             for h in how_matches:
@@ -1204,7 +1789,10 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
                     "공원": "park", "식탁": "table", "공부": "studying", "산책": "walking", "부담": "burden", "고지서": "bills",
                     "중년": "middle aged", "역할": "role", "할머니": "grandmother", "할아버지": "grandfather",
                     "노인": "senior", "어르신": "elderly", "야경": "night view", "도시": "city", "풍경": "landscape",
-                    "긴급": "emergency", "상황": "situation"
+                    "긴급": "emergency", "상황": "situation", "시장": "market", "쇼핑객": "shoppers",
+                    "상인": "merchant", "시민": "citizens", "물가": "prices", "가격": "price",
+                    "상승": "rising", "채소": "vegetables", "세금": "tax", "그래프": "graph",
+                    "아파트": "apartment", "조명": "lights", "도심": "downtown"
                 }
                 for ko, en in translation_map.items():
                     combined_base = combined_base.replace(ko, en)
@@ -1258,22 +1846,23 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
 
         # Determine language
         is_korean = bool(re.search(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', search_base))
-        
+
+        # 카테고리별 검색 부정어 (뉴스용 -기자 -뉴스룸 등이 요리에 새는 것 방지)
+        cat_neg = CATEGORY_VISUAL.get(vcat, CATEGORY_VISUAL["news"])
         if is_korean:
             # 한국어/영어 모두 Bing 최우선 (사용자 요청: Google/Naver 제거)
             search_engine = "bing"
-            # [수정] 무조건 한글로 정제 (사용자 요청) + 강력한 부정어 추가 (손, 인체 등)
-            search_keyword = f"{search_base} -자막 -워터마크 -손 -손가락 -팔 -사람 -인물 -기자 -뉴스룸 -스튜디오"
+            search_keyword = f"{search_base} {cat_neg['search_neg_ko']}"
         else:
             # 영어여도 Bing/DDG를 위해 한국어 정제어 추가 + 강력한 부정어 추가
             search_engine = "bing"
-            search_keyword = f"{search_base} -hands -fingers -arms -human -person -reporter -newsroom -studio -자막 -워터마크"
+            search_keyword = f"{search_base} {cat_neg['search_neg_en']}"
         
         # [추가] 데이터 시각화나 추상적 이미지인 경우 부정어 강화
         if any(word in search_base.lower() for word in ["data", "visualization", "graph", "chart", "abstract", "network", "digital"]):
             search_keyword += " -interaction -touching -pointing -monitor -screen"
         
-        print(f"[Search] Scene {index} - Original Keyword: {scene.get('keyword')}")
+        print(f"[Search] Scene {index} - Original Keyword: {raw_keyword or scene.get('keyword')} (category={vcat})")
         print(f"[Search] Scene {index} - Base Query: {search_base}")
         print(f"[Search] Enhanced search query for scene {index}: {search_keyword} using {search_engine}")
         

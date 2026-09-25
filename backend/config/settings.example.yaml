@@ -2,15 +2,25 @@ azure_speech_key: null
 azure_speech_region: koreacentral
 cloudflare_worker_url: https://azure-tts.seriessnap-co.workers.dev
 crawler_verbose: true
-dashscope_api_key: sk-df26d7ad3c7548d69defea91b7bdbcf5
+dashscope_api_key: null  # <-- 여기에 발급받은 키 입력
 fal_key: null
 flux_mode: false
-gemini_api_key: AIzaSyDjHYQ1i_YC_o4-WnYePzojiLQN6q2yT2Q
+gemini_api_key: null  # <-- 여기에 발급받은 키 입력
+gemini_text_models:
+- gemini-3.5-flash-lite
 image_gen:
   cloudflare_account_id: bd4bd0de2c7eef66047c8863ea823dd5
-  cloudflare_api_token: OGOYxWdfF0Ca_mdOQy3n2p6WKEbDB4pz4tcUIRpQ
+  cloudflare_api_token: null  # <-- 여기에 발급받은 키 입력
+  deepinfra_api_key: null
+  deepinfra_image_model: black-forest-labs/FLUX-1-schnell
+  gemini_image_model: gemini-3.1-flash-lite-image
   local_sd_url: http://127.0.0.1:7860
-  use_ai_horde: false
+  pexels_api_key: null  # <-- 여기에 발급받은 키 입력
+  pollinations_min_interval: 16
+  pollinations_models:
+  - flux
+  - turbo
+  use_ai_horde: true
   use_cloudflare: true
   use_local_sd: false
   use_pollinations: true
@@ -19,6 +29,8 @@ image_gen:
   zimage_steps: 4
 login_check_selector: .gnb_my
 login_url: https://nid.naver.com/nidlogin.login
+naver_client_id: null
+naver_client_secret: null
 prompt_settings:
   custom_instructions: '[최종본] 쇼츠·롱폼 대본 & 편집 소스 자동 생성기 지침
 
@@ -190,15 +202,18 @@ prompt_settings:
     어그로를 끌게 하자.'
 qwen_local_model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 qwen_model: qwen3-tts-flash
+tavily_api_key: null
 use_azure_tts: true
 use_cloudflare_tts_proxy: true
 use_local_qwen: false
 use_qwen_tts: true
 video_settings:
   fps: 24
+  kenburns: true
   resolution:
   - 1920
   - 1080
 voice_settings:
   bj_issue_king: ko-KR-SunHiNeural
   park_anchor: ko-KR-InJoonNeural
+youtube_api_key: null

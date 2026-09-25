@@ -1,5 +1,5 @@
 import React from 'react';
-import { type AppContent, type SceneCandidates, type ScriptItem } from '../services/api';
+import { type AppContent, type SceneCandidates, type ScriptItem, type SceneLayout, type CaptionStyle } from '../services/api';
 import VideoEditor from './VideoEditor';
 
 interface Step5TimelineProps {
@@ -19,6 +19,13 @@ interface Step5TimelineProps {
   gapDuration: number;
   selectedVisuals: Record<number, string[]>;
   setSelectedVisuals: React.Dispatch<React.SetStateAction<Record<number, string[]>>>;
+  clipTrims: Record<number, Record<string, { in: number; out: number | null }>>;
+  sceneLayouts: Record<number, SceneLayout>;
+  setSceneLayouts: React.Dispatch<React.SetStateAction<Record<number, SceneLayout>>>;
+  showSceneCaptions: boolean;
+  setShowSceneCaptions: (v: boolean) => void;
+  captionStyle: CaptionStyle;
+  setCaptionStyle: React.Dispatch<React.SetStateAction<CaptionStyle>>;
   visualCandidates: Record<number, SceneCandidates>;
   setVisualCandidates: React.Dispatch<React.SetStateAction<Record<number, SceneCandidates>>>;
   subtitleStyle: {
@@ -49,6 +56,7 @@ interface Step5TimelineProps {
   }>>;
   srtData: { id: number; start: number; end: number; text: string }[];
   setSrtData: React.Dispatch<React.SetStateAction<{ id: number; start: number; end: number; text: string }[]>>;
+  setSrtScriptSig: (sig: string | null) => void;
   editingSrtId: number | null;
   setEditingSrtId: (id: number | null) => void;
   setSceneDurations: React.Dispatch<React.SetStateAction<number[]>>;

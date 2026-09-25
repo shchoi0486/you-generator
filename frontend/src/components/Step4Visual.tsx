@@ -8,6 +8,7 @@ import {
   Maximize,
   Search,
   ChevronLeft,
+  ChevronRight,
   Cloud,
   Loader2,
   Trash2,
@@ -16,12 +17,19 @@ import {
   X,
   Pencil,
   Edit2,
-  Save
+  Save,
+  Upload,
+  Film
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { 
-  type AppContent, 
-  type SceneCandidates
+import {
+  type AppContent,
+  type SceneCandidates,
+  type StockVideo,
+  type RefineClip,
+  type RefineResult,
+  api,
+  assetUrl
 } from '../services/api';
 
 interface Step4VisualProps {
@@ -38,6 +46,7 @@ interface Step4VisualProps {
   selectedAiModel: string;
   setSelectedAiModel: (model: string) => void;
   fetchAllCandidates: (force?: boolean) => void;
+  fetchAllByType: (type: 'ai' | 'search' | 'stock') => void;
   fetchCandidates: (index: number, type?: 'all' | 'ai' | 'search', model?: string, isAppend?: boolean, customKeyword?: string) => void;
   editingSceneIndex: number | null;
   setEditingSceneIndex: (index: number | null) => void;
@@ -49,7 +58,17 @@ interface Step4VisualProps {
   setZoomedImage: (url: string | null) => void;
   handleMoveToEdit: () => void;
   fetchingIndices: Set<string>;
+  stockFetchRef?: React.MutableRefObject<((idx: number, silent?: boolean) => Promise<void>) | null>;
+  onRefineApply?: (idx: number, r: { narration_ko?: string; subtitles?: Array<{ text: string; start: number; end: number }>; sfx?: string }) => void;
+  getSceneDuration?: (idx: number) => number;
+  clipTrims: Record<number, Record<string, { in: number; out: number | null }>>;
+  setClipTrims: React.Dispatch<React.SetStateAction<Record<number, Record<string, { in: number; out: number | null }>>>>;
+  extraMedia: Record<number, StockVideo[]>;
+  setExtraMedia: React.Dispatch<React.SetStateAction<Record<number, StockVideo[]>>>;
 }
+
+/** 클립당 최소 길이(초). 씬 길이를 이 값보다 짧게 쪼갤 수 없음 */
+export const MIN_CLIP_SECONDS = 1.5;
 
 const Step4Visual: React.FC<Step4VisualProps> = ({ 
   content,
@@ -64,7 +83,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
   stopGeneration,
   selectedAiModel,
   setSelectedAiModel,
-  fetchAllCandidates,
+  fetchAllByType,
   fetchCandidates,
   editingSceneIndex,
   setEditingSceneIndex,
@@ -75,8 +94,321 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
   zoomedImage,
   setZoomedImage,
   handleMoveToEdit,
-  fetchingIndices
+  fetchingIndices,
+  stockFetchRef,
+  onRefineApply,
+  getSceneDuration,
+  clipTrims,
+  setClipTrims,
+  extraMedia,
+  setExtraMedia
 }) => {
+  const [fetchingStock, setFetchingStock] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
+  const rowRefs = React.useRef<Record<string, HTMLDivElement | null>>({});
+  const edgeTimer = React.useRef<number | null>(null);
+  const stopEdgeScroll = () => {
+    if (edgeTimer.current) { clearInterval(edgeTimer.current); edgeTimer.current = null; }
+  };
+  const startEdgeScroll = (key: string, dir: 1 | -1) => {
+    stopEdgeScroll();
+    edgeTimer.current = window.setInterval(() => {
+      rowRefs.current[key]?.scrollBy({ left: dir * 28 });
+    }, 30);
+  };
+  const edgeBtn = "absolute top-1/2 -translate-y-1/2 z-20 w-7 h-10 items-center justify-center rounded-full bg-white/90 shadow-md border border-gray-100 text-gray-500 hover:text-indigo-600 hidden group-hover/row:flex";
+  const rowArrow = (rowKey: string, dir: 1 | -1) => (
+    <button
+      key={`edge-${dir}`}
+      aria-label={dir === 1 ? '오른쪽으로 스크롤' : '왼쪽으로 스크롤'}
+      className={`${edgeBtn} ${dir === 1 ? 'right-1' : 'left-1'}`}
+      onMouseEnter={() => startEdgeScroll(rowKey, dir)}
+      onMouseLeave={stopEdgeScroll}
+      onClick={() => rowRefs.current[rowKey]?.scrollBy({ left: dir * 360, behavior: 'smooth' })}
+    >
+      {dir === 1 ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+    </button>
+  );
+  const [refineOpen, setRefineOpen] = React.useState(false);
+  const [refineLoading, setRefineLoading] = React.useState(false);
+  const [refineResult, setRefineResult] = React.useState<RefineResult | null>(null);
+  const [refineError, setRefineError] = React.useState<string | null>(null);
+
+  const fullUrl = (u: string) => assetUrl(u);
+
+  const fetchStockFor = async (idx: number, silent: boolean = false) => {
+    const scene = content.scenes[idx];
+    const base = (scene?.stock_query || scene?.keyword || '').trim();
+    // stock_query가 없으면 description 첫 구절을 덧붙여 씬별 고유 쿼리로 만듦
+    const descHead = (!scene?.stock_query && scene?.description
+      ? scene.description.split(',')[0].slice(0, 60).trim() : '');
+    const kw = `${base} ${descHead}`.trim();
+    if (!kw) return;
+    if (!silent && fetchingStock) return;
+    if (!silent) setFetchingStock(true);
+    try {
+      const data = await api.getStockVideos(kw, 4);
+      const vids: StockVideo[] = (data?.videos || []).map((v: StockVideo) => ({ ...v, kind: 'video', source: 'stock' }));
+      if (vids.length > 0) {
+        setExtraMedia((prev) => {
+          const existing = new Set((prev[idx] || []).map((m) => m.url));
+          const fresh = vids.filter((v) => !existing.has(v.url));
+          if (fresh.length === 0) return prev;
+          return { ...prev, [idx]: [...(prev[idx] || []), ...fresh] };
+        });
+        // 자동 선택 없음: 사용자가 직접 고름
+      }
+    } catch (e) {
+      if (silent) {
+        console.error(`Stock fetch failed for scene ${idx}:`, (e as Error).message);
+      } else {
+        alert(`스톡 비디오 검색 실패: ${(e as Error).message} (Pexels API 키 확인)`);
+      }
+    } finally {
+      if (!silent) setFetchingStock(false);
+    }
+  };
+
+  if (stockFetchRef) stockFetchRef.current = fetchStockFor;
+
+  const fetchStock = async () => {
+    if (fetchingStock) return;
+    setFetchingStock(true);
+    try {
+      for (let i = 0; i < content.scenes.length; i++) {
+        await fetchStockFor(i, true);
+      }
+    } finally {
+      setFetchingStock(false);
+    }
+  };
+
+  const openRefine = () => {
+    setRefineResult(null);
+    setRefineError(null);
+    setRefineOpen(true);
+  };
+
+  const runRefine = async () => {
+    const idx = activeSceneIndex;
+    const scriptItem = content.script.find((s) => s.scene_index === idx);
+    const scene = content.scenes[idx] as unknown as Record<string, unknown>;
+    const urls = selectedVisuals[idx] || [];
+    if (urls.length === 0) {
+      setRefineError('다듬기에 쓸 클립을 먼저 선택하세요 (최대 3개).');
+      return;
+    }
+    const aiSearch = [
+      ...((visualCandidates[idx]?.ai || []).map((v: { url?: string; path?: string }) => ({ ...v, source: 'ai' }))),
+      ...((visualCandidates[idx]?.search || []).map((v: { path: string; url?: string }) => ({ ...v, source: 'search' }))),
+    ];
+    const clips: RefineClip[] = urls.slice(0, 3).map((u) => {
+      const extra = (extraMedia[idx] || []).find((m) => m.url === u);
+      if (extra) {
+        const isUp = u.includes('/uploads/');
+        return {
+          url: u,
+          kind: extra.kind === 'video' || /\.(mp4|webm|mov)(\?|$)/i.test(u) ? 'video' : 'image',
+          source: isUp ? 'upload' : 'stock',
+          note: isUp ? '' : String(scene?.keyword || ''),
+        };
+      }
+      const found = aiSearch.find((v) => v.url === u || (v as { path?: string }).path === u);
+      return { url: u, kind: 'image', source: (found as { source?: string } | undefined)?.source || 'ai', note: '' };
+    });
+    setRefineLoading(true);
+    setRefineError(null);
+    try {
+      const data = await api.refineScene({
+        scene: {
+          section: String(scene?.section || ''),
+          speaker: scriptItem?.speaker || 'BJ 이슈왕',
+          text: scriptItem?.text || '',
+          subtitle: scriptItem?.subtitle || '',
+          duration: Number(scene?.time_end || 0) - Number(scene?.time_start || 0),
+        },
+        clips,
+        topic: String((content as unknown as Record<string, unknown>)?.projectName || ''),
+      });
+      setRefineResult(data as RefineResult);
+    } catch (e) {
+      setRefineError((e as Error).message || '다듬기에 실패했습니다.');
+    } finally {
+      setRefineLoading(false);
+    }
+  };
+
+  const handleUpload = async (f: File) => {
+    if (!f || uploading) return;
+    setUploading(true);
+    try {
+      const data = await api.uploadAsset(f);
+      const isVideo = /\.(mp4|webm|mov)$/i.test(data.url || '');
+      const item: StockVideo = { url: data.url, path: data.path, preview: data.url, kind: isVideo ? 'video' : 'image', source: 'upload' };
+      setExtraMedia((prev) => ({ ...prev, [activeSceneIndex]: [...(prev[activeSceneIndex] || []), item] }));
+      setSelectedVisuals((prev) => {
+        const cur = prev[activeSceneIndex] || [];
+        if (cur.length >= 3 || cur.includes(data.url)) return prev;
+        if (!canAddClip(activeSceneIndex, cur.length)) return prev;
+        return { ...prev, [activeSceneIndex]: [...cur, data.url] };
+      });
+    } catch (e) {
+      alert(`업로드 실패: ${(e as Error).message}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const stockItems = (extraMedia[activeSceneIndex] || []).filter((m) => (m.source || 'stock') !== 'upload');
+  const uploadItems = (extraMedia[activeSceneIndex] || []).filter((m) => (m.source || 'stock') === 'upload');
+
+  const sceneDurationFor = (idx: number): number => {
+    try {
+      const d = getSceneDuration?.(idx) ?? 0;
+      return Number.isFinite(d) ? d : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const canAddClip = (idx: number, currentLen: number): boolean => {
+    const dur = sceneDurationFor(idx);
+    if (dur > 0 && dur / (currentLen + 1) < MIN_CLIP_SECONDS) {
+      alert(`씬 길이(${dur.toFixed(1)}초)로는 클립당 최소 ${MIN_CLIP_SECONDS}초가 안 나옵니다.`);
+      return false;
+    }
+    return true;
+  };
+
+  const moveClip = (idx: number, url: string, dir: -1 | 1) => {
+    setSelectedVisuals((prev) => {
+      const current = prev[idx] || [];
+      const pos = current.indexOf(url);
+      const next = pos + dir;
+      if (pos < 0 || next < 0 || next >= current.length) return prev;
+      const arr = [...current];
+      [arr[pos], arr[next]] = [arr[next], arr[pos]];
+      return { ...prev, [idx]: arr };
+    });
+  };
+
+  const renderExtraCard = (item: StockVideo) => {
+    const isSelected = selectedVisuals[activeSceneIndex]?.includes(item.url);
+    const isVideo = item.kind === 'video';
+    return (
+      <div
+        key={item.url}
+        onClick={() => {
+          setSelectedVisuals((prev) => {
+            const current = prev[activeSceneIndex] || [];
+            if (current.includes(item.url)) {
+              return {
+                ...prev,
+                [activeSceneIndex]: current.filter((u) => u !== item.url),
+              };
+            }
+            if (current.length >= 3) {
+              alert('한 장면당 최대 3개까지 선택할 수 있습니다.');
+              return prev;
+            }
+            if (!canAddClip(activeSceneIndex, current.length)) return prev;
+            return {
+              ...prev,
+              [activeSceneIndex]: [...current, item.url],
+            };
+          });
+        }}
+        className={`group relative aspect-video w-40 sm:w-44 shrink-0 rounded-2xl overflow-hidden border-2 transition-all cursor-pointer ${
+          isSelected
+            ? 'border-indigo-600 ring-8 ring-indigo-50 shadow-2xl scale-[1.02] z-10'
+            : 'border-gray-50 hover:border-indigo-200 hover:shadow-xl shadow-md'
+        }`}
+      >
+        {isVideo ? (
+          <video
+            src={fullUrl(item.url)}
+            poster={item.preview && item.preview.startsWith('http') ? item.preview : undefined}
+            muted
+            playsInline
+            preload="metadata"
+            className="w-full h-full object-cover"
+            onMouseOver={(e) => (e.target as HTMLVideoElement).play().catch(() => {})}
+            onMouseOut={(e) => (e.target as HTMLVideoElement).pause()}
+          />
+        ) : (
+          <img src={fullUrl(item.url)} className="w-full h-full object-cover" alt="" loading="lazy" />
+        )}
+        {isVideo && (
+          <span className="absolute bottom-2 left-2 px-1.5 py-0.5 bg-black/60 text-white text-[9px] font-black rounded-md">VIDEO</span>
+        )}
+        {isSelected && (
+          <div className="absolute top-2 right-2 bg-indigo-600 text-white w-5 h-5 flex items-center justify-center rounded-full shadow-lg ring-2 ring-white/20 text-[10px] font-black z-20">
+            {(selectedVisuals[activeSceneIndex]?.indexOf(item.url) || 0) + 1}
+          </div>
+        )}
+        {isSelected && (selectedVisuals[activeSceneIndex]?.length || 0) > 1 && (
+          <div className="absolute bottom-2 right-2 flex gap-1 z-20" onClick={(e) => e.stopPropagation()}>
+            <button
+              title="앞으로 이동"
+              onClick={(e) => { e.stopPropagation(); moveClip(activeSceneIndex, item.url, -1); }}
+              className="w-5 h-5 rounded-md bg-black/60 hover:bg-black/80 text-white text-[10px] font-black flex items-center justify-center"
+            >
+              ‹
+            </button>
+            <button
+              title="뒤로 이동"
+              onClick={(e) => { e.stopPropagation(); moveClip(activeSceneIndex, item.url, 1); }}
+              className="w-5 h-5 rounded-md bg-black/60 hover:bg-black/80 text-white text-[10px] font-black flex items-center justify-center"
+            >
+              ›
+            </button>
+          </div>
+        )}
+        {isSelected && isVideo && (
+          <div
+            className="absolute bottom-1.5 left-1.5 flex items-center gap-1 z-20 bg-black/60 rounded-md px-1.5 py-0.5"
+            onClick={(e) => e.stopPropagation()}
+            title="영상 시작/종료 지점(초)"
+          >
+            <input
+              type="number" min={0} step={0.5}
+              value={clipTrims[activeSceneIndex]?.[item.url]?.in ?? 0}
+              onChange={(e) => {
+                const v = Math.max(0, parseFloat(e.target.value) || 0);
+                setClipTrims((prev) => ({
+                  ...prev,
+                  [activeSceneIndex]: {
+                    ...(prev[activeSceneIndex] || {}),
+                    [item.url]: { in: v, out: prev[activeSceneIndex]?.[item.url]?.out ?? null },
+                  },
+                }));
+              }}
+              className="w-9 bg-transparent text-white text-[9px] font-bold outline-none"
+            />
+            <span className="text-white/60 text-[9px]">~</span>
+            <input
+              type="number" min={0} step={0.5}
+              value={clipTrims[activeSceneIndex]?.[item.url]?.out ?? ''}
+              placeholder="끝"
+              onChange={(e) => {
+                const raw = e.target.value;
+                const v = raw === '' ? null : Math.max(0, parseFloat(raw) || 0);
+                setClipTrims((prev) => ({
+                  ...prev,
+                  [activeSceneIndex]: {
+                    ...(prev[activeSceneIndex] || {}),
+                    [item.url]: { in: prev[activeSceneIndex]?.[item.url]?.in ?? 0, out: v },
+                  },
+                }));
+              }}
+              className="w-9 bg-transparent text-white text-[9px] font-bold outline-none placeholder:text-white/40"
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
   if (!content) return null;
 
   return (
@@ -132,37 +464,60 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                     className="px-2 py-1 bg-white border border-gray-200 rounded-lg text-[10px] font-bold text-gray-700 focus:border-indigo-500 outline-none transition-all cursor-pointer hover:border-gray-300"
                     title="이미지 생성 모델 선택"
                   >
-                    <option value="pollinations">Pollinations (기본)</option>
-                    <option value="cloudflare">Cloudflare AI</option>
-                    <option value="local_sd">Local SD</option>
-                    <option value="zimage">Z-Image</option>
-                    <option value="horde">AI Horde</option>
-                    <option value="dall-e-3">DALL-E 3</option>
-                    <option value="stable-diffusion-xl">SD XL</option>
-                    <option value="recraft-v3">Recraft V3</option>
-                    <option value="flux-1.1-pro">FLUX 1.1 Pro</option>
-                    <option value="flux-pro">FLUX Pro</option>
-                    <option value="flux-dev">FLUX Dev</option>
-                    <option value="flux-schnell">FLUX Schnell</option>
-                    <option value="midjourney">Midjourney</option>
+                    <option value="pollinations">Pollinations (무료 · 워터마크)</option>
+                    <option value="cloudflare">Cloudflare AI (무료 · neurons)</option>
+                    <option value="deepinfra">FLUX schnell (DeepInfra · 약 0.6원/장)</option>
+                    <option value="gemini">Google Nano Banana (유료 · 장당 과금)</option>
+                    <option value="horde">AI Horde (무료 · 느림)</option>
+                    <option value="local_sd">Local SD (로컬 서버 필요)</option>
+                    <option value="zimage">Z-Image (CUDA GPU 필요)</option>
                   </select>
                 </div>
 
-                <button 
-                  onClick={() => fetchAllCandidates(false)}
-                  className="text-indigo-600 hover:text-indigo-700 disabled:text-gray-300 flex items-center gap-1.5 text-[10px] font-bold transition-all whitespace-nowrap"
-                >
-                  <Sparkles size={14} />
-                  전체 이미지 생성
-                </button>
+                {/* 소스별 전체 수집 아이콘 버튼 */}
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => fetchAllByType('ai')}
+                    title="모든 장면 AI 이미지 생성"
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-indigo-200 text-indigo-600 hover:border-indigo-300 hover:bg-indigo-50 bg-white whitespace-nowrap"
+                  >
+                    <Sparkles size={14} />
+                    AI
+                  </button>
 
-                <button 
-                  onClick={() => fetchAllCandidates(true)}
-                  className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-gray-200 text-gray-700 hover:border-indigo-200 hover:text-indigo-600 bg-white whitespace-nowrap"
-                >
-                  <RefreshCw size={14} />
-                  전체 다시 생성
-                </button>
+                  <button
+                    onClick={() => fetchAllByType('search')}
+                    title="모든 장면 웹 이미지 검색"
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-sky-200 text-sky-600 hover:border-sky-300 hover:bg-sky-50 bg-white whitespace-nowrap"
+                  >
+                    <Search size={14} />
+                    이미지
+                  </button>
+
+                  <button
+                    onClick={fetchStock}
+                    disabled={fetchingStock}
+                    title="모든 장면 키워드로 스톡 비디오 검색"
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-emerald-200 text-emerald-600 hover:border-emerald-300 hover:bg-emerald-50 bg-white whitespace-nowrap disabled:opacity-50"
+                  >
+                    <Film size={14} className={fetchingStock ? 'animate-spin' : ''} />
+                    스톡영상
+                  </button>
+
+                  <label
+                    title="직접 찍은 영상/사진을 현재 장면에 넣기"
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-violet-200 text-violet-600 hover:border-violet-300 hover:bg-violet-50 bg-white whitespace-nowrap cursor-pointer"
+                  >
+                    <Upload size={14} className={uploading ? 'animate-pulse' : ''} />
+                    내 파일
+                    <input
+                      type="file"
+                      accept="image/*,video/mp4,video/webm,video/quicktime"
+                      className="hidden"
+                      onChange={(e) => { if (e.target.files?.[0]) handleUpload(e.target.files[0]); e.target.value = ''; }}
+                    />
+                  </label>
+                </div>
               </>
             )}
           </div>
@@ -216,12 +571,21 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                   {/* Thumbnail Preview */}
                   <div className={`shrink-0 w-12 h-8 rounded-lg overflow-hidden bg-gray-100 border border-gray-100 flex items-center justify-center relative ${isSelected ? 'ring-2 ring-indigo-50' : ''}`}>
                     {displayImageUrl ? (
-                      <img 
-                        src={`http://localhost:8000${displayImageUrl}`} 
-                        className="w-full h-full object-cover"
-                        alt=""
-                        key={displayImageUrl} // URL 변경 시 이미지 강제 갱신
-                      />
+                      /\.(mp4|webm|mov)(\?|$)/i.test(displayImageUrl) ? (
+                        <video
+                          src={assetUrl(displayImageUrl)}
+                          className="w-full h-full object-cover"
+                          key={displayImageUrl}
+                          muted loop playsInline preload="metadata" autoPlay
+                        />
+                      ) : (
+                        <img
+                          src={assetUrl(displayImageUrl)}
+                          className="w-full h-full object-cover"
+                          alt=""
+                          key={displayImageUrl} // URL 변경 시 이미지 강제 갱신
+                        />
+                      )
                     ) : (
                       <ImageIcon size={12} className="text-gray-300" />
                     )}
@@ -249,9 +613,23 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                       <p className="text-[10px] text-gray-400 truncate flex-1 font-medium">
                         {scene.description}
                       </p>
-                      {hasVisual && !fetchingIndices.has(`${idx}-ai`) && !fetchingIndices.has(`${idx}-search`) && (
-                        <CheckCircle2 size={10} className="text-green-500 shrink-0 ml-auto" />
-                      )}
+                      {hasVisual && !fetchingIndices.has(`${idx}-ai`) && !fetchingIndices.has(`${idx}-search`) && (() => {
+                        const urls = selectedVisuals[idx] || [];
+                        const vidCount = urls.filter((u) => /\.(mp4|webm|mov)(\?|$)/i.test(u)).length;
+                        const imgCount = urls.length - vidCount;
+                        const label = [
+                          imgCount > 0 ? `이미지 ${imgCount}` : '',
+                          vidCount > 0 ? `영상 ${vidCount}` : '',
+                        ].filter(Boolean).join(' · ');
+                        return (
+                          <span className="flex items-center gap-1 shrink-0 ml-auto">
+                            <span className="text-[9px] font-black text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-md px-1 py-px whitespace-nowrap">
+                              {label}
+                            </span>
+                            <CheckCircle2 size={10} className="text-green-500 shrink-0" />
+                          </span>
+                        );
+                      })()}
                     </div>
                   </div>
                 </button>
@@ -263,7 +641,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
         {/* Right: Candidates Area */}
         <div className="flex-1 flex flex-col bg-white overflow-hidden">
           {/* Compressed Scene Context & Controls */}
-          <div className="px-6 py-2 bg-white shrink-0 border-b border-gray-50/50 shadow-sm relative z-10">
+          <div className="px-4 py-1.5 bg-white shrink-0 border-b border-gray-50/50 shadow-sm relative z-10">
             <div className="flex items-center gap-4">
               <div className="flex-1 min-w-0">
                 {editingSceneIndex === activeSceneIndex ? (
@@ -323,14 +701,14 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                   <motion.div 
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    className="flex items-center gap-4 py-0.5"
+                    className="flex items-center gap-4 py-0.5 flex-wrap"
                   >
                     {/* Keyword Section */}
                     <div className="flex items-center gap-2.5 shrink-0 group">
                       <div className="shrink-0 bg-indigo-600 text-white text-[10px] font-black px-2.5 py-1 rounded-lg shadow-sm uppercase tracking-wider italic">
                         장면 {activeSceneIndex + 1}
                       </div>
-                      <h3 className="text-base font-black text-gray-900 tracking-tight">
+                      <h3 className="text-sm font-black text-gray-900 tracking-tight">
                         {content.scenes[activeSceneIndex].keyword}
                       </h3>
                       <button 
@@ -374,60 +752,53 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                     {/* Quick Action */}
                     <button 
                       onClick={() => fetchCandidates(activeSceneIndex, 'all', selectedAiModel)}
-                      className="ml-auto flex items-center gap-2 px-2.5 py-1 rounded-xl text-[10px] font-black transition-all border border-indigo-100 text-indigo-600 hover:bg-indigo-50 bg-white whitespace-nowrap shadow-sm active:scale-95"
+                      className="ml-auto flex items-center gap-2 px-2 py-0.5 rounded-xl text-[10px] font-black transition-all border border-indigo-100 text-indigo-600 hover:bg-indigo-50 bg-white whitespace-nowrap shadow-sm active:scale-95"
                     >
                       <RefreshCw size={14} className={(fetchingIndices.has(`${activeSceneIndex}-ai`) || fetchingIndices.has(`${activeSceneIndex}-search`)) ? "animate-spin" : ""} />
                       다시 생성
                     </button>
+                    <button
+                      onClick={openRefine}
+                      title="선택한 클립을 참고해 이 씬 대본만 다듬기"
+                      className="flex items-center gap-2 px-2 py-0.5 rounded-xl text-[10px] font-black transition-all border border-amber-200 text-amber-600 hover:bg-amber-50 bg-white whitespace-nowrap shadow-sm active:scale-95"
+                    >
+                      <Sparkles size={14} />
+                      대본 다듬기
+                    </button>
+                  {(() => {
+                    const line = content.script.find((s) => s.scene_index === activeSceneIndex)?.text || '';
+                    const guide = (content.scenes[activeSceneIndex] as { filming_guide?: string })?.filming_guide || '';
+                    if (!line && !guide) return null;
+                    return (
+                      <div className="w-full mt-0.5 flex items-start gap-3 px-1">
+                        {line ? (
+                          <div className="flex-1 flex items-start gap-1.5 min-w-0">
+                            <span className="shrink-0 px-1.5 py-0.5 bg-indigo-50 text-indigo-500 rounded-md text-[9px] font-black">자막</span>
+                            <p className="text-[10px] text-gray-600 font-medium leading-snug truncate" title={line}>{line}</p>
+                          </div>
+                        ) : null}
+                        {guide ? (
+                          <div className="flex-1 flex items-start gap-1.5 min-w-0">
+                            <span className="shrink-0 px-1.5 py-0.5 bg-emerald-50 text-emerald-600 rounded-md text-[9px] font-black">촬영</span>
+                            <p className="text-[10px] text-gray-600 font-medium leading-snug truncate" title={guide}>{guide}</p>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })()}
                   </motion.div>
                 )}
               </div>
             </div>
           </div>
 
-          {!visualCandidates[activeSceneIndex] ? (
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="flex-1 flex flex-col items-center justify-center bg-gray-50/10 p-12"
-            >
-              <div className="relative mb-8">
-                <motion.div 
-                  animate={{ 
-                    scale: [1, 1.1, 1],
-                    opacity: [0.2, 0.3, 0.2]
-                  }}
-                  transition={{ duration: 4, repeat: Infinity }}
-                  className="absolute inset-0 bg-indigo-200 blur-3xl rounded-full" 
-                />
-                <div className="relative w-24 h-24 bg-white rounded-3xl shadow-xl flex items-center justify-center border border-indigo-50">
-                  <ImageIcon size={40} className="text-indigo-200" />
-                  <motion.div 
-                    animate={{ y: [0, -5, 0] }}
-                    transition={{ duration: 2, repeat: Infinity }}
-                    className="absolute -top-2 -right-2 bg-indigo-600 p-2 rounded-2xl shadow-lg shadow-indigo-200"
-                  >
-                    <Sparkles size={16} className="text-white" />
-                  </motion.div>
-                </div>
-              </div>
-              <div className="text-center space-y-2.5">
-                <h3 className="text-xl font-black text-gray-900 tracking-tight">시각 자료 생성 대기 중</h3>
-                <p className="text-sm text-gray-400 font-medium max-w-sm leading-relaxed mx-auto">
-                  상단의 <span className="text-indigo-600 font-bold">'전체 이미지 생성'</span> 버튼을 눌러 모든 장면을 한꺼번에 준비하거나,<br />
-                  장면별로 <span className="text-indigo-600 font-bold">'다시 생성'</span> 버튼을 클릭하여 시각자료를 구성해보세요.
-                </p>
-              </div>
-            </motion.div>
-          ) : (
-            <div className="flex-1 overflow-y-auto px-6 py-4 custom-scrollbar">
-              <div className="flex flex-col gap-0">
-                {/* Candidates Sections */}
+        <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 custom-scrollbar">
+          <div className="flex flex-col gap-0">
                 {[
                   { title: 'AI 생성 이미지', items: visualCandidates[activeSceneIndex]?.ai || [], Icon: Sparkles, type: 'ai' },
                   { title: '웹 검색 이미지', items: visualCandidates[activeSceneIndex]?.search || [], Icon: Cloud, type: 'search' }
                 ].map((section, sIdx) => (
-                  <div key={sIdx} className={`flex flex-col gap-2 ${section.type === 'search' ? 'mt-4 pt-5 border-t border-gray-50' : ''}`}>
+                  <div key={sIdx} className={`flex flex-col gap-2 ${section.type === 'search' ? 'mt-2 pt-2 border-t border-gray-50' : ''}`}>
                     <div className="flex items-center justify-between px-1 pt-1.5">
                       <div className="flex items-center gap-2.5">
                         <div className={`p-1 rounded-lg ${section.type === 'ai' ? 'bg-indigo-600 text-white shadow-indigo-100' : 'bg-sky-500 text-white shadow-sky-100'} shadow-md`}>
@@ -487,8 +858,10 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                           initial={{ opacity: 0 }}
                           animate={{ opacity: 1 }}
                           exit={{ opacity: 0 }}
-                          className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5"
+                          ref={(el) => { rowRefs.current.ai = el; }}
+                          className="flex gap-3 overflow-x-auto px-1 pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden group/row relative"
                         >
+                          {rowArrow('ai', -1)}
                           {section.items.map((candidate, cIdx) => {
                             const isSelected = selectedVisuals[activeSceneIndex]?.includes(candidate.url);
                             return (
@@ -504,7 +877,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                   delay: cIdx * 0.03
                                 }}
                                 key={candidate.url}
-                                className={`group relative aspect-video rounded-3xl overflow-hidden border-2 transition-all cursor-pointer ${
+                                className={`group relative aspect-video w-40 sm:w-44 shrink-0 rounded-2xl overflow-hidden border-2 transition-all cursor-pointer ${
                                   isSelected 
                                   ? 'border-indigo-600 ring-8 ring-indigo-50 shadow-2xl scale-[1.02] z-10' 
                                   : 'border-gray-50 hover:border-indigo-200 hover:shadow-xl shadow-md'
@@ -521,7 +894,12 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                         [activeSceneIndex]: current.filter(url => url !== candidate.url)
                                       };
                                     } else {
-                                      // 추가: 선택된 목록 끝에 추가
+                                      // 추가: 장면당 최대 3개
+                                      if (current.length >= 3) {
+                                        alert('한 장면당 최대 3개까지 선택할 수 있습니다.');
+                                        return prev;
+                                      }
+                                      if (!canAddClip(activeSceneIndex, current.length)) return prev;
                                       return {
                                         ...prev,
                                         [activeSceneIndex]: [...current, candidate.url]
@@ -530,8 +908,8 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                   });
                                 }}
                               >
-                                <img 
-                                  src={candidate.url.startsWith('http') ? candidate.url : `http://localhost:8000${candidate.url.startsWith('/') ? '' : '/'}${candidate.url.replace('/assets/assets/', '/assets/')}`}
+                                <img
+                                  src={assetUrl(candidate.url)}
                                   className={`w-full h-full object-cover transition-transform duration-1000 ${isSelected ? 'scale-110' : 'group-hover:scale-115'}`}
                                   alt=""
                                   loading="lazy"
@@ -547,6 +925,24 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                   >
                                     {(selectedVisuals[activeSceneIndex]?.indexOf(candidate.url) || 0) + 1}
                                   </motion.div>
+                                )}
+                                {isSelected && (selectedVisuals[activeSceneIndex]?.length || 0) > 1 && (
+                                  <div className="absolute top-2 left-2 flex gap-1 z-20" onClick={(e) => e.stopPropagation()}>
+                                    <button
+                                      title="앞으로 이동"
+                                      onClick={(e) => { e.stopPropagation(); moveClip(activeSceneIndex, candidate.url, -1); }}
+                                      className="w-5 h-5 rounded-md bg-black/60 hover:bg-black/80 text-white text-[10px] font-black flex items-center justify-center"
+                                    >
+                                      ‹
+                                    </button>
+                                    <button
+                                      title="뒤로 이동"
+                                      onClick={(e) => { e.stopPropagation(); moveClip(activeSceneIndex, candidate.url, 1); }}
+                                      className="w-5 h-5 rounded-md bg-black/60 hover:bg-black/80 text-white text-[10px] font-black flex items-center justify-center"
+                                    >
+                                      ›
+                                    </button>
+                                  </div>
                                 )}
 
                                 {/* Action Buttons (Simplified and Positioned at corners) */}
@@ -575,7 +971,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                   <button 
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      setZoomedImage(`http://localhost:8000${candidate.url}`);
+                                      setZoomedImage(assetUrl(candidate.url));
                                     }}
                                     className="p-1.5 bg-black/40 hover:bg-black/60 backdrop-blur-md text-white rounded-lg transition-all hover:scale-110 border border-white/10 shadow-lg"
                                     title="크게 보기"
@@ -597,7 +993,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                 e.stopPropagation();
                                 fetchCandidates(activeSceneIndex, section.type as 'ai' | 'search', section.type === 'ai' ? selectedAiModel : undefined, true);
                               }}
-                              className="group relative aspect-video rounded-3xl border-2 border-dashed border-gray-100 hover:border-indigo-300 hover:bg-indigo-50/30 transition-all flex flex-col items-center justify-center gap-2 bg-gray-50/10 shadow-sm hover:shadow-indigo-50"
+                              className="group relative aspect-video w-32 sm:w-36 shrink-0 rounded-2xl border-2 border-dashed border-gray-100 hover:border-indigo-300 hover:bg-indigo-50/30 transition-all flex flex-col items-center justify-center gap-2 bg-gray-50/10 shadow-sm hover:shadow-indigo-50"
                               title={`${section.title} 추가 생성/검색`}
                             >
                               <div className="w-10 h-10 rounded-2xl bg-white border border-gray-100 flex items-center justify-center text-gray-400 group-hover:text-indigo-600 group-hover:scale-110 transition-all shadow-md group-hover:shadow-lg">
@@ -615,7 +1011,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                               layout
                               initial={{ opacity: 0, scale: 0.9 }}
                               animate={{ opacity: 1, scale: 1 }}
-                              className="aspect-video rounded-3xl border-2 border-indigo-100 bg-indigo-50/10 flex flex-col items-center justify-center gap-4 animate-pulse shadow-sm"
+                              className="aspect-video w-32 sm:w-36 shrink-0 rounded-2xl border-2 border-indigo-100 bg-indigo-50/10 flex flex-col items-center justify-center gap-4 animate-pulse shadow-sm"
                             >
                               <div className="w-12 h-12 rounded-2xl bg-indigo-100/50 flex items-center justify-center">
                                 <Loader2 size={28} className="text-indigo-600 animate-spin" />
@@ -625,37 +1021,252 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                               </div>
                             </motion.div>
                           )}
+                          {rowArrow('ai', 1)}
                         </motion.div>
                       ) : (
                         <motion.div 
                           initial={{ opacity: 0, y: 20 }}
                           animate={{ opacity: 1, y: 0 }}
-                          className="h-64 flex flex-col items-center justify-center bg-gray-50/30 rounded-[3rem] border-2 border-gray-100 border-dashed text-gray-300 space-y-5 transition-all hover:bg-gray-50/50"
+                          className="flex items-center gap-3 bg-gray-50/30 rounded-2xl border-2 border-gray-100 border-dashed text-gray-400 px-4 py-3"
                         >
-                          <div className="p-5 bg-white rounded-[2rem] shadow-xl border border-gray-50 group-hover:scale-110 transition-transform duration-500">
-                            <Search size={40} className="opacity-20 text-indigo-600" />
-                          </div>
-                          <div className="text-center">
-                            <h5 className="text-[13px] font-black text-gray-500 uppercase tracking-widest mb-1">발견된 이미지가 없습니다</h5>
-                            <p className="text-[10px] text-gray-400 font-medium mb-6">이미지 생성을 시작해보세요</p>
-                            <button 
-                              onClick={() => fetchCandidates(activeSceneIndex, section.type as 'ai' | 'search', selectedAiModel)}
-                              className="px-8 py-3 bg-indigo-600 text-white rounded-2xl text-[12px] font-black hover:bg-indigo-700 transition-all shadow-xl shadow-indigo-100 uppercase tracking-widest active:scale-95 flex items-center gap-2 mx-auto"
-                            >
-                              <Sparkles size={16} />
-                              지금 생성하기
-                            </button>
-                          </div>
+                          <Search size={18} className="opacity-40 text-indigo-600 shrink-0" />
+                          <p className="text-[11px] font-bold text-gray-500 flex-1">발견된 이미지가 없습니다</p>
+                          <button 
+                            onClick={() => fetchCandidates(activeSceneIndex, section.type as 'ai' | 'search', selectedAiModel)}
+                            className="px-4 py-1.5 bg-indigo-600 text-white rounded-xl text-[11px] font-black hover:bg-indigo-700 transition-all shadow-md shadow-indigo-100 active:scale-95 flex items-center gap-1.5 shrink-0"
+                          >
+                            <Sparkles size={13} />
+                            지금 생성하기
+                          </button>
                         </motion.div>
                       )}
                     </AnimatePresence>
                   </div>
                 ))}
+                {/* 스톡 비디오 (결과 그리드) */}
+                <div className="shrink-0 flex flex-col gap-2 mt-2 pt-2 border-t border-gray-50">
+        <div className="flex items-center justify-between px-1 pt-1.5">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1 rounded-lg bg-emerald-600 text-white shadow-md">
+              <Film size={12} />
+            </div>
+            <div>
+              <h4 className="text-[11px] font-black text-gray-900 tracking-tight leading-none">스톡 비디오</h4>
+              <div className="flex items-center gap-1 mt-0.5">
+                <span className="text-[8.5px] text-gray-400 font-bold tracking-tighter">
+                  {stockItems.length}개 보유
+                </span>
+                <div className="w-0.5 h-0.5 rounded-full bg-gray-200" />
+                <span className="text-[8.5px] text-indigo-500 font-black uppercase tracking-widest">
+                  Pexels
+                </span>
               </div>
             </div>
-          )}
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-gray-50 border border-gray-100">
+              <div className={`w-1 h-1 rounded-full ${fetchingStock ? 'bg-amber-400 animate-pulse' : 'bg-green-400 shadow-[0_0_8px_rgba(74,222,128,0.4)]'}`} />
+              <span className="text-[8.5px] font-black text-gray-500 uppercase tracking-widest">
+                {fetchingStock ? '생성 중' : '안정'}
+              </span>
+            </div>
+            <button
+              onClick={() => fetchStockFor(activeSceneIndex)}
+              disabled={fetchingStock}
+              title="현재 장면만 스톡 추가 검색"
+              className="p-1 rounded-lg bg-white text-gray-400 hover:text-emerald-600 hover:border-emerald-200 hover:bg-emerald-50/50 transition-all border border-gray-100 shadow-sm disabled:opacity-50 active:scale-90"
+            >
+              <RefreshCw size={11} className={fetchingStock ? 'animate-spin' : ''} />
+            </button>
+          </div>
+        </div>
+                  {stockItems.length > 0 ? (
+                    <div ref={(el) => { rowRefs.current.stock = el; }} className="flex gap-3 overflow-x-auto px-1 pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden group/row relative">
+                      {rowArrow('stock', -1)}
+                      {stockItems.map((item) => renderExtraCard(item))}
+                      {rowArrow('stock', 1)}
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3 bg-gray-50/30 rounded-2xl border-2 border-gray-100 border-dashed text-gray-400 px-4 py-3">
+                      <Search size={18} className="opacity-40 text-emerald-600 shrink-0" />
+                      <p className="text-[11px] font-bold text-gray-500 flex-1">스톡 비디오가 없습니다</p>
+                      <button
+                        onClick={() => fetchStockFor(activeSceneIndex)}
+                        disabled={fetchingStock}
+                        className="px-4 py-1.5 bg-emerald-600 text-white rounded-xl text-[11px] font-black hover:bg-emerald-700 transition-all shadow-md shadow-emerald-100 active:scale-95 flex items-center gap-1.5 shrink-0 disabled:opacity-50"
+                      >
+                        <Search size={13} />
+                        스톡 검색
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {/* 내 파일 */}
+                <div className="shrink-0 flex flex-col gap-2 mt-2 pt-2 border-t border-gray-50">
+                  <div className="flex items-center justify-between px-1 pt-1.5">
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1 rounded-lg bg-indigo-600 text-white shadow-md">
+                        <Upload size={12} />
+                      </div>
+                      <div>
+                        <h4 className="text-[11px] font-black text-gray-900 tracking-tight leading-none">내 파일</h4>
+                        <div className="flex items-center gap-1 mt-0.5">
+                          <span className="text-[8.5px] text-gray-400 font-bold tracking-tighter">
+                            {uploadItems.length}개 보유
+                          </span>
+                          <div className="w-0.5 h-0.5 rounded-full bg-gray-200" />
+                          <span className="text-[8.5px] text-indigo-500 font-black uppercase tracking-widest">
+                            내 디바이스
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    <label
+                      title="내 파일에 직접 파일 추가"
+                      className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-indigo-100 text-indigo-600 hover:border-indigo-300 hover:bg-indigo-50 bg-white whitespace-nowrap cursor-pointer"
+                    >
+                      <Upload size={11} className={uploading ? 'animate-pulse' : ''} />
+                      추가
+                      <input
+                        type="file"
+                        accept="image/*,video/mp4,video/webm,video/quicktime"
+                        className="hidden"
+                        onChange={(e) => { if (e.target.files?.[0]) handleUpload(e.target.files[0]); e.target.value = ''; }}
+                      />
+                    </label>
+                  </div>
+                  {uploadItems.length > 0 ? (
+                    <div ref={(el) => { rowRefs.current.upload = el; }} className="flex gap-3 overflow-x-auto px-1 pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden group/row relative">
+                      {rowArrow('upload', -1)}
+                      {uploadItems.map((item) => renderExtraCard(item))}
+                      {rowArrow('upload', 1)}
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3 bg-gray-50/30 rounded-2xl border-2 border-gray-100 border-dashed text-gray-400 px-4 py-3">
+                      <Upload size={18} className="opacity-40 text-indigo-600 shrink-0" />
+                      <p className="text-[11px] font-bold text-gray-500 flex-1">직접 찍은 영상·사진을 올리면 여기에 표시됩니다</p>
+                      <label
+                        title="내 파일 직접 업로드"
+                        className="shrink-0 flex items-center gap-1 px-4 py-1.5 bg-indigo-600 text-white rounded-xl text-[11px] font-black hover:bg-indigo-700 transition-all shadow-md shadow-indigo-100 active:scale-95 cursor-pointer"
+                      >
+                        {uploading && <Loader2 size={13} className="animate-spin" />}
+                        업로드
+                        <input
+                          type="file"
+                          accept="image/*,video/mp4,video/webm,video/quicktime"
+                          className="hidden"
+                          onChange={(e) => { if (e.target.files?.[0]) handleUpload(e.target.files[0]); e.target.value = ''; }}
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
+        </div>
         </div>
       </div>
+
+      {/* Refine Modal */}
+      {refineOpen && (
+        <div
+          className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setRefineOpen(false)}
+        >
+          <div
+            className="w-full max-w-xl bg-white rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2 px-5 py-4 border-b border-gray-100">
+              <Sparkles size={16} className="text-amber-500" />
+              <p className="text-sm font-bold text-gray-800 flex-1">
+                씬 {activeSceneIndex + 1} 대본 다듬기
+                <span className="ml-2 text-[11px] font-medium text-gray-400">선택 클립 {(selectedVisuals[activeSceneIndex] || []).length}개 참고 · 분량·수치는 잠금</span>
+              </p>
+              <button onClick={() => setRefineOpen(false)} className="p-1 text-gray-400 hover:text-gray-700">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4 overflow-y-auto">
+              <div className="space-y-1.5">
+                <p className="text-xs font-bold text-gray-500">현재 대본</p>
+                <p className="px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs text-gray-700">
+                  {content.script.find((s) => s.scene_index === activeSceneIndex)?.text || '(없음)'}
+                </p>
+              </div>
+              {!refineResult && (
+                <button
+                  onClick={runRefine}
+                  disabled={refineLoading || (selectedVisuals[activeSceneIndex] || []).length === 0}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-amber-500 text-white rounded-xl text-xs font-bold hover:bg-amber-600 disabled:bg-gray-200 transition-all"
+                >
+                  {refineLoading ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                  클립 분석 후 다듬기 실행
+                </button>
+              )}
+              {refineError && (
+                <p className="px-3 py-2 bg-red-50 border border-red-100 rounded-xl text-xs font-bold text-red-600">{refineError}</p>
+              )}
+              {refineResult?.mismatch_warning ? (
+                <div className="px-3 py-2.5 bg-amber-50 border border-amber-200 rounded-xl space-y-1">
+                  <p className="text-xs font-black text-amber-700">클립-대본 불일치 (대본은 그대로 둠)</p>
+                  <p className="text-[11px] text-amber-700">{refineResult.mismatch_warning}</p>
+                </div>
+              ) : null}
+              {refineResult && (
+                <div className="space-y-3">
+                  {(refineResult.clip_notes || []).length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-xs font-bold text-gray-500">클립 분석</p>
+                      {(refineResult.clip_notes || []).map((n, i) => (
+                        <p key={i} className="text-[11px] text-gray-600 bg-gray-50 rounded-lg px-3 py-1.5">{n}</p>
+                      ))}
+                    </div>
+                  )}
+                  <div className="space-y-1">
+                    <p className="text-xs font-bold text-gray-700">다듬어진 나레이션</p>
+                    <p className="px-3 py-2.5 bg-indigo-50/60 border border-indigo-100 rounded-xl text-xs font-bold text-gray-900 leading-relaxed">
+                      {refineResult.narration_ko || '(변경 없음)'}
+                    </p>
+                  </div>
+                  {(refineResult.subtitles || []).length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-xs font-bold text-gray-700">자막 분할</p>
+                      {(refineResult.subtitles || []).map((s, i) => (
+                        <p key={i} className="text-[11px] text-gray-600">
+                          <span className="font-bold text-teal-600">[{Number(s.start || 0).toFixed(1)}s-{Number(s.end || 0).toFixed(1)}s]</span> {s.text}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                  {refineResult.sfx ? (
+                    <p className="text-[11px] text-gray-600"><span className="font-black text-amber-600">효과음 </span>{refineResult.sfx}</p>
+                  ) : null}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2 px-5 py-4 border-t border-gray-100">
+              <p className="text-[10px] text-gray-400 mr-auto">적용 후 3단계에서 TTS를 다시 생성하세요.</p>
+              <button
+                onClick={() => setRefineOpen(false)}
+                className="px-4 py-2 bg-white border border-gray-200 text-gray-500 rounded-xl text-xs font-bold hover:border-gray-300"
+              >
+                닫기
+              </button>
+              <button
+                onClick={() => {
+                  if (refineResult && onRefineApply) {
+                    onRefineApply(activeSceneIndex, refineResult);
+                    setRefineOpen(false);
+                  }
+                }}
+                disabled={!refineResult || !onRefineApply}
+                className="px-5 py-2 bg-indigo-600 text-white rounded-xl text-xs font-bold hover:bg-indigo-700 disabled:bg-gray-200"
+              >
+                이대로 적용
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Image Zoom Modal */}
       {zoomedImage && (
@@ -677,6 +1288,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
           />
         </div>
       )}
+    </div>
     </div>
   );
 };

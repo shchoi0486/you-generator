@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Request, Body
+from fastapi import FastAPI, HTTPException, Request, Body, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from core.progress_tracker import progress_tracker
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Union, Tuple, Any
 import os
+import re
 import yaml
 import asyncio
 import httpx
@@ -166,6 +167,7 @@ class GenerateRequest(BaseModel):
     article_text: str
     custom_instructions: Optional[str] = None
     duration: Optional[int] = 60
+    template_id: Optional[str] = "news_duo"
 
 
 class TTSRequest(BaseModel):
@@ -188,6 +190,7 @@ class VisualCandidateRequest(BaseModel):
     ai_model: Optional[str] = "pollinations"
     topic: Optional[str] = ""  # 추가: 검색 품질 향상을 위한 주제어
     visual_guide: Optional[str] = ""  # 추가: 검색 품질 향상을 위한 비주얼 가이드
+    category: Optional[str] = ""  # 대본 카테고리 (news/recipe/review/knowledge, templates.py와 공유)
 
 
 class SubtitleStyle(BaseModel):
@@ -210,6 +213,13 @@ class AudioEditRequest(BaseModel):
     sfx_list: List[dict] = []  # list of {path: str, time: float, volume: float}
 
 
+class CaptionStyle(BaseModel):
+    font_size: int = 13
+    color: str = "#FFD76A"
+    bg_color: Optional[str] = "rgba(0,0,0,0.45)"
+    y_offset: int = 7  # % position from top
+
+
 class RenderRequest(BaseModel):
     audio_path: str
     srt_path: str
@@ -219,6 +229,8 @@ class RenderRequest(BaseModel):
     audio_edit: Optional[AudioEditRequest] = None
     edited_srt: Optional[str] = None
     aspect_ratio: str = "16:9 (Youtube)"  # 화면 비율 추가
+    scene_captions: Optional[List[dict]] = None  # [{start, end, text}] 씬별 상단 자막 밴드
+    caption_style: Optional[CaptionStyle] = None
 
 
 class TTSPreviewRequest(BaseModel):
@@ -411,8 +423,24 @@ async def save_config(config_data: dict = Body(...)):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, 'config', 'settings.yaml')
     try:
+        # 기존 파일과 deep-merge (예전 프론트 상태로 저장해도 새 키가 날아가지 않게)
+        def _merge(base, incoming):
+            for k, v in (incoming or {}).items():
+                if isinstance(v, dict) and isinstance(base.get(k), dict):
+                    _merge(base[k], v)
+                else:
+                    base[k] = v
+            return base
+
+        existing = {}
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                existing = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            pass
+        merged = _merge(existing, config_data)
         with open(config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(config_data, f, allow_unicode=True)
+            yaml.dump(merged, f, allow_unicode=True)
         return {"status": "success", "message": "Configuration saved successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -537,6 +565,160 @@ async def cancel_task(request: CancelRequest):
     return {"status": "success", "message": "Cancellation requested"}
 
 
+@app.get("/templates")
+async def get_templates():
+    from core.templates import list_templates
+    return list_templates()
+
+
+class ShortsUrlRequest(BaseModel):
+    url: str
+
+
+class ShortsCreateRequest(BaseModel):
+    reference: str  # 분석 리포트 JSON 문자열 또는 요약 텍스트
+    new_topic: str
+    duration: Optional[int] = 40
+    category: Optional[str] = "recipe_short"
+
+
+class RefineClipInfo(BaseModel):
+    url: str = ""
+    kind: str = "image"  # video | image
+    source: str = ""  # stock | upload | ai | search
+    note: str = ""
+
+
+class RefineSceneRequest(BaseModel):
+    scene: dict = {}  # {section, speaker, text, subtitle, duration}
+    clips: List[RefineClipInfo] = []
+    topic: Optional[str] = ""
+    category: Optional[str] = "recipe_short"
+
+
+@app.post("/shorts/refine-scene")
+async def shorts_refine_scene(request: RefineSceneRequest):
+    """선택된 클립을 참고해 해당 씬 대본만 다듬는다. 잠금 필드는 손대지 않는다."""
+    from core.shorts_lab import refine_scene
+    try:
+        return refine_scene(
+            request.scene,
+            [c.model_dump() for c in request.clips],
+            request.topic or "",
+            request.category or "recipe_short",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[Shorts Refine Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shorts/analyze-media")
+async def shorts_analyze_media(file: UploadFile = File(...), hint: str = Form("")):
+    from core.shorts_lab import analyze_upload
+    try:
+        data = await file.read()
+        result = analyze_upload(data, file.content_type or "", hint or "")
+        # 업로드 원본 보관
+        try:
+            updir = os.path.join(get_asset_dir(), "uploads")
+            os.makedirs(updir, exist_ok=True)
+            safe_name = re.sub(r"[^\w.\-]", "_", file.filename or "upload.bin")[-80:]
+            with open(os.path.join(updir, safe_name), "wb") as f:
+                f.write(data)
+        except Exception as e:
+            print(f"Upload backup failed: {e}")
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[Shorts Media Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shorts/analyze-url")
+async def shorts_analyze_url(request: ShortsUrlRequest):
+    from core.shorts_lab import analyze_youtube
+    try:
+        return analyze_youtube(request.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[Shorts URL Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shorts/create")
+async def shorts_create(request: ShortsCreateRequest):
+    from core.shorts_lab import create_from_pattern
+    try:
+        return create_from_pattern(request.reference, request.new_topic, request.duration, request.category or "recipe_short")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[Shorts Create Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shorts/prompt-template")
+async def shorts_prompt_template(category: str = "recipe_short"):
+    """카테고리 고정 프롬프트(지침+섹션) 조회 — 프롬프트 확인/수정 모달용."""
+    from core.templates import get_template
+    try:
+        t = get_template(category)
+        return {
+            "id": t["id"],
+            "name": t["name"],
+            "instructions": t["instructions"],
+            "sections": [{"name": n, "desc": d} for n, d in t.get("sections", [])],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/uploads")
+async def upload_asset(file: UploadFile = File(...)):
+    """사용자 직접 촬영 파일(이미지/동영상) 업로드 → 씬별 교체용."""
+    try:
+        allowed_exts = (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".webm", ".mov")
+        name = file.filename or "upload.bin"
+        if not name.lower().endswith(allowed_exts):
+            raise HTTPException(status_code=400, detail=f"지원하지 않는 형식입니다: {allowed_exts}")
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="빈 파일입니다.")
+        if len(data) > 200 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="200MB를 초과합니다.")
+        updir = os.path.join(get_asset_dir(), "uploads")
+        os.makedirs(updir, exist_ok=True)
+        import time as _t
+        safe = re.sub(r"[^\w.\-]", "_", name)[-60:]
+        fname = f"user_{int(_t.time())}_{safe}"
+        path = os.path.join(updir, fname)
+        with open(path, "wb") as f:
+            f.write(data)
+        rel = os.path.relpath(path, get_asset_dir())
+        return {"url": f"/assets/{rel.replace(os.sep, '/')}", "path": path}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/visuals/stock-videos")
+async def get_stock_videos(keyword: str, count: int = 4):
+    from core.visual_engine import search_pexels_videos
+    try:
+        videos = search_pexels_videos(keyword, min(max(count, 1), 8))
+        return {"videos": videos}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[Stock Videos Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/scrape")
 async def scrape(request: NewsRequest):
     global cancel_requested
@@ -558,9 +740,10 @@ async def scrape(request: NewsRequest):
             raise asyncio.CancelledError("User requested cancellation")
 
         if content:
-            print(f"[Scrape Success] Title: {content.split('\n')[0].replace('# ', '')}")
+            _title = content.split('\n')[0].replace('# ', '')
+            print(f"[Scrape Success] Title: {_title}")
             await progress_tracker.update("scrape", "completed", 100, "뉴스 본문 추출이 완료되었습니다.")
-            return {"full_text": content, "title": content.split('\n')[0].replace('# ', '')}
+            return {"full_text": content, "title": _title}
         else:
             print(f"[Scrape Failed] No content extracted from {request.url}")
             await progress_tracker.update("scrape", "failed", 0, "뉴스 본문 추출에 실패했습니다.")
@@ -575,7 +758,7 @@ async def scrape(request: NewsRequest):
 async def generate(request: GenerateRequest):
     global cancel_requested
     cancel_requested = False # Reset flag for new task
-    print(f"\n[Generate Request] Content Length: {len(request.article_text)}, Duration: {request.duration}s")
+    print(f"\n[Generate Request] Content Length: {len(request.article_text)}, Duration: {request.duration}s, Template: {request.template_id}")
     try:
         async def progress_callback(progress, message):
             if cancel_requested:
@@ -588,15 +771,32 @@ async def generate(request: GenerateRequest):
             request.article_text, 
             custom_instructions=request.custom_instructions, 
             duration=request.duration,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            template_id=request.template_id
         )
-        print(f"[Generate Success] Storyboard size: {len(content.get('storyboard', []))} scenes")
-        await progress_tracker.update("generate", "completed", 100, "대본 및 장면 가이드 생성이 완료되었습니다.")
+        # generator.py는 전 모델 실패 시 {"error": "..."} dict를 반환한다 (예외를 던지지 않음).
+        # 그대로 200으로 돌려주면 프론트가 빈 화면이 되므로 여기서 상태코드로 변환한다.
+        if not content or content.get("error"):
+            err_msg = (content or {}).get("error", "Unknown generation error") if isinstance(content, dict) else str(content)
+            print(f"[Generate Failed] {err_msg[:500]}")
+            await progress_tracker.update("generate", "failed", 0, f"오류 발생: {err_msg[:200]}")
+            if "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg:
+                raise HTTPException(status_code=401, detail="Gemini API 키가 유효하지 않습니다. 설정 화면에서 API 키를 확인해주세요.")
+            raise HTTPException(status_code=500, detail=f"대본 생성에 실패했습니다: {err_msg[:500]}")
+        storyboard = content.get('storyboard', content.get('script', []))
+        print(f"[Generate Success] Storyboard size: {len(storyboard)} scenes, duration: {content.get('total_duration', '?')}s / target {content.get('target_duration', request.duration)}s")
+        if content.get('warning'):
+            await progress_tracker.update("generate", "completed", 100, content['warning'])
+        else:
+            await progress_tracker.update("generate", "completed", 100, "대본 및 장면 가이드 생성이 완료되었습니다.")
         return content
     except asyncio.CancelledError:
         print("[Generate Cancelled] User requested stop.")
         await progress_tracker.update("generate", "failed", 0, "사용자가 작업을 취소했습니다.")
         raise HTTPException(status_code=499, detail="Task cancelled by user")
+    except HTTPException:
+        # 위에서 의도적으로 던진 401/500은 그대로 전달 (generic except가 500으로 덮지 않도록)
+        raise
     except Exception as e:
         print(f"[Generate Error] {str(e)}")
         await progress_tracker.update("generate", "failed", 0, f"오류 발생: {str(e)}")
@@ -673,10 +873,11 @@ async def get_visual_candidates(request: VisualCandidateRequest):
             ai_model=request.ai_model,
             topic=request.topic,  # 추가
             visual_guide=request.visual_guide,  # 추가
+            category=request.category,  # 카테고리별 비주얼 프리셋
             cancel_check=cancel_check
         )
 
-        print(f"[Visual Candidates Success] Found {len(candidates_dict.get('ai', []))} AI, {len(candidates_dict.get('search', []))} Search, {len(candidates_dict.get('graph', []))} Graph candidates")
+        print(f"[Visual Candidates Success] Found {len(candidates_dict.get('ai', []))} AI, {len(candidates_dict.get('search', []))} Search, {len(candidates_dict.get('graph', []))} Graph candidates (category={request.category})")
 
         # Convert absolute paths to URL paths for the frontend
         asset_base = get_asset_dir()
@@ -740,6 +941,8 @@ async def render_video(request: RenderRequest):
                         audio_edit=request.audio_edit.model_dump() if request.audio_edit else None,
                         edited_srt=request.edited_srt,
                         aspect_ratio=request.aspect_ratio,
+                        scene_captions=request.scene_captions,
+                        caption_style=request.caption_style.model_dump() if request.caption_style else None,
                         progress_callback=progress_cb,
                         cancel_check=cancel_check
                     )
@@ -764,10 +967,21 @@ async def render_video(request: RenderRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
+    import os as _os
+    import sys as _sys
+    # 번들 콘솔(cp949)에서 이모지 출력 크래시 방지
+    try:
+        if hasattr(_sys.stdout, "reconfigure"):
+            _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(_sys.stderr, "reconfigure"):
+            _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     import uvicorn
+    _port = int(_os.environ.get("YOU_BACKEND_PORT", "8000"))
     print("\n" + "="*50)
     print("🚀 AutoVideoSystem Backend Server Starting...")
-    print(f"📡 API Address: http://localhost:8000")
+    print(f"📡 API Address: http://localhost:{_port}")
     print("📝 Logs will be displayed below in real-time.")
     print("="*50 + "\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=_port, log_level="info")

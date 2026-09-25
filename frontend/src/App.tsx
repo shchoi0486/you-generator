@@ -6,14 +6,21 @@ import {
   Download,
   X
 } from 'lucide-react';
-import { 
-  api, 
-  type ScriptItem, 
-  type AppContent, 
-  type AppConfig, 
+import {
+  api,
+  type ScriptItem,
+  type AppContent,
+  type AppConfig,
   type SceneCandidates,
   type Article,
-  type ProjectMeta
+  type ProjectMeta,
+  type ShortsReport,
+  type ClipRef,
+  type SceneLayout,
+  type StockVideo,
+  type CaptionStyle,
+  API_BASE_URL,
+  assetUrl
 } from './services/api';
 import Step1Input from './components/Step1Input';
 import Step2Review from './components/Step2Review';
@@ -40,6 +47,104 @@ import {
 } from './constants/data';
 
 
+interface SrtItem { id: number; start: number; end: number; text: string; scene?: number }
+
+/** 한 번에 표시할 자막 최대 글자수 */
+export const SUBTITLE_MAX_CHARS = 16;
+
+/** 긴 자막을 단어 경계에서 쪼갬 (한국어: 공백 우선, 장문 단어는 강제 절단) */
+const splitSubtitleText = (text: string, maxChars: number): string[] => {
+  const t = (text || '').trim().replace(/\s+/g, ' ');
+  if (t.length <= maxChars) return [t];
+  const words = t.split(' ');
+  const chunks: string[] = [];
+  let cur = '';
+  const push = (s: string) => { if (s) chunks.push(s); };
+  for (const w of words) {
+    if ((cur + (cur ? ' ' : '') + w).length <= maxChars) {
+      cur = cur ? `${cur} ${w}` : w;
+    } else {
+      push(cur);
+      cur = '';
+      if (w.length <= maxChars) {
+        cur = w;
+      } else {
+        for (let i = 0; i < w.length; i += maxChars) push(w.slice(i, i + maxChars));
+      }
+    }
+  }
+  push(cur);
+  return chunks.filter(Boolean);
+};
+
+/** 긴 자막 엔트리를 시간 비례로 분할. scene 인덱스를 부여해 씬 매핑 유지 */
+const splitLongSubtitles = (items: SrtItem[], scriptLen: number, maxChars: number = SUBTITLE_MAX_CHARS): SrtItem[] => {
+  const out: SrtItem[] = [];
+  let nextId = 1;
+  items.forEach((item, i) => {
+    const scene = item.scene ?? Math.min(i, Math.max(0, scriptLen - 1));
+    const parts = splitSubtitleText(item.text, maxChars);
+    if (parts.length <= 1) {
+      out.push({ ...item, id: nextId++, scene });
+      return;
+    }
+    const total = Math.max(0.001, item.end - item.start);
+    const totalChars = parts.reduce((a, p) => a + p.length, 0) || 1;
+    let t = item.start;
+    parts.forEach((p, pi) => {
+      const share = p.length / totalChars;
+      // 마지막 조각은 남은 구간 전체 차지 (반올림 누적 방지)
+      const dur = pi === parts.length - 1 ? Math.max(0.3, item.end - t) : Math.max(0.3, total * share);
+      const end = pi === parts.length - 1 ? item.end : Math.min(item.end, t + dur);
+      out.push({ id: nextId++, start: t, end: Math.max(end, t + 0.1), text: p, scene });
+      t = end;
+    });
+  });
+  return out;
+};
+
+const parseSrtText = (data: string): SrtItem[] => {
+  const items: SrtItem[] = [];
+  const blocks = data.replace(/\r\n/g, '\n').trim().split(/\n\s*\n/);
+
+  const timeToSeconds = (t: string) => {
+    const [h, m, s_ms] = t.split(':');
+    const [s, ms] = s_ms.replace('.', ',').split(',');
+    return parseInt(h) * 3600 + parseInt(m) * 60 + parseInt(s) + parseInt(ms) / 1000;
+  };
+
+  for (const block of blocks) {
+    const lines = block.split('\n').map(l => l.trim()).filter(l => l !== '');
+    if (lines.length >= 3) {
+      let timeLineIdx = -1;
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes('-->')) {
+          timeLineIdx = i;
+          break;
+        }
+      }
+
+      if (timeLineIdx !== -1) {
+        const timeMatch = lines[timeLineIdx].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
+
+        if (timeMatch) {
+          const [ , startStr, endStr ] = timeMatch;
+          const text = lines.slice(timeLineIdx + 1).join(' ').trim();
+          const idLine = lines.slice(0, timeLineIdx).join('').trim();
+          const id = parseInt(idLine, 10);
+
+          items.push({
+            id: isNaN(id) ? items.length + 1 : id,
+            start: timeToSeconds(startStr),
+            end: timeToSeconds(endStr),
+            text: text
+          });
+        }
+      }
+    }
+  }
+  return items;
+};
 
 
 function App() {
@@ -68,6 +173,15 @@ function App() {
   const [directText, setDirectText] = useState('');
   const [projectName, setProjectName] = useState('새 프로젝트');
   const [duration, setDuration] = useState(60);
+  const [templateId, setTemplateId] = useState('news_duo');
+  // ShortsLab 상태 (스텝 이동해도 분석 결과 유지)
+  const [shortsMode, setShortsMode] = useState<'file' | 'youtube'>('file');
+  const [shortsYtUrl, setShortsYtUrl] = useState('');
+  const [shortsHint, setShortsHint] = useState('');
+  const [shortsReport, setShortsReport] = useState<ShortsReport | null>(null);
+  const [shortsTopic, setShortsTopic] = useState('');
+  const [shortsDuration, setShortsDuration] = useState(40);
+  const [shortsCategory, setShortsCategory] = useState('recipe_short');
   const [inputType, setInputType] = useState<'url' | 'text'>('url');
   const [article, setArticle] = useState<Article | null>(null);
   const [content, setContent] = useState<AppContent | null>(null); // script + scenes
@@ -86,6 +200,22 @@ function App() {
   // Let's replace it with state only if it's not used in ways that require a ref (like in closures).
 
   const [selectedVisuals, setSelectedVisuals] = useState<Record<number, string[]>>({});
+  // 클립별 in/out 트림: sceneIdx -> url -> {in, out}
+  const [clipTrims, setClipTrims] = useState<Record<number, Record<string, { in: number; out: number | null }>>>({});
+  // 씬별 화면 배치: scale(1=핏), x/y(화면 비율 오프셋)
+  const [sceneLayouts, setSceneLayouts] = useState<Record<number, SceneLayout>>({});
+  // 씬 자막(상단 밴드) 표시 여부 — Step2의 씬별 subtitle을 나레이션 자막과 별도 스타일로 표시
+  const [showSceneCaptions, setShowSceneCaptions] = useState(true);
+  // 스톡/업로드 미디어 목록: Step4 로컬에 두면 화면 이동 시 날아가므로 App에서 보유
+  const [extraMedia, setExtraMedia] = useState<Record<number, StockVideo[]>>({});
+  // 저장된 프로젝트 불러오기 경로로 4개 이상이 들어오는 경우 대비: 씬당 최대 3개로 정리
+  const sanitizeSelectedVisuals = (v: Record<number, string[]>): Record<number, string[]> => {
+    const out: Record<number, string[]> = {};
+    Object.entries(v || {}).forEach(([k, arr]) => {
+      if (Array.isArray(arr)) out[Number(k)] = [...new Set(arr)].slice(0, 3);
+    });
+    return out;
+  };
   const [renderResult, setRenderResult] = useState<{
     videoUrl?: string;
     video_path?: string;
@@ -147,6 +277,14 @@ function App() {
     show_subtitles: true // 자막 표시 여부
   });
 
+  // 상단 씬 자막 밴드 스타일 (하단 내레이션 자막과 별도)
+  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>({
+    font_size: 13,
+    color: '#FFD76A',
+    bg_color: 'rgba(0,0,0,0.45)',
+    y_offset: 7
+  });
+
   const [aspectRatio, setAspectRatio] = useState<string>("16:9 (Youtube)"); // 화면 비율 추가
   const [audioEdit, setAudioEdit] = useState<{
     bgm_path: string | null;
@@ -158,6 +296,13 @@ function App() {
     sfx_list: []
   });
   const [srtData, setSrtData] = useState<Array<{ id: number; start: number; end: number; text: string }>>([]);
+  // srtData 생성 시점의 대본 지문. 대본 수정 후 TTS 미재생성 시 자막 불일치 경고용
+  const [srtScriptSig, setSrtScriptSig] = useState<string | null>(null);
+  // 오디오 생성 시점의 대본 지문. 타임라인 구조편집 등으로 어긋나면 음성 재생성 경고용
+  const [audioScriptSig, setAudioScriptSig] = useState<string | null>(null);
+  const currentScriptSig = (content?.script || []).map((s) => `${s.speaker}:${s.text}`).join('\n');
+  const audioStale = !!audio && audioScriptSig !== null && audioScriptSig !== currentScriptSig;
+  const subsStale = !audioStale && srtData.length > 0 && srtScriptSig !== null && srtScriptSig !== currentScriptSig;
   const [sceneDurations, setSceneDurations] = useState<number[]>([]); // 각 장면의 길이 상태 추가
   const [editingSrtId, setEditingSrtId] = useState<number | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -253,7 +398,7 @@ function App() {
     audioEdit.sfx_list.forEach(sfx => {
       // 현재 시간과 SFX 시간이 일치하면 재생 (오차 범위 0.1초)
       if (Math.abs(currentTime - sfx.time) < 0.1) {
-        const sfxAudio = new Audio(`http://localhost:8000/${sfx.path}`);
+        const sfxAudio = new Audio(assetUrl(sfx.path));
         sfxAudio.volume = sfx.volume;
         sfxAudio.play().catch(() => {});
       }
@@ -269,6 +414,28 @@ function App() {
     
     // 1. SRT 데이터가 있으면 SRT 우선 사용
     // 씬의 길이는 현재 자막 시작부터 다음 자막 시작까지 (공백 포함)로 계산해야 이미지 싱크가 맞음
+    // 자막 분할로 srtData가 script보다 많을 수 있어 scene 필드 우선 매칭
+    const scoped = (srtData || []).filter((s) => (s as { scene?: number }).scene === currentIdx);
+    if (scoped.length > 0) {
+      const start = scoped[0].start;
+      const nextScoped = (srtData || []).filter((s) => (s as { scene?: number }).scene === currentIdx + 1);
+      let end: number;
+      if (nextScoped.length > 0) {
+        end = nextScoped[0].start;
+      } else if (currentIdx < data.length - 1 && srtData.length > 0) {
+        // 다음 씬 자막이 없으면 (삭제됨) 그 다음 씬 시작 또는 마지막 end 사용
+        const later = (srtData || []).filter((s) => ((s as { scene?: number }).scene ?? -1) > currentIdx);
+        end = later.length > 0 ? later[0].start : scoped[scoped.length - 1].end;
+      } else {
+        end = scoped[scoped.length - 1].end + gapDuration;
+      }
+      const duration = end - start;
+      return {
+        start: start.toFixed(2),
+        end: end.toFixed(2),
+        duration: duration.toFixed(2)
+      };
+    }
     if (srtData && srtData.length === data.length) {
       const item = srtData[currentIdx];
       const start = item.start;
@@ -389,13 +556,18 @@ function App() {
         if (parsed.content) setContent(parsed.content);
         if (parsed.audio) setAudio(parsed.audio);
         if (parsed.visualCandidates) setVisualCandidates(parsed.visualCandidates);
-        if (parsed.selectedVisuals) setSelectedVisuals(parsed.selectedVisuals);
+        if (parsed.selectedVisuals) setSelectedVisuals(sanitizeSelectedVisuals(parsed.selectedVisuals));
+        if (parsed.extraMedia) setExtraMedia(parsed.extraMedia);
+        if (parsed.clipTrims) setClipTrims(parsed.clipTrims);
+        if (parsed.sceneLayouts) setSceneLayouts(parsed.sceneLayouts);
+        if (typeof parsed.showSceneCaptions === 'boolean') setShowSceneCaptions(parsed.showSceneCaptions);
         if (parsed.voiceMap) setVoiceMap(parsed.voiceMap);
         if (parsed.selectedEngine) setSelectedEngine(parsed.selectedEngine);
         if (parsed.selectedLanguage) setSelectedLanguage(parsed.selectedLanguage);
         if (parsed.voiceSettings) setVoiceSettings(parsed.voiceSettings);
         if (parsed.gapDuration) setGapDuration(parsed.gapDuration);
         if (parsed.srtData) setSrtData(parsed.srtData);
+        if (parsed.captionStyle) setCaptionStyle((prev) => ({ ...prev, ...parsed.captionStyle }));
       } catch (e) {
         console.error('Failed to load project from localStorage', e);
       }
@@ -432,6 +604,7 @@ function App() {
       voiceSettings,
       gapDuration,
       srtData,
+      captionStyle,
       lastModified: new Date().toISOString()
     };
     
@@ -463,8 +636,8 @@ function App() {
   }, [
     projectId, currentStep, activeMenu, url, directText, projectName, duration, 
     inputType, article, content, audio, visualCandidates, 
-    selectedVisuals, voiceMap, selectedEngine, selectedLanguage, 
-    voiceSettings, gapDuration, srtData
+    selectedVisuals, clipTrims, sceneLayouts, showSceneCaptions, extraMedia, voiceMap, selectedEngine, selectedLanguage, 
+    voiceSettings, gapDuration, srtData, captionStyle
   ]);
 
   const handleNewProject = React.useCallback((skipConfirm = false) => {
@@ -482,11 +655,20 @@ function App() {
       setAudio(null);
       setVisualCandidates({});
       setSelectedVisuals({});
+      setClipTrims({});
+      setSceneLayouts({});
+      setExtraMedia({});
       setRenderResult(null);
       setError(null);
       setActiveMenu('Home');
       
       // Reset additional editor states
+      setCaptionStyle({
+        font_size: 13,
+        color: '#FFD76A',
+        bg_color: 'rgba(0,0,0,0.45)',
+        y_offset: 7
+      });
       setSubtitleStyle({
         preset: 'youtube',
         font: 'Noto Sans KR',
@@ -506,7 +688,9 @@ function App() {
         bgm_volume: 0.2,
         sfx_list: []
       });
-      setSrtData([]);
+      setSrtData([]); setSrtScriptSig(null);
+      setAudioScriptSig(null);
+      setShortsReport(null); setShortsTopic(''); setShortsYtUrl('');
       setSceneDurations([]);
       setEditingSrtId(null);
       setIsPlaying(false);
@@ -541,13 +725,18 @@ function App() {
         if (mergedData.article) setArticle(mergedData.article);
         if (mergedData.audio) setAudio(mergedData.audio);
         if (mergedData.visualCandidates) setVisualCandidates(mergedData.visualCandidates);
-        if (mergedData.selectedVisuals) setSelectedVisuals(mergedData.selectedVisuals);
+        if (mergedData.selectedVisuals) setSelectedVisuals(sanitizeSelectedVisuals(mergedData.selectedVisuals));
+        if (mergedData.extraMedia) setExtraMedia(mergedData.extraMedia);
+        if (mergedData.clipTrims) setClipTrims(mergedData.clipTrims);
+        if (mergedData.sceneLayouts) setSceneLayouts(mergedData.sceneLayouts);
+        if (typeof mergedData.showSceneCaptions === 'boolean') setShowSceneCaptions(mergedData.showSceneCaptions);
         if (mergedData.voiceMap) setVoiceMap(mergedData.voiceMap);
         if (mergedData.selectedEngine) setSelectedEngine(mergedData.selectedEngine);
         if (mergedData.selectedLanguage) setSelectedLanguage(mergedData.selectedLanguage);
         if (mergedData.voiceSettings) setVoiceSettings(mergedData.voiceSettings);
         if (mergedData.gapDuration !== undefined) setGapDuration(mergedData.gapDuration);
         if (mergedData.subtitleStyle) setSubtitleStyle(mergedData.subtitleStyle);
+        if (mergedData.captionStyle) setCaptionStyle((prev) => ({ ...prev, ...mergedData.captionStyle }));
         if (mergedData.aspectRatio) setAspectRatio(mergedData.aspectRatio);
         if (mergedData.audioEdit) setAudioEdit(mergedData.audioEdit);
         if (mergedData.srtData) {
@@ -674,14 +863,19 @@ function App() {
           inputType,
           article,
           audio,
-          visualCandidates,
-          selectedVisuals,
-          voiceMap,
+      visualCandidates,
+      selectedVisuals,
+      clipTrims,
+      sceneLayouts,
+      showSceneCaptions,
+      extraMedia,
+      voiceMap,
           selectedEngine,
           selectedLanguage,
           voiceSettings,
           gapDuration,
           subtitleStyle,
+          captionStyle,
           aspectRatio,
           audioEdit,
           srtData,
@@ -708,7 +902,7 @@ function App() {
     projectId, currentStep, activeMenu, url, directText, projectName, 
     duration, inputType, article, content, audio, visualCandidates, 
     selectedVisuals, voiceMap, selectedEngine, selectedLanguage, 
-    voiceSettings, gapDuration, subtitleStyle, aspectRatio, audioEdit, 
+    voiceSettings, gapDuration, subtitleStyle, captionStyle, aspectRatio, audioEdit, 
     srtData, sceneDurations
   ]);
 
@@ -811,7 +1005,7 @@ function App() {
         throw new Error("미리보기 URL을 받지 못했습니다.");
       }
       
-      const audioUrl = `http://localhost:8000${response.audio_url}`;
+      const audioUrl = assetUrl(response.audio_url);
       console.log("Playing audio from:", audioUrl);
       
       const audio = new Audio(audioUrl);
@@ -895,7 +1089,7 @@ function App() {
         if (!isPlayAllPreviewRef.current) break; // 생성 중에 중지 체크
 
         // 2. 오디오 재생
-        const audioUrl = `http://localhost:8000${response.audio_url}`;
+        const audioUrl = assetUrl(response.audio_url);
         const audio = new Audio(audioUrl);
         audioRef.current = audio;
         setPlayingSpeaker(`segment-${typeof segment === 'object' && segment !== null && 'text' in segment ? (segment as { text: string }).text.substring(0, 10) : (segment as string).substring(0, 10)}`);
@@ -967,7 +1161,7 @@ function App() {
   }, [activeMenu]);
 
   useEffect(() => {
-    const eventSource = new EventSource('http://localhost:8000/events');
+    const eventSource = new EventSource(`${API_BASE_URL}/events`);
     
     eventSource.onmessage = (event) => {
       try {
@@ -1063,26 +1257,133 @@ function App() {
     if (!article) return;
     setLoading(true);
     setError(null);
-    setSrtData([]); // 대본 재생성 시 자막 데이터 초기화
+    setSrtData([]); setSrtScriptSig(null); // 대본 재생성 시 자막 데이터 초기화
+    setAudio(null); setAudioScriptSig(null); // 이전 대본의 음성이 남지 않도록 초기화
     // 초기 진행 상태 설정
     setProgress({ step: 'generate', status: 'starting', progress: 10, message: 'AI 대본 생성을 요청하고 있습니다...' });
     try {
       const result = await api.generateContent({ 
         article_text: article.full_text as string,
-        duration: duration 
+        duration: duration,
+        template_id: templateId
       });
+      // 구 백엔드 호환: {"error": "..."} 형태로 올 수도 있다
+      if (!result || (result as { error?: string }).error) {
+        const errMsg = (result as { error?: string } | null)?.error || 'AI 대본 생성에 실패했습니다.';
+        const isKeyIssue = errMsg.includes('API_KEY_INVALID') || errMsg.includes('API key not valid') || errMsg.includes('API 키');
+        setError(isKeyIssue ? 'Gemini API 키가 유효하지 않습니다. 설정 화면에서 API 키를 확인해주세요.' : errMsg);
+        if (isKeyIssue) setActiveMenu('Settings');
+        return;
+      }
       setContent(result);
       // Stay in Step 2 for Review
       setCurrentStep(2);
     } catch (err: unknown) {
-      setError((err as Error).message || 'AI 대본 생성 중 오류가 발생했습니다. 서버 상태를 확인해주세요.');
+      const status = (err as Error & { status?: number }).status;
+      const msg = (err as Error).message || 'AI 대본 생성 중 오류가 발생했습니다. 서버 상태를 확인해주세요.';
+      const isKeyIssue = status === 401 || msg.includes('API_KEY_INVALID') || msg.includes('API key not valid') || msg.includes('API 키');
+      setError(isKeyIssue ? 'Gemini API 키가 유효하지 않습니다. 설정 화면에서 API 키를 확인해주세요.' : msg);
+      if (isKeyIssue) setActiveMenu('Settings');
     } finally {
       setLoading(false);
     }
   };
 
+  // 숏폼 바로 만들기 (분석 스킵, 카테고리 기본 패턴 + 웹 근거)
+  const handleShortsDirectCreate = async (topic: string, dur: number, category: string) => {
+    if (!topic.trim()) return;
+    setLoading(true);
+    setError(null);
+    setSrtData([]); setSrtScriptSig(null);
+    setAudio(null); setAudioScriptSig(null);
+    setProgress({ step: 'generate', status: 'starting', progress: 10, message: 'AI 대본 생성을 요청하고 있습니다...' });
+    try {
+      const result = await api.createShorts({
+        reference: '',
+        new_topic: topic.trim(),
+        duration: dur,
+        category,
+      });
+      const contentTyped = result as AppContent;
+      const title = contentTyped.title || topic.trim().slice(0, 50);
+      setArticle({ title, full_text: title });
+      setContent(contentTyped);
+      setCurrentStep(2);
+    } catch (err: unknown) {
+      setError((err as Error).message || '대본 생성 중 오류가 발생했습니다.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 새로 생성된 오디오의 SRT를 즉시 자막 데이터에 반영 (TTS 재생성 직후 호출)
+  const refreshSrtData = async (audioObj: { srtUrl?: unknown; srt_url?: unknown; srt_path?: unknown }): Promise<SrtItem[] | null> => {
+    const rawSrtUrlValue = audioObj.srtUrl ?? audioObj.srt_url;
+    const rawSrtUrl = typeof rawSrtUrlValue === 'string' ? rawSrtUrlValue : '';
+    const srtPath = typeof audioObj.srt_path === 'string' ? audioObj.srt_path : '';
+    if (!rawSrtUrl && !srtPath) return null;
+
+    let srtUrl = "";
+    if (rawSrtUrl) {
+      srtUrl = assetUrl(rawSrtUrl);
+    } else {
+      // 백엔드는 보통 assets/audio/ 에 srt를 저장함
+      const fileName = srtPath.split(/[\\/]/).pop();
+      srtUrl = assetUrl(`/assets/audio/${fileName}`);
+    }
+
+    const response = await fetch(srtUrl as RequestInfo);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch SRT: ${response.status} ${response.statusText}`);
+    }
+    const parsed = parseSrtText(await response.text());
+    if (parsed.length === 0) return null;
+    const split = splitLongSubtitles(parsed, content?.script.length ?? parsed.length);
+    setSrtData(split);
+    setSrtScriptSig((content?.script || []).map((s) => `${s.speaker}:${s.text}`).join('\n'));
+    return split;
+  };
+
   // Keep latest handleGenerateTTS for custom event
   const handleGenerateTTSRef = useRef<(() => Promise<void>) | null>(null);
+
+  // Step4Visual의 스톡 검색을 전체 생성 루프에서 호출하기 위한 ref
+  const stockFetchRef = useRef<((idx: number, silent?: boolean) => Promise<void>) | null>(null);
+
+  // 다듬기 결과 적용: 해당 씬 대본/자막 교체 + srtData 구간 교체 + 음성 무효화
+  const onRefineApply = (idx: number, r: {
+    narration_ko?: string;
+    subtitles?: Array<{ text: string; start: number; end: number }>;
+    sfx?: string;
+  }) => {
+    if (!content) return;
+    const range = getTimelineRange(content.script, idx);
+    const S = parseFloat(range.start);
+    const E = parseFloat(range.end);
+    const newScript = [...content.script];
+    const si = newScript.findIndex((s) => s.scene_index === idx);
+    if (si !== -1) {
+      newScript[si] = {
+        ...newScript[si],
+        text: r.narration_ko ?? newScript[si].text,
+        subtitle: (r.subtitles || []).map((s) => s.text).join(' / ') || newScript[si].subtitle,
+        sfx: r.sfx ?? newScript[si].sfx,
+      };
+    }
+    const maxId = srtData.reduce((m, s) => Math.max(m, s.id), 0);
+    const fresh = (r.subtitles || [])
+      .map((s, i) => {
+        const st = S + Math.max(0, Number(s.start) || 0);
+        const en = S + Math.max(Number(s.end) || 0, Number(s.start) || 0) + 0.5;
+        return { id: maxId + 1 + i, start: st, end: Math.min(Math.max(en, st + 0.5), E), text: s.text, scene: idx };
+      })
+      .filter((s) => s.end > s.start);
+    const kept = srtData.filter((s) => !(s.start >= S - 1e-6 && s.start < E - 1e-6));
+    setSrtData([...kept, ...fresh].sort((a, b) => a.start - b.start));
+    setContent({ ...content, script: newScript });
+    setAudio(null);
+    setAudioScriptSig(null);
+  };
   
   const handleGenerateTTS = async () => {
     if (!content?.script || content.script.length === 0) return;
@@ -1110,6 +1411,13 @@ function App() {
           srtUrl: data.srt_url || data.srtUrl
         };
         setAudio(mappedData);
+        setAudioScriptSig((content?.script || []).map((s) => `${s.speaker}:${s.text}`).join('\n'));
+        // 새 오디오의 SRT를 자막 데이터에 즉시 반영 (이전 버전 잔류 방지)
+        try {
+          await refreshSrtData(mappedData);
+        } catch (e) {
+          console.error('SRT refresh after TTS failed:', e);
+        }
         // Step 4로 무조건 이동하지 않고 현재 상태 유지
         if (currentStep < 4) setCurrentStep(4);
       }
@@ -1171,6 +1479,7 @@ function App() {
 
       const data = await api.getVisualCandidates({ 
         scene: {
+          keyword: (scene as { keyword?: string }).keyword || '',
           description: scene.description,
           keywords: searchKeywords
         }, 
@@ -1180,8 +1489,13 @@ function App() {
         ai_count: (type === 'all' || type === 'ai') ? (isAppend ? 1 : 1) : 0,
         search_count: (type === 'all' || type === 'search') ? (isAppend ? 1 : 5) : 0,
         ai_model: currentModel,
-        topic: projectName,
-        visual_guide: scene.description
+        // 백엔드 검색어 오염 방지: 프로젝트명이 기본값이면 기사 제목 사용, 둘 다 없으면 빈 문자열
+        topic: (projectName && projectName !== '새 프로젝트') ? projectName : (article?.title || ''),
+        visual_guide: (scene as { keyword?: string }).keyword || scene.description,
+        // 카테고리별 비주얼 프리셋 (templates.py와 ID 공유)
+        category: templateId === 'news_duo' || templateId === 'news_solo' ? 'news'
+          : templateId.endsWith('_short') ? templateId
+          : (shortsCategory || 'news'),
       });
       
       // 2. 결과 부분적 또는 전체적 업데이트
@@ -1227,33 +1541,14 @@ function App() {
         };
       });
 
-      // [개선] AI 결과가 있고 현재 선택된 이미지가 없으면 첫 번째 AI 이미지를 자동 선택
-      // setVisualCandidates의 업데이트 완료 후 실행하기 위해 별도로 호출
-      if (data?.candidates?.ai && data.candidates.ai.length > 0) {
-        setSelectedVisuals(vPrev => {
-          const currentSelection = vPrev[index] || [];
-          if (currentSelection.length === 0) {
-            return { ...vPrev, [index]: [data.candidates.ai[0].url] };
-          }
-          return vPrev;
-        });
-      } else if ((!data?.candidates?.ai || data.candidates.ai.length === 0) && data?.candidates?.search && data.candidates.search.length > 0) {
-        // AI가 없고 검색 결과만 있을 경우 검색 결과의 첫 번째 이미지 선택
-        setSelectedVisuals(vPrev => {
-          const currentSelection = vPrev[index] || [];
-          if (currentSelection.length === 0) {
-            return { ...vPrev, [index]: [data.candidates.search[0].url] };
-          }
-          return vPrev;
-        });
-      }
+      // 자동 선택 없음: 후보만 채우고 선택은 사용자가 직접 함
     } catch (err: unknown) {
       console.error(`Failed to fetch candidates for scene ${index}`, (err as Error).message || '서버 상태를 확인해주세요.');
     } finally {
       fetchKeys.forEach(key => fetchingIndicesRef.current.delete(key));
       setFetchingIndices(new Set(fetchingIndicesRef.current));
     }
-  }, [content?.scenes, visualCandidates, projectId, selectedAiModel]);
+  }, [content?.scenes, visualCandidates, projectId, selectedAiModel, article?.title, projectName, templateId, shortsCategory]);
 
   // 4단계 진입 시 혹은 장면 변경 시, 후보 이미지를 자동으로 가져오지 않도록 함 (사용자가 모델 선택 후 생성 버튼을 누를 때만 실행)
   // 기존 자동 생성 로직은 사용자의 요청에 의해 제거되었습니다.
@@ -1267,6 +1562,8 @@ function App() {
     
     if (isRegenerate) {
       setSelectedVisuals({});
+      setClipTrims({});
+      setSceneLayouts({});
     }
     
     for (let i = 0; i < sceneCount; i++) {
@@ -1284,13 +1581,53 @@ function App() {
       // [개선] AI 생성과 웹 검색을 분리하여 호출함으로써 AI 결과가 먼저 화면에 반영되도록 함
       // 1. AI 이미지 생성 (비교적 빠름)
       await fetchCandidates(i, 'ai', selectedAiModelRef.current);
-      
+
       if (stopGenerationRef.current) break;
-      
+
       // 2. 웹 검색 수집 (Playwright 로직으로 인해 느림)
       await fetchCandidates(i, 'search');
+
+      if (stopGenerationRef.current) break;
+
+      // 3. 스톡 비디오 수집 (개별 생성도 그대로 가능, 실패해도 루프 계속)
+      try {
+        await stockFetchRef.current?.(i, true);
+      } catch (e) {
+        console.error(`Stock fetch failed for scene ${i}:`, e);
+      }
     }
     
+    setIsGeneratingAll(false);
+    setGenerationProgress({ current: 0, total: 0 });
+  }, [content?.scenes, fetchCandidates, visualCandidates]);
+
+  // 소스별 전체 수집: AI / 웹검색 이미지 / 스톡 비디오를 각각 전 장면에 실행
+  const fetchAllByType = React.useCallback(async (type: 'ai' | 'search' | 'stock') => {
+    if (!content?.scenes) return;
+    const sceneCount = content.scenes.length;
+    setIsGeneratingAll(true);
+    stopGenerationRef.current = false;
+    setGenerationProgress({ current: 0, total: sceneCount });
+
+    for (let i = 0; i < sceneCount; i++) {
+      if (stopGenerationRef.current) break;
+      setGenerationProgress(prev => ({ ...prev, current: i + 1 }));
+      try {
+        if (type === 'ai') {
+          if (visualCandidates[i]?.ai && visualCandidates[i].ai.length > 0) continue;
+          await fetchCandidates(i, 'ai', selectedAiModelRef.current);
+        } else if (type === 'search') {
+          if (visualCandidates[i]?.search && visualCandidates[i].search.length > 0) continue;
+          await fetchCandidates(i, 'search');
+        } else {
+          await stockFetchRef.current?.(i, true);
+        }
+      } catch (e) {
+        console.error(`Bulk ${type} fetch failed for scene ${i}:`, e);
+      }
+      if (stopGenerationRef.current) break;
+    }
+
     setIsGeneratingAll(false);
     setGenerationProgress({ current: 0, total: 0 });
   }, [content?.scenes, fetchCandidates, visualCandidates]);
@@ -1307,91 +1644,21 @@ function App() {
       // SRT 파일 파싱 시도 (백엔드에 SRT 파싱 엔드포인트가 있다고 가정하거나 프론트에서 처리)
       // 여기서는 간단하게 SRT 파일 URL이 있으면 가져와서 파싱하는 로직 추가 가능
       // [개선] audio.srtUrl 또는 audio.srt_url 모두 지원하도록 수정
-      const rawSrtUrlValue = audio.srtUrl ?? audio.srt_url;
-      const rawSrtUrl = typeof rawSrtUrlValue === 'string' ? rawSrtUrlValue : '';
-      const srtPath = typeof audio.srt_path === 'string' ? audio.srt_path : '';
-      
-      if (rawSrtUrl || srtPath) {
-        try {
-          let srtUrl = "";
-          if (rawSrtUrl) {
-            srtUrl = rawSrtUrl.startsWith('http') ? rawSrtUrl : `http://localhost:8000${rawSrtUrl.startsWith('/') ? '' : '/'}${rawSrtUrl}`;
-          } else {
-            // 백엔드는 보통 assets/audio/ 에 srt를 저장함
-            const fileName = srtPath.split(/[\\/]/).pop();
-            srtUrl = `http://localhost:8000/assets/audio/${fileName}`;
-          }
-          
-          console.log("Fetching SRT from:", srtUrl);
-          const response = await fetch(srtUrl as RequestInfo);
-          if (!response.ok) {
-            throw new Error(`Failed to fetch SRT: ${response.status} ${response.statusText}`);
-          }
-          const srtText = await response.text();
-          
-          // Robust SRT Parser
-          const parseSRT = (data: string) => {
-            const items: { id: number; start: number; end: number; text: string }[] = [];
-            const blocks = data.replace(/\r\n/g, '\n').trim().split(/\n\s*\n/);
-            
-            for (const block of blocks) {
-              const lines = block.split('\n').map(l => l.trim()).filter(l => l !== '');
-              if (lines.length >= 3) {
-                // Find time range line (usually second line, but could be first if ID is missing)
-                let timeLineIdx = -1;
-                for (let i = 0; i < lines.length; i++) {
-                  if (lines[i].includes('-->')) {
-                    timeLineIdx = i;
-                    break;
-                  }
-                }
+      const parsedData = await refreshSrtData(audio).catch((e) => {
+        console.error("Failed to parse SRT:", e);
+        return null;
+      });
+      if (parsedData && parsedData.length > 0) {
+        const totalDuration = parsedData[parsedData.length - 1].end;
+        setVideoDuration(totalDuration);
 
-                if (timeLineIdx !== -1) {
-                  const timeMatch = lines[timeLineIdx].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
-                  
-                  if (timeMatch) {
-                    const [ , startStr, endStr ] = timeMatch;
-                    
-                    const timeToSeconds = (t: string) => {
-                      const [h, m, s_ms] = t.split(':');
-                      const [s, ms] = s_ms.replace('.', ',').split(',');
-                      return parseInt(h) * 3600 + parseInt(m) * 60 + parseInt(s) + parseInt(ms) / 1000;
-                    };
-                    
-                    const text = lines.slice(timeLineIdx + 1).join(' ').trim();
-                    const idLine = lines.slice(0, timeLineIdx).join('').trim();
-                    const id = parseInt(idLine, 10);
-                    
-                    items.push({
-                      id: isNaN(id) ? items.length + 1 : id,
-                      start: timeToSeconds(startStr),
-                      end: timeToSeconds(endStr),
-                      text: text
-                    });
-                  }
-                }
-              }
-            }
-            return items;
-          };
-          
-          const parsedData = parseSRT(srtText);
-          setSrtData(parsedData);
-          if (parsedData.length > 0) {
-            const totalDuration = parsedData[parsedData.length - 1].end;
-            setVideoDuration(totalDuration);
-            
-            // 각 장면의 초기 길이를 균등하게 분할
-            if (content?.scenes) {
-              const initialDurations = content.scenes.map(() => totalDuration / content.scenes.length);
-              setSceneDurations(initialDurations);
-            }
-          }
-        } catch (e) {
-          console.error("Failed to parse SRT:", e);
+        // 각 장면의 초기 길이를 균등하게 분할
+        if (content?.scenes) {
+          const initialDurations = content.scenes.map(() => totalDuration / content.scenes.length);
+          setSceneDurations(initialDurations);
         }
       }
-      
+
       setCurrentStep(5);
     } catch (err: unknown) {
       setError((err as Error).message || '편집 단계로 이동 중 오류가 발생했습니다.');
@@ -1402,18 +1669,21 @@ function App() {
 
   useEffect(() => {
     if (content?.script && srtData.length === 0) {
-      const newSrtData: { id: number; start: number; end: number; text: string }[] = [];
+      const rawSrtData: SrtItem[] = [];
       content.script.forEach((item, idx) => {
         const range = getTimelineRange(content.script, idx);
-        newSrtData.push({
+        rawSrtData.push({
           id: idx + 1,
           start: parseFloat(range.start),
           end: parseFloat(range.end),
-          text: item.text
+          text: item.text,
+          scene: idx
         });
       });
+      const newSrtData = splitLongSubtitles(rawSrtData, content.script.length);
       if (newSrtData.length > 0) {
         setSrtData(newSrtData);
+        setSrtScriptSig((content?.script || []).map((s) => `${s.speaker}:${s.text}`).join('\n'));
       }
     }
   }, [content, srtData.length, getTimelineRange]);
@@ -1424,36 +1694,42 @@ function App() {
     setError(null);
     setProgress({ step: 'render', status: 'starting', progress: 5, message: '최종 영상 렌더링을 준비하고 있습니다...' });
     try {
-      // [개선] 모든 장면에 대해 이미지가 선택되었는지 확인하고, 없으면 첫 번째 후보를 자동으로 할당
+      // 자동 할당 없음: 비어 있는 씬이 있으면 렌더를 막고 직접 고르게 함
       const finalVisuals: Record<number, string[]> = { ...selectedVisuals };
-      let missingCount = 0;
-      
+      const missingScenes: number[] = [];
+
       content.scenes.forEach((_, idx) => {
         if (!finalVisuals[idx] || finalVisuals[idx].length === 0) {
-          const candidates = visualCandidates[idx];
-          if (candidates) {
-            if (candidates.ai && candidates.ai.length > 0) {
-              finalVisuals[idx] = [candidates.ai[0].path];
-            } else if (candidates.search && candidates.search.length > 0) {
-              finalVisuals[idx] = [candidates.search[0].path];
-            } else {
-              missingCount++;
-            }
-          } else {
-            missingCount++;
-          }
+          missingScenes.push(idx + 1);
         }
       });
 
-      if (missingCount > 0) {
-        console.warn(`${missingCount}개 장면에 이미지가 없습니다. 검은색 배경으로 대체됩니다.`);
+      if (missingScenes.length > 0) {
+        alert(`아직 시각 자료가 없는 장면이 있습니다 (장면 ${missingScenes.join(', ')}). 각 장면에서 직접 선택해주세요.`);
+        return;
       }
 
       // 백엔드 렌더링을 위해 이미지 리스트와 각 장면의 길이를 전달
-      const bg_images: Array<[string[], number]> = content.scenes.map((_, idx) => {
+      // 영상 클립은 in/out 트림을 함께 전달 ({path, in, out})
+      const bg_images: Array<[Array<string | ClipRef>, number]> = content.scenes.map((_, idx) => {
         const range = getTimelineRange(content.script, idx);
+        const trims = clipTrims[idx] || {};
+        const layout = sceneLayouts[idx];
+        const hasLayout = layout && (Math.abs(layout.scale - 1) > 1e-6 || Math.abs(layout.x) > 1e-6 || Math.abs(layout.y) > 1e-6);
+        const clips = (finalVisuals[idx] || []).map((p) => {
+          const t = trims[p];
+          const hasTrim = t && (t.in > 0 || t.out != null);
+          if (hasTrim || hasLayout) {
+            return {
+              path: p,
+              ...(hasTrim ? { in: Math.max(0, t!.in || 0), out: t!.out } : {}),
+              ...(hasLayout ? { scale: layout!.scale, x: layout!.x, y: layout!.y } : {}),
+            };
+          }
+          return p;
+        });
         return [
-          finalVisuals[idx] || [],
+          clips,
           parseFloat(range.duration)
         ];
       });
@@ -1474,6 +1750,19 @@ function App() {
 
       const editedSrtContent = formatSRT(srtData);
 
+      // 씬 자막(상단 밴드): Step2의 씬별 subtitle을 씬 구간에 맞춰 전달
+      const sceneCaptions = showSceneCaptions
+        ? content.scenes.flatMap((scene, idx) => {
+            const text = (scene.subtitle || '').trim();
+            if (!text) return [];
+            const range = getTimelineRange(content.script, idx);
+            const start = parseFloat(range.start);
+            const end = parseFloat(range.end);
+            if (!(end > start)) return [];
+            return [{ start, end, text }];
+          })
+        : [];
+
       const data = await api.renderVideo({
         audio_path: audio.audio_path as string,
         srt_path: audio.srt_path as string,
@@ -1492,7 +1781,12 @@ function App() {
           }))
         },
         edited_srt: editedSrtContent, // 백엔드에서 이 필드를 처리하도록 함
-        aspect_ratio: aspectRatio // 화면 비율 추가
+        aspect_ratio: aspectRatio, // 화면 비율 추가
+        scene_captions: sceneCaptions,
+        caption_style: {
+          ...captionStyle,
+          bg_color: captionStyle.bg_color === 'transparent' ? undefined : captionStyle.bg_color
+        }
       });
       setRenderResult(data);
       setCurrentStep(6);
@@ -1513,12 +1807,12 @@ function App() {
       {/* Hidden Audio Elements for Preview */}
       <audio 
         ref={mainAudioRef} 
-        src={audio?.audio_url ? `http://localhost:8000${audio.audio_url}` : undefined} 
+        src={typeof audio?.audio_url === 'string' ? assetUrl(audio.audio_url) : undefined} 
         className="hidden"
       />
       <audio 
         ref={bgmAudioRef} 
-        src={audioEdit.bgm_path ? `http://localhost:8000/${audioEdit.bgm_path}` : undefined} 
+        src={audioEdit.bgm_path ? assetUrl(audioEdit.bgm_path) : undefined} 
         loop 
         className="hidden"
       />
@@ -1580,12 +1874,48 @@ function App() {
                 {/* Content Card */}
                 <div className={`bg-white shadow-2xl shadow-gray-200/40 border border-gray-100 flex-1 relative flex flex-col min-h-0 overflow-hidden ${currentStep === 5 ? 'rounded-none shadow-none border-none' : 'rounded-3xl'}`}>
                   
-                  <div className={`flex-1 flex flex-col min-h-0 ${currentStep !== 5 ? 'p-4 md:p-6' : ''}`}>
+                  <div className={`flex-1 flex flex-col min-h-0 ${currentStep !== 5 ? 'p-2 md:p-3' : ''}`}>
                     <LoadingOverlay 
                       loading={loading} 
                       progress={progress} 
                       handleCancelTask={handleCancelTask} 
                     />
+
+                {audioStale && (
+                  <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-amber-700 animate-in fade-in slide-in-from-top-2 duration-300">
+                    <AlertCircle size={20} className="shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <p className="font-bold text-sm">음성이 대본과 맞지 않습니다</p>
+                      <p className="text-xs opacity-80">
+                        대본 수정·타임라인 편집 이후라 음성이 어긋났습니다. 그대로 렌더하면 소리와 자막이 다릅니다. TTS를 다시 생성하세요.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleGenerateTTS()}
+                      className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition-colors"
+                    >
+                      TTS 다시 생성
+                    </button>
+                  </div>
+                )}
+
+                {subsStale && currentStep >= 3 && (
+                  <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-amber-700 animate-in fade-in slide-in-from-top-2 duration-300">
+                    <AlertCircle size={20} className="shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <p className="font-bold text-sm">자막이 대본과 맞지 않습니다</p>
+                      <p className="text-xs opacity-80">
+                        자막이 이전 대본 기준입니다. TTS를 다시 생성하면 현재 대본으로 맞춰집니다.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleGenerateTTS()}
+                      className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition-colors"
+                    >
+                      TTS 다시 생성
+                    </button>
+                  </div>
+                )}
 
                 {error && (
                   <div className="mb-6 p-4 bg-red-50 border border-red-100 rounded-xl flex items-start gap-3 text-red-600 animate-in fade-in slide-in-from-top-2 duration-300">
@@ -1640,6 +1970,30 @@ function App() {
                     setDirectText={setDirectText}
                     duration={duration}
                     setDuration={setDuration}
+                    templateId={templateId}
+                    setTemplateId={setTemplateId}
+                    shortsMode={shortsMode}
+                    setShortsMode={setShortsMode}
+                    shortsYtUrl={shortsYtUrl}
+                    setShortsYtUrl={setShortsYtUrl}
+                    shortsHint={shortsHint}
+                    setShortsHint={setShortsHint}
+                    shortsReport={shortsReport}
+                    setShortsReport={setShortsReport}
+                    shortsTopic={shortsTopic}
+                    setShortsTopic={setShortsTopic}
+                    shortsDuration={shortsDuration}
+                    setShortsDuration={setShortsDuration}
+                    shortsCategory={shortsCategory}
+                    setShortsCategory={setShortsCategory}
+                    onShortsComplete={(article, content) => {
+                      setArticle(article);
+                      setContent(content);
+                      setSrtData([]); setSrtScriptSig(null);
+                      setAudio(null); setAudioScriptSig(null);
+                      setCurrentStep(2);
+                    }}
+                    onShortsDirectCreate={handleShortsDirectCreate}
                     handleScrape={handleScrape}
                     loading={loading}
                   />
@@ -1655,6 +2009,7 @@ function App() {
                     handleGenerate={handleGenerateContent}
                     setContent={setContent}
                     setAudio={setAudio}
+                    setAudioScriptSig={setAudioScriptSig}
                     getTimelineRange={getTimelineRange}
                     setCurrentStep={setCurrentStep}
                     loading={loading}
@@ -1709,6 +2064,7 @@ function App() {
                     selectedAiModel={selectedAiModel}
                     setSelectedAiModel={setSelectedAiModel}
                     fetchAllCandidates={fetchAllCandidates}
+                    fetchAllByType={fetchAllByType}
                     fetchCandidates={fetchCandidates}
                     editingSceneIndex={editingSceneIndex}
                     setEditingSceneIndex={setEditingSceneIndex}
@@ -1720,6 +2076,13 @@ function App() {
                     setZoomedImage={setZoomedImage}
                     handleMoveToEdit={handleMoveToEdit}
                     fetchingIndices={fetchingIndices}
+                    stockFetchRef={stockFetchRef}
+                    getSceneDuration={(idx) => parseFloat(getTimelineRange(content.script, idx).duration)}
+                    clipTrims={clipTrims}
+                    setClipTrims={setClipTrims}
+                    extraMedia={extraMedia}
+                    setExtraMedia={setExtraMedia}
+                    onRefineApply={onRefineApply}
                   />
                 )}
                 {/* Step 5: Advanced Video Editor */}
@@ -1741,12 +2104,20 @@ function App() {
                     gapDuration={gapDuration}
                     selectedVisuals={selectedVisuals}
                     setSelectedVisuals={setSelectedVisuals}
+                    clipTrims={clipTrims}
+                    sceneLayouts={sceneLayouts}
+                    setSceneLayouts={setSceneLayouts}
+                    showSceneCaptions={showSceneCaptions}
+                    setShowSceneCaptions={setShowSceneCaptions}
+                    captionStyle={captionStyle}
+                    setCaptionStyle={setCaptionStyle}
                     visualCandidates={visualCandidates}
                     setVisualCandidates={setVisualCandidates}
                     subtitleStyle={subtitleStyle}
                     setSubtitleStyle={setSubtitleStyle}
                     srtData={srtData}
                     setSrtData={setSrtData}
+                    setSrtScriptSig={setSrtScriptSig}
                     editingSrtId={editingSrtId}
                     setEditingSrtId={setEditingSrtId}
                     setSceneDurations={setSceneDurations}
@@ -1789,12 +2160,20 @@ function App() {
                 gapDuration={gapDuration}
                 selectedVisuals={selectedVisuals}
                 setSelectedVisuals={setSelectedVisuals}
+                clipTrims={clipTrims}
+                sceneLayouts={sceneLayouts}
+                setSceneLayouts={setSceneLayouts}
+                showSceneCaptions={showSceneCaptions}
+                setShowSceneCaptions={setShowSceneCaptions}
+                captionStyle={captionStyle}
+                setCaptionStyle={setCaptionStyle}
                 visualCandidates={visualCandidates}
                 setVisualCandidates={setVisualCandidates}
                 subtitleStyle={subtitleStyle}
                 setSubtitleStyle={setSubtitleStyle}
                 srtData={srtData}
                 setSrtData={setSrtData}
+                setSrtScriptSig={setSrtScriptSig}
                 editingSrtId={editingSrtId}
                 setEditingSrtId={setEditingSrtId}
                 setSceneDurations={setSceneDurations}
