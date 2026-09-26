@@ -23,7 +23,8 @@ import {
   Settings2
 } from 'lucide-react';
 import type { LucideProps } from 'lucide-react';
-import { type AppContent, type SceneCandidates, type ScriptItem, type ProjectMeta, type SceneLayout, type CaptionStyle, assetUrl } from '../services/api';
+import { type AppContent, type SceneCandidates, type ScriptItem, type ProjectMeta, type SceneLayout, type CaptionStyle, type StickerItem, assetUrl } from '../services/api';
+import { customStyles } from '../constants/data';
 import Timeline from './Timeline';
 import PropertiesPanel from './PropertiesPanel';
 
@@ -63,6 +64,7 @@ interface VideoEditorProps {
     stroke_width: number;
     stroke_color: string;
     bg_color: string;
+    text_align?: string;
   };
   setSubtitleStyle: React.Dispatch<React.SetStateAction<{
     preset: string;
@@ -76,6 +78,7 @@ interface VideoEditorProps {
     stroke_width: number;
     stroke_color: string;
     bg_color: string;
+    text_align?: string;
   }>>;
   srtData: { id: number; start: number; end: number; text: string }[];
   setSrtData: React.Dispatch<React.SetStateAction<{ id: number; start: number; end: number; text: string }[]>>;
@@ -95,6 +98,19 @@ interface VideoEditorProps {
   subtitlePresets: Record<string, { label: string, font_size: number, color: string, stroke_width: number, stroke_color: string, bg_color: string }>;
   aspectRatio: string;
   setAspectRatio: (ratio: string) => void;
+  transition: { type: string; duration: number };
+  setTransition: React.Dispatch<React.SetStateAction<{ type: string; duration: number }>>;
+  videoFilter: string;
+  setVideoFilter: (f: string) => void;
+  sceneFilters: Record<number, string>;
+  setSceneFilters: React.Dispatch<React.SetStateAction<Record<number, string>>>;
+  stickers: StickerItem[];
+  setStickers: React.Dispatch<React.SetStateAction<StickerItem[]>>;
+  audioUrl?: string;
+  mediaFit: string;
+  sceneFits: Record<number, string>;
+  setSceneFits: React.Dispatch<React.SetStateAction<Record<number, string>>>;
+  mediaZoom: number;
   // Navigation Props
   showBackButton?: boolean;
   onBack?: () => void;
@@ -120,10 +136,40 @@ interface GeneratedImageItem {
   candidate?: {
     url?: string;
   };
+  source?: string;
 }
 
 export const isVideoSrc = (src: string) =>
   /\.(mp4|webm|mov)(\?|$)/i.test(src);
+
+/** 화면 비율 정규화: 짧은 표기('9:16')와 정식 값('9:16 (Shorts)') 혼용 방지.
+ *  설정 레일은 정식 값, 구 에디터 버튼은 짧은 값을 썼던 게 9:16 미반영의 원인. */
+export const ASPECT_CANONICAL: Record<string, string> = {
+  '16:9': '16:9 (Youtube)',
+  '9:16': '9:16 (Shorts)',
+  '1:1': '1:1 (Square)',
+  '3:4': '3:4 (Portrait)',
+  '16:9 (Youtube)': '16:9 (Youtube)',
+  '9:16 (Shorts)': '9:16 (Shorts)',
+  '1:1 (Square)': '1:1 (Square)',
+  '3:4 (Portrait)': '3:4 (Portrait)',
+};
+
+export const normalizeAspect = (v: string): string =>
+  ASPECT_CANONICAL[v] ?? '16:9 (Youtube)';
+
+export const aspectCss = (v: string): string => {
+  const c = normalizeAspect(v);
+  if (c.startsWith('9:16')) return '9/16';
+  if (c.startsWith('1:1')) return '1/1';
+  if (c.startsWith('3:4')) return '3/4';
+  return '16/9';
+};
+
+export const isPortraitAspect = (v: string): boolean => {
+  const c = normalizeAspect(v);
+  return c.startsWith('9:16') || c.startsWith('3:4');
+};
 
 export const resolveVisualSrc = (
   rawPath: string | undefined,
@@ -209,6 +255,19 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
   subtitlePresets,
   aspectRatio,
   setAspectRatio,
+  transition,
+  setTransition,
+  videoFilter,
+  setVideoFilter,
+  sceneFilters,
+  setSceneFilters,
+  stickers,
+  setStickers,
+  audioUrl,
+  mediaFit,
+  sceneFits,
+  setSceneFits,
+  mediaZoom,
   showBackButton = false,
   onBack,
   backLabel = "Back",
@@ -221,7 +280,8 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<EditorTab>('media');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedItem, setSelectedItem] = useState<{ id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' } | null>(null);
+  const [stickerDraft, setStickerDraft] = useState('');
+  const [selectedItem, setSelectedItem] = useState<{ id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' | 'sticker' } | null>(null);
   const [dragScene, setDragScene] = useState<number | null>(null);
   const dragRef = useRef<{ idx: number; startX: number; startY: number; baseX: number; baseY: number } | null>(null);
   const [showProjectModal, setShowProjectModal] = useState(showInitialProjectModal);
@@ -232,6 +292,25 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
       setShowProjectModal(true);
     }
   }, [showInitialProjectModal]);
+
+  // PropertiesPanel의 이전/다음 자막 이동 버튼용
+  React.useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' | 'sticker' }>).detail;
+      if (detail && detail.id !== undefined && detail.type) {
+        setSelectedItem({ id: detail.id, type: detail.type });
+      }
+    };
+    window.addEventListener('selectTimelineItem', handler as EventListener);
+    return () => window.removeEventListener('selectTimelineItem', handler as EventListener);
+  }, []);
+
+  // 구 짧은 표기로 저장된 비율을 정식으로 정규화 (9:16 미반영 수정)
+  React.useEffect(() => {
+    const canonical = normalizeAspect(aspectRatio);
+    if (canonical !== aspectRatio) setAspectRatio(canonical);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleCloseModal = useCallback(() => {
     setShowProjectModal(false);
@@ -245,9 +324,9 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
 
   // Layout resizing states (percentages)
   const containerRef = useRef<HTMLDivElement>(null);
-  const [leftWidth, setLeftWidth] = useState(25); // initial 25% (1:2:1 ratio)
-  const [rightWidth, setRightWidth] = useState(25); // initial 25% (1:2:1 ratio)
-  const [timelineHeight, setTimelineHeight] = useState(248); // initial 248px
+  const [leftWidth, setLeftWidth] = useState(22); // 좌/우 패널 축소로 미리보기 확대
+  const [rightWidth, setRightWidth] = useState(22);
+  const [timelineHeight, setTimelineHeight] = useState(184); // 기본 타임라인 축소
 
   const startTimelineResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -257,8 +336,8 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
     const onMouseMove = (moveEvent: MouseEvent) => {
       const currentDeltaY = startY - moveEvent.clientY;
       let newHeight = startHeight + currentDeltaY;
-      if (newHeight < 100) newHeight = 100;
-      if (newHeight > 500) newHeight = 500;
+      if (newHeight < 120) newHeight = 120;
+      if (newHeight > 420) newHeight = 420;
       setTimelineHeight(newHeight);
     };
 
@@ -387,12 +466,76 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
       document.removeEventListener('mousemove', handleSubtitleMouseMove);
       document.removeEventListener('mouseup', handleSubtitleMouseUp);
     }
-    
+
     return () => {
       document.removeEventListener('mousemove', handleSubtitleMouseMove);
       document.removeEventListener('mouseup', handleSubtitleMouseUp);
     };
   }, [isDraggingSubtitle, handleSubtitleMouseMove, handleSubtitleMouseUp]);
+
+  // Caption Dragging Logic (상단 자막 밴드: 세로 이동, OpenCut식 직접 드래그)
+  const capDragRef = useRef<{ startY: number; baseY: number; moved: boolean } | null>(null);
+  const handleCaptionPointerDown = useCallback((e: React.PointerEvent, sceneIdx: number) => {
+    e.stopPropagation();
+    setSelectedItem({ id: sceneIdx, type: 'caption' });
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    capDragRef.current = { startY: e.clientY, baseY: captionStyle.y_offset ?? 7, moved: false };
+  }, [captionStyle.y_offset]);
+  const handleCaptionPointerMove = useCallback((e: React.PointerEvent) => {
+    const d = capDragRef.current;
+    if (!d || !videoContainerRef.current) return;
+    const rect = videoContainerRef.current.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    const dyPct = ((e.clientY - d.startY) / rect.height) * 100;
+    if (!d.moved && Math.abs(e.clientY - d.startY) < 3) return;
+    d.moved = true;
+    const ny = Math.max(0, Math.min(40, d.baseY + dyPct));
+    setCaptionStyle((prev) => ({ ...prev, y_offset: Math.round(ny * 10) / 10 }));
+  }, [setCaptionStyle]);
+  const handleCaptionPointerUp = useCallback(() => {
+    capDragRef.current = null;
+  }, []);
+
+  // Scene corner-resize Logic (OpenCut식 코너 핸들 확대/축소)
+  const resizeRef = useRef<{ startDist: number; baseScale: number } | null>(null);
+  const handleCornerPointerDown = useCallback((e: React.PointerEvent, idx: number) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setSelectedItem({ id: idx, type: 'scene' });
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    if (!videoContainerRef.current) return;
+    const rect = videoContainerRef.current.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const startDist = Math.max(1, Math.hypot(e.clientX - cx, e.clientY - cy));
+    const baseScale = sceneLayouts[idx]?.scale ?? 1;
+    resizeRef.current = { startDist, baseScale };
+  }, [sceneLayouts]);
+  const handleCornerPointerMove = useCallback((e: React.PointerEvent, idx: number) => {
+    const r = resizeRef.current;
+    if (!r || !videoContainerRef.current) return;
+    const rect = videoContainerRef.current.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dist = Math.max(1, Math.hypot(e.clientX - cx, e.clientY - cy));
+    const ns = Math.min(3, Math.max(1, r.baseScale * (dist / r.startDist)));
+    setSceneLayouts((prev) => ({
+      ...prev,
+      [idx]: { scale: Math.round(ns * 100) / 100, x: prev[idx]?.x ?? 0, y: prev[idx]?.y ?? 0 },
+    }));
+  }, [setSceneLayouts]);
+  const handleCornerPointerUp = useCallback(() => {
+    resizeRef.current = null;
+  }, []);
+
+  // Esc로 선택 해제
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSelectedItem(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // force show editor UI if isStandalone is true, even if menu doesn't match perfectly
   // This helps when the parent might be slightly out of sync but wants to show this component.
@@ -411,11 +554,17 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
     console.error('Failed to parse projects list', e);
   }
 
-  const handleDeleteItem = useCallback((id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm' | 'caption') => {
+  const handleDeleteItem = useCallback((id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm' | 'caption' | 'sticker') => {
     const targetType = type || selectedItem?.type;
     const targetId = id !== undefined ? id : selectedItem?.id;
 
     if (!targetType || targetId === undefined) return;
+
+    if (targetType === 'sticker') {
+      setStickers((prev) => prev.filter((s) => s.id !== String(targetId)));
+      setSelectedItem(null);
+      return;
+    }
 
     if (targetType === 'caption' && content) {
       const sceneIdx = typeof targetId === 'number' ? targetId : parseInt(String(targetId));
@@ -497,11 +646,57 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
       setAudioEdit((prev) => ({ ...prev, bgm_path: null }));
     }
     setSelectedItem(null);
-  }, [selectedItem, srtData, content, selectedVisuals, visualCandidates, setSrtData, setEditingSrtId, setContent, setSelectedVisuals, setVisualCandidates, setSceneDurations, setAudioEdit]);
+  }, [selectedItem, srtData, content, selectedVisuals, visualCandidates, setSrtData, setEditingSrtId, setContent, setSelectedVisuals, setVisualCandidates, setSceneDurations, setAudioEdit, setStickers]);
+
+  // Sticker Dragging Logic (세로 이동)
+  const stickerDragRef = useRef<{ startY: number; baseY: number } | null>(null);
+  const handleStickerPointerDown = useCallback((e: React.PointerEvent, id: string) => {
+    e.stopPropagation();
+    setSelectedItem({ id, type: 'sticker' });
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    const cur = stickers.find((s) => s.id === id);
+    stickerDragRef.current = { startY: e.clientY, baseY: cur?.y ?? 50 };
+  }, [stickers]);
+  const handleStickerPointerMove = useCallback((e: React.PointerEvent, id: string) => {
+    const d = stickerDragRef.current;
+    if (!d || !videoContainerRef.current) return;
+    const rect = videoContainerRef.current.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    const ny = Math.max(2, Math.min(98, d.baseY + ((e.clientY - d.startY) / rect.height) * 100));
+    setStickers((prev) => prev.map((s) => (s.id === id ? { ...s, y: Math.round(ny * 10) / 10 } : s)));
+  }, [setStickers]);
+  const handleStickerPointerUp = useCallback(() => {
+    stickerDragRef.current = null;
+  }, []);
+
+  // 현재 재생 위치의 장면 인덱스 (스티커 추가용)
+  const currentSceneIdx = (() => {
+    if (!content?.scenes) return 0;
+    const idx = (content.scenes || []).findIndex((_, sIdx) => {
+      const r = getTimelineRange(content?.script, sIdx);
+      return currentTime >= parseFloat(r.start) && currentTime <= parseFloat(r.end);
+    });
+    return idx === -1 ? 0 : idx;
+  })();
+
+  const addSticker = useCallback((text: string) => {
+    const t = text.trim().slice(0, 20);
+    if (!t || !content?.scenes) return;
+    const r = getTimelineRange(content?.script, currentSceneIdx);
+    const s = parseFloat(r.start);
+    const e = parseFloat(r.end);
+    const id = `stk-${Date.now()}`;
+    setStickers((prev) => [...prev, {
+      id, text: t, scene: currentSceneIdx,
+      start: Math.round(s * 10) / 10, end: Math.round(e * 10) / 10,
+      y: 50, size: 36, color: '#FFFFFF',
+    }]);
+    setSelectedItem({ id, type: 'sticker' });
+  }, [content, currentSceneIdx, getTimelineRange, setStickers]);
 
   const allGeneratedImages = useMemo(() => {
     if (!content?.scenes) return [];
-    return content.scenes.flatMap((scene, sceneIdx) => {
+    const items = content.scenes.flatMap((scene, sceneIdx) => {
       const aiImages = scene.ai_images;
       if (!Array.isArray(aiImages)) return [];
       return aiImages
@@ -522,10 +717,32 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
         .filter((img): img is GeneratedImageItem => img !== null);
     }
     );
-  }, [content]);
+    // Step4에서 고른 검색/그래프 후보도 라이브러리에 합류 (씬 장면 풀과 중복 제외)
+    try {
+      const seen = new Set(items.map((i) => i.path).filter(Boolean));
+      (['ai', 'search', 'graph'] as const).forEach((kind) => {
+        Object.entries(visualCandidates || {}).forEach(([sIdx, cands]) => {
+          const list = ((cands as unknown) as Record<string, Array<{ path?: string; url?: string }>>)[kind] || [];
+          list.forEach((c) => {
+            const key = (c && (c.path || c.url)) || '';
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            items.push({
+              path: key,
+              sceneIdx: Number(sIdx) || 0,
+              candidate: { url: c.url || key },
+              source: kind,
+            });
+          });
+        });
+      });
+    } catch { /* 후보 합류 실패해도 장면 풀은 표시 */ }
+    return items;
+  }, [content, visualCandidates]);
 
   return (
     <div className="flex-1 w-full flex flex-col min-h-0 min-w-0 bg-white text-zinc-800 font-sans">
+      <style>{customStyles}</style>
       {/* Project Selection Modal */}
       {showProjectModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm animate-in fade-in duration-300">
@@ -624,8 +841,8 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
         </div>
       )}
 
-      {/* Top Header Bar - OpenCut 스타일 라이트 모드 */}
-            <div className="h-12 bg-white border-b border-zinc-200 flex flex-wrap items-center justify-between px-4 shrink-0 z-50 shadow-sm min-w-0 gap-y-2 py-1">
+      {/* Top Header Bar - OpenCut 스타일 라이트 모드 (Step5 공간 확보용 슬림) */}
+            <div className="h-10 bg-white border-b border-zinc-200 flex flex-wrap items-center justify-between px-4 shrink-0 z-50 shadow-sm min-w-0 gap-y-1">
         <div className="flex items-center gap-8 min-w-0">
           <div className="flex items-center gap-3 pr-8 border-r border-zinc-200 shrink-0">
             <div className="w-8 h-8 bg-gradient-to-br from-blue-600 to-indigo-700 rounded-xl flex items-center justify-center shadow-md shadow-blue-500/20 ring-1 ring-white/10">
@@ -660,24 +877,21 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
 
         <div className="flex items-center gap-3 sm:gap-4 ml-auto">
           <div className="flex items-center gap-1 bg-blue-100 p-1 rounded-xl border border-blue-200 scale-90 sm:scale-100">
-            <button 
-              className={`px-3 py-1.5 rounded-lg text-[10px] font-black transition-all ${aspectRatio === '16:9' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-zinc-500 hover:text-zinc-700 hover:bg-blue-100'}`}
-              onClick={() => setAspectRatio('16:9')}
-            >
-              16:9
-            </button>
-            <button 
-              className={`px-3 py-1.5 rounded-lg text-[10px] font-black transition-all ${aspectRatio === '9:16' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-zinc-500 hover:text-zinc-700 hover:bg-blue-100'}`}
-              onClick={() => setAspectRatio('9:16')}
-            >
-              9:16
-            </button>
-            <button 
-              className={`px-3 py-1.5 rounded-lg text-[10px] font-black transition-all ${aspectRatio === '1:1' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-zinc-500 hover:text-zinc-700 hover:bg-blue-100'}`}
-              onClick={() => setAspectRatio('1:1')}
-            >
-              1:1
-            </button>
+            {[
+              { short: '16:9', full: '16:9 (Youtube)' },
+              { short: '9:16', full: '9:16 (Shorts)' },
+              { short: '1:1', full: '1:1 (Square)' },
+              { short: '3:4', full: '3:4 (Portrait)' },
+            ].map((o) => (
+              <button
+                key={o.full}
+                className={`px-3 py-1.5 rounded-lg text-[10px] font-black transition-all ${normalizeAspect(aspectRatio) === o.full ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-zinc-500 hover:text-zinc-700 hover:bg-blue-100'}`}
+                onClick={() => setAspectRatio(o.full)}
+                title={o.full}
+              >
+                {o.short}
+              </button>
+            ))}
           </div>
           
           <button 
@@ -898,14 +1112,48 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                                 }
                               }
                               return (
-                                <div 
-                                  key={idx} 
+                                <div
+                                  key={idx}
                                   draggable
                                   onDragStart={(e) => {
                                     e.dataTransfer.setData('application/json', JSON.stringify({ type: 'media', path: img.path }));
                                   }}
                                   className="group relative aspect-video bg-zinc-100 rounded-lg overflow-hidden border border-zinc-300 hover:border-blue-500 transition-all cursor-grab active:cursor-grabbing shadow-sm"
-                                  onClick={() => setSelectedItem({ id: img.sceneIdx, type: 'scene' })}
+                                  title="클릭: 현재 장면에 배치/해제 · 드래그: 타임라인에 배치"
+                                  onClick={() => {
+                                    // 클릭 = 현재 장면(선택된 씬 or 재생 위치 씬)에 배치/해제
+                                    const target = selectedItem?.type === 'scene' && typeof selectedItem.id === 'number'
+                                      ? selectedItem.id
+                                      : currentSceneIdx;
+                                    const key = img.path;
+                                    if (!key) return;
+                                    setSelectedVisuals((prev) => {
+                                      const cur = prev[target] || [];
+                                      if (cur.includes(key)) {
+                                        return { ...prev, [target]: cur.filter((u) => u !== key) };
+                                      }
+                                      if (cur.length >= 3) {
+                                        alert('한 장면당 최대 3개까지 배치할 수 있습니다.');
+                                        return prev;
+                                      }
+                                      // 클립당 최소 노출 가드 (이미지 2.5초 / 영상 1.5초)
+                                      try {
+                                        const r = getTimelineRange(content?.script, target);
+                                        const dur = parseFloat(r.duration) || 0;
+                                        const urls = [...cur, key];
+                                        const minSec = urls.some((u) => isVideoSrc(u)) ? 1.5 : 2.5;
+                                        if (dur > 0 && dur / urls.length < minSec) {
+                                          const ok = window.confirm(
+                                            `씬 길이(${dur.toFixed(1)}초)에 배치하면 클립당 ${(dur / urls.length).toFixed(1)}초로 짧아집니다.\n` +
+                                            `화면만 빠르게 전환하는 B-roll 연출로 사용하시겠습니까?`
+                                          );
+                                          if (!ok) return prev;
+                                        }
+                                      } catch { /* 시간 계산 실패해도 배치 허용 */ }
+                                      return { ...prev, [target]: [...cur, key] };
+                                    });
+                                    setSelectedItem({ id: target, type: 'scene' });
+                                  }}
                                 >
                                   <img src={src} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" alt="Asset" />
                                   <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
@@ -914,6 +1162,22 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                                   <div className="absolute bottom-1 right-1 px-1.5 py-0.5 bg-black/60 backdrop-blur-md rounded text-[8px] font-black text-white border border-white/10">
                                     S{img.sceneIdx + 1}
                                   </div>
+                                  {(() => {
+                                    const placed = Object.entries(selectedVisuals || {})
+                                      .filter(([, urls]) => (urls as string[]).includes(img.path))
+                                      .map(([s]) => Number(s) + 1);
+                                    if (placed.length === 0) return null;
+                                    return (
+                                      <div className="absolute top-1 left-1 px-1.5 py-0.5 bg-indigo-600 rounded text-[8px] font-black text-white shadow">
+                                        ✓ S{placed.join(',S')}
+                                      </div>
+                                    );
+                                  })()}
+                                  {img.source && img.source !== 'ai' && (
+                                    <div className="absolute top-1 right-1 px-1.5 py-0.5 bg-black/60 backdrop-blur-md rounded text-[8px] font-black text-amber-300 border border-white/10">
+                                      {img.source === 'search' ? '검색' : img.source === 'graph' ? '그래프' : img.source}
+                                    </div>
+                                  )}
                                 </div>
                               );
                             })}
@@ -1014,13 +1278,162 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                     </div>
                   )}
 
-                  {activeTab === 'transitions' && (
-                    <div className="space-y-6">
-                      <div className="py-12 flex flex-col items-center justify-center bg-zinc-50 rounded-2xl border border-dashed border-zinc-200">
-                        <Layout size={24} className="text-zinc-300 mb-2" />
-                        <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-widest">Transitions</span>
-                        <p className="text-[8px] text-zinc-400 font-bold mt-1 text-center px-4">Visual transitions between scenes.</p>
+                  {activeTab === 'stickers' && (
+                    <div className="space-y-4">
+                      <h4 className="text-[9px] font-black text-zinc-600 uppercase tracking-widest px-1">
+                        스티커 (짧은 텍스트·이모지, 렌더에 반영)
+                      </h4>
+                      <div className="flex gap-1.5">
+                        <input
+                          type="text"
+                          value={stickerDraft}
+                          onChange={(e) => setStickerDraft(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') { addSticker(stickerDraft); setStickerDraft(''); } }}
+                          placeholder="예: 👍 최고!"
+                          maxLength={20}
+                          title="스티커 내용"
+                          className="flex-1 min-w-0 bg-white border border-zinc-200 rounded-xl px-3 py-2 text-xs font-bold text-zinc-700 outline-none focus:border-indigo-500"
+                        />
+                        <button
+                          onClick={() => { addSticker(stickerDraft); setStickerDraft(''); }}
+                          disabled={!stickerDraft.trim()}
+                          title="현재 장면에 스티커 추가"
+                          className="px-3 py-2 bg-indigo-600 text-white rounded-xl text-[11px] font-black hover:bg-indigo-700 disabled:bg-zinc-200 transition-all shrink-0"
+                        >
+                          추가
+                        </button>
                       </div>
+                      <p className="text-[9px] text-zinc-400 font-bold px-1">현재 재생 위치의 장면 구간에 추가됩니다.</p>
+                      <div className="space-y-1.5">
+                        {stickers.length === 0 && (
+                          <p className="text-[10px] text-zinc-400 font-bold text-center py-4">스티커가 없습니다</p>
+                        )}
+                        {stickers.map((stk) => {
+                          const active = selectedItem?.type === 'sticker' && selectedItem.id === stk.id;
+                          return (
+                            <button
+                              key={stk.id}
+                              onClick={() => setSelectedItem({ id: stk.id, type: 'sticker' })}
+                              className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-xl border text-left transition-all ${
+                                active ? 'bg-indigo-50 border-indigo-500' : 'bg-white border-zinc-200 hover:border-zinc-300'
+                              }`}
+                            >
+                              <span className="text-sm font-black text-zinc-800 truncate flex-1">{stk.text}</span>
+                              <span className="text-[9px] font-bold text-zinc-400 shrink-0">S{stk.scene + 1}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {activeTab === 'transitions' && (
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <h4 className="text-[9px] font-black text-zinc-600 uppercase tracking-widest px-1">
+                          장면 전환 (렌더에 반영)
+                        </h4>
+                        <div className="grid grid-cols-2 gap-2">
+                          {[
+                            { id: 'none', label: '자르기' },
+                            { id: 'crossfade', label: '크로스페이드' },
+                          ].map((o) => (
+                            <button
+                              key={o.id}
+                              onClick={() => setTransition((prev) => ({ ...prev, type: o.id }))}
+                              className={`py-2 text-[10px] font-black rounded-xl border transition-all ${
+                                transition.type === o.id
+                                  ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                                  : 'bg-white border-zinc-200 text-zinc-600 hover:border-zinc-300'
+                              }`}
+                            >
+                              {o.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {transition.type === 'crossfade' && (
+                        <div className="space-y-2">
+                          <label className="text-[9px] font-black text-zinc-500 uppercase tracking-widest flex justify-between">
+                            전환 길이
+                            <span className="text-indigo-500">{transition.duration.toFixed(1)}초</span>
+                          </label>
+                          <input
+                            title="전환 길이"
+                            type="range"
+                            min="0.2"
+                            max="1"
+                            step="0.1"
+                            value={transition.duration}
+                            onChange={(e) => setTransition((prev) => ({ ...prev, duration: parseFloat(e.target.value) }))}
+                            className="w-full h-1.5 bg-zinc-200 rounded-full appearance-none cursor-pointer accent-indigo-600"
+                          />
+                          <p className="text-[9px] text-zinc-400 font-bold leading-relaxed">장면 길이는 그대로 유지되고 겹치는 구간만 블렌딩됩니다. 자막·음성 타이밍은 어긋나지 않습니다.</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {activeTab === 'filters' && (
+                    <div className="space-y-4">
+                      <h4 className="text-[9px] font-black text-zinc-600 uppercase tracking-widest px-1">
+                        전체 컬러 필터 (렌더에 반영)
+                      </h4>
+                      <div className="grid grid-cols-2 gap-2">
+                        {[
+                          { id: 'none', label: '없음' },
+                          { id: 'bw', label: '흑백' },
+                          { id: 'vivid', label: '선명하게' },
+                          { id: 'bright', label: '밝게' },
+                          { id: 'cinematic', label: '시네마틱' },
+                        ].map((o) => (
+                          <button
+                            key={o.id}
+                            onClick={() => setVideoFilter(o.id)}
+                            className={`py-2 text-[10px] font-black rounded-xl border transition-all ${
+                              videoFilter === o.id
+                                ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                                : 'bg-white border-zinc-200 text-zinc-600 hover:border-zinc-300'
+                            }`}
+                          >
+                            {o.label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-[9px] text-zinc-400 font-bold leading-relaxed px-1">배경 영상에만 적용되고 자막에는 영향이 없습니다.</p>
+                    </div>
+                  )}
+
+                  {activeTab === 'effects' && (
+                    <div className="space-y-4">
+                      <h4 className="text-[9px] font-black text-zinc-600 uppercase tracking-widest px-1">
+                        자막 등장 효과 (렌더에 반영)
+                      </h4>
+                      <div className="grid grid-cols-3 gap-2">
+                        {[
+                          { id: 'none', label: '없음' },
+                          { id: 'fade', label: '페이드인' },
+                          { id: 'slide', label: '슬라이드업' },
+                          { id: 'typing', label: '타이핑' },
+                          { id: 'pulse', label: '펄스' },
+                        ].map((o) => {
+                          const cur = (subtitleStyle as { animation?: string }).animation ?? 'none';
+                          return (
+                            <button
+                              key={o.id}
+                              onClick={() => setSubtitleStyle((prev) => ({ ...prev, animation: o.id }))}
+                              className={`py-2 text-[10px] font-black rounded-xl border transition-all ${
+                                cur === o.id
+                                  ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                                  : 'bg-white border-zinc-200 text-zinc-600 hover:border-zinc-300'
+                              }`}
+                            >
+                              {o.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[9px] text-zinc-400 font-bold leading-relaxed px-1">미리보기에서도 같은 효과로 표시됩니다. 상단 자막은 속성 패널에서 설정합니다.</p>
                     </div>
                   )}
                 </div>
@@ -1044,18 +1457,18 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                 </div>
               </div>
 
-              <div 
-                className="flex-1 flex flex-col items-center justify-center p-3 relative min-h-0 min-w-0 overflow-hidden"
+              <div
+                className="flex-1 flex flex-col items-center justify-center p-2 relative min-h-0 min-w-0 overflow-hidden"
                 onClick={() => setSelectedItem(null)} // Click outside to deselect
               >
                   <div 
                     ref={videoContainerRef}
                     className="relative shadow-[0_0_30px_rgba(0,0,0,0.1)] transition-all duration-500 border border-zinc-300 shrink-0"
-                    style={{ 
-                      aspectRatio: aspectRatio === '16:9' ? '16/9' : aspectRatio === '9:16' ? '9/16' : '1/1',
+                    style={{
+                      aspectRatio: aspectCss(aspectRatio),
                       maxHeight: '100%',
                       maxWidth: '100%',
-                      width: 'auto',
+                      width: isPortraitAspect(aspectRatio) ? 'auto' : '100%',
                       height: '100%',
                       backgroundColor: '#f8fafc'
                     }}
@@ -1091,6 +1504,11 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                   const layoutModified = Math.abs(layout.scale - 1) > 1e-6 || Math.abs(layout.x) > 1e-6 || Math.abs(layout.y) > 1e-6;
 
                   const isSceneSelected = selectedItem?.type === 'scene' && selectedItem.id === idx;
+                  // 렌더와 동일한 맞춤으로 미리보기 (fit=포함 / fill=너비 채움·넘치면 크롭 / crop=꽉 채움)
+                  // 확대(zoom)는 렌더에서 layout scale에 곱해지므로 미리보기도 동일 적용
+                  const effFit = sceneFits[idx] ?? mediaFit;
+                  const effScale = (layout.scale || 1) * (mediaZoom / 100);
+                  const fitClass = effFit === 'fit' ? 'object-contain' : 'object-cover';
                   return (
                     <div
                       key={idx}
@@ -1098,14 +1516,32 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                       onClick={(e) => { e.stopPropagation(); setSelectedItem({ id: idx, type: 'scene' }); }}
                     >
                       {isSceneSelected && (
-                        <div className="absolute inset-0 z-[80] pointer-events-none ring-2 ring-inset ring-indigo-400" />
+                        <>
+                          <div className="absolute inset-0 z-[80] pointer-events-none ring-2 ring-inset ring-indigo-400" />
+                          {(['tl', 'tr', 'bl', 'br'] as const).map((corner) => (
+                            <div
+                              key={corner}
+                              onPointerDown={(e) => handleCornerPointerDown(e, idx)}
+                              onPointerMove={(e) => handleCornerPointerMove(e, idx)}
+                              onPointerUp={handleCornerPointerUp}
+                              onPointerCancel={handleCornerPointerUp}
+                              title="드래그로 확대/축소"
+                              className={`absolute z-[81] w-3.5 h-3.5 bg-white border-2 border-indigo-500 rounded-full shadow-md touch-none select-none ${
+                                corner === 'tl' ? '-top-1 -left-1 cursor-nwse-resize' :
+                                corner === 'tr' ? '-top-1 -right-1 cursor-nesw-resize' :
+                                corner === 'bl' ? '-bottom-1 -left-1 cursor-nesw-resize' :
+                                '-bottom-1 -right-1 cursor-nwse-resize'
+                              }`}
+                            />
+                          ))}
+                        </>
                       )}
                       {src ? (
                         <>
                           <div
                             className="absolute inset-0 flex items-center justify-center touch-none select-none"
                             style={{
-                              transform: `translate(${layout.x * 100}%, ${layout.y * 100}%) scale(${layout.scale})`,
+                              transform: `translate(${layout.x * 100}%, ${layout.y * 100}%) scale(${effScale})`,
                               cursor: dragScene === idx ? 'grabbing' : 'grab',
                             }}
                             title="드래그로 이동 · 휠로 확대/축소 · 더블클릭 초기화"
@@ -1147,7 +1583,7 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                               <video
                                 key={`${src}#${trimIn}-${trimOut ?? ''}`}
                                 src={src}
-                                className="w-full h-full object-contain pointer-events-none"
+                                className={`w-full h-full ${fitClass} pointer-events-none`}
                                 muted loop playsInline preload="auto" autoPlay
                                 ref={(el) => {
                                   if (!el) return;
@@ -1170,7 +1606,7 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                             ) : (
                               <img
                                 src={src}
-                                className="w-full h-full object-contain pointer-events-none"
+                                className={`w-full h-full ${fitClass} pointer-events-none`}
                                 alt={`Scene ${idx + 1}`}
                                 draggable={false}
                               />
@@ -1208,9 +1644,10 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
               {subtitleStyle.show_subtitles && srtData.map((srt) => {
                 if (currentTime >= srt.start && currentTime <= srt.end) {
                   const isSelected = selectedItem?.type === 'subtitle' && selectedItem.id === srt.id;
+                  const subAnim = ((subtitleStyle as { animation?: string }).animation ?? 'none');
                   return (
-                    <div 
-                      key={srt.id}
+                    <div
+                      key={`${srt.id}-${subAnim}`}
                       className="absolute flex justify-center text-center z-[100] pointer-events-none"
                       style={{ 
                         top: `${subtitleStyle.y_offset ?? 90}%`,
@@ -1222,6 +1659,8 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                     >
                       <div
                         onMouseDown={(e) => handleSubtitleMouseDown(e, srt.id)}
+                        onClick={(e) => { e.stopPropagation(); setSelectedItem({ id: srt.id, type: 'subtitle' }); setEditingSrtId(srt.id); }}
+                        title="자막 (클릭해서 선택)"
                         className={`relative inline-block pointer-events-auto cursor-move ${
                           isSelected ? 'ring-1 ring-white ring-offset-0 border border-white border-dashed bg-black/20' : ''
                         }`}
@@ -1243,11 +1682,12 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                             </div>
                           </>
                         )}
-                        <span 
-                          style={{ 
+                        <span
+                          style={{
                             fontSize: `${subtitleStyle.font_size}px`,
                             color: subtitleStyle.color,
                             fontFamily: subtitleStyle.font,
+                            textAlign: (((subtitleStyle as { text_align?: string }).text_align ?? 'center') as 'left' | 'center' | 'right'),
                             WebkitTextStroke: `${subtitleStyle.stroke_width}px ${subtitleStyle.stroke_color}`,
                             backgroundColor: subtitleStyle.bg_color !== 'transparent' ? subtitleStyle.bg_color : undefined,
                             padding: subtitleStyle.bg_color !== 'transparent' ? '4px 12px' : '0',
@@ -1256,7 +1696,12 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                             fontWeight: 'bold',
                             textShadow: '0 2px 10px rgba(0,0,0,0.5)',
                             display: 'inline-block',
-                            maxWidth: '100%'
+                            maxWidth: '100%',
+                            wordBreak: 'keep-all',
+                            overflowWrap: 'break-word',
+                            animation: subAnim === 'none' ? undefined : `${subAnim === 'slide' ? 'subSlideUp' : subAnim === 'typing' ? 'subTyping' : subAnim === 'pulse' ? 'subPulse' : 'subFadeIn'} 0.35s ease-out`,
+                            ...(subAnim === 'typing' ? { overflow: 'hidden' as const, whiteSpace: 'nowrap' as const } : {}),
+                            ...(subAnim === 'pulse' ? { animation: 'subPulse 0.8s ease-in-out infinite' } : {}),
                           }}
                         >
                           {srt.text}
@@ -1277,17 +1722,21 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                 const capText = sceneIdx !== -1 ? (content?.scenes[sceneIdx]?.subtitle || '').trim() : '';
                 if (!capText) return null;
                 const isCapSelected = selectedItem?.type === 'caption' && selectedItem.id === sceneIdx;
+                const capAnim = ((captionStyle as { animation?: string }).animation ?? 'none');
                 return (
                   <div
-                    key={`scenecap-${sceneIdx}`}
+                    key={`scenecap-${sceneIdx}-${capAnim}`}
                     className="absolute flex justify-center text-center z-[90] pointer-events-none"
                     style={{ top: `${captionStyle.y_offset ?? 7}%`, left: '50%', transform: 'translate(-50%, -50%)', width: 'max-content', maxWidth: '80%' }}
                   >
                     <span
-                      onMouseDown={(e) => { e.stopPropagation(); setSelectedItem({ id: sceneIdx, type: 'caption' }); }}
+                      onPointerDown={(e) => handleCaptionPointerDown(e, sceneIdx)}
+                      onPointerMove={(e) => handleCaptionPointerMove(e)}
+                      onPointerUp={handleCaptionPointerUp}
+                      onPointerCancel={handleCaptionPointerUp}
                       onClick={(e) => { e.stopPropagation(); setSelectedItem({ id: sceneIdx, type: 'caption' }); }}
-                      title="씬 자막 (클릭해서 수정)"
-                      className={`pointer-events-auto cursor-pointer ${isCapSelected ? 'ring-1 ring-amber-300 ring-offset-0 border border-amber-300 border-dashed bg-black/20' : ''}`}
+                      title="씬 자막 (드래그로 상하 이동 · 클릭해서 수정)"
+                      className={`pointer-events-auto cursor-move touch-none select-none ${isCapSelected ? 'ring-1 ring-amber-300 ring-offset-0 border border-amber-300 border-dashed bg-black/20' : ''}`}
                       style={{
                         fontSize: `${captionStyle.font_size}px`,
                         color: captionStyle.color,
@@ -1300,7 +1749,10 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                         fontWeight: 'bold',
                         textShadow: '0 2px 8px rgba(0,0,0,0.6)',
                         display: 'inline-block',
-                        maxWidth: '100%'
+                        maxWidth: '100%',
+                        wordBreak: 'keep-all',
+                        overflowWrap: 'break-word',
+                        animation: capAnim === 'none' ? undefined : `${capAnim === 'slide' ? 'subSlideUp' : capAnim === 'typing' ? 'subTyping' : capAnim === 'pulse' ? 'subPulse' : 'subFadeIn'} 0.3s ease-out`
                       }}
                     >
                       {capText}
@@ -1308,6 +1760,41 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                   </div>
                 );
               })()}
+
+              {/* Sticker Overlays */}
+              {stickers.filter((st) => currentTime >= st.start && currentTime <= st.end).map((st) => {
+                const isStkSelected = selectedItem?.type === 'sticker' && selectedItem.id === st.id;
+                return (
+                  <div
+                    key={st.id}
+                    className="absolute flex justify-center text-center z-[95] pointer-events-none"
+                    style={{ top: `${st.y ?? 50}%`, left: '50%', transform: 'translate(-50%, -50%)', width: 'max-content', maxWidth: '90%' }}
+                  >
+                    <span
+                      onPointerDown={(e) => handleStickerPointerDown(e, st.id)}
+                      onPointerMove={(e) => handleStickerPointerMove(e, st.id)}
+                      onPointerUp={handleStickerPointerUp}
+                      onPointerCancel={handleStickerPointerUp}
+                      onClick={(e) => { e.stopPropagation(); setSelectedItem({ id: st.id, type: 'sticker' }); }}
+                      title="스티커 (드래그로 이동 · 클릭해서 수정)"
+                      className={`pointer-events-auto cursor-move touch-none select-none ${isStkSelected ? 'ring-1 ring-indigo-300 ring-offset-0 border border-indigo-300 border-dashed bg-black/20 rounded-lg' : ''}`}
+                      style={{
+                        fontSize: `${st.size ?? 36}px`,
+                        color: st.color ?? '#FFFFFF',
+                        fontFamily: subtitleStyle.font,
+                        WebkitTextStroke: '1px black',
+                        textShadow: '0 2px 8px rgba(0,0,0,0.6)',
+                        fontWeight: 'bold',
+                        display: 'inline-block',
+                        maxWidth: '100%',
+                        animation: 'subFadeIn 0.3s ease-out',
+                      }}
+                    >
+                      {st.text}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
 
             </div>
@@ -1341,9 +1828,18 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
               </div>
 
               {/* Right: Maximize Button */}
-              <button 
+              <button
+                onClick={() => {
+                  const el = videoContainerRef.current;
+                  if (!el) return;
+                  if (document.fullscreenElement) {
+                    document.exitFullscreen().catch(() => {});
+                  } else if (el.requestFullscreen) {
+                    el.requestFullscreen().catch(() => {});
+                  }
+                }}
                 className="w-8 h-8 hover:bg-zinc-100 rounded-xl transition-all text-zinc-500 hover:text-zinc-800 bg-zinc-50 border border-zinc-200 shadow-sm flex items-center justify-center"
-                title="Fullscreen"
+                title="전체화면으로 미리보기 (다시 누르면 해제)"
               >
                 <Maximize2 size={14} />
               </button>
@@ -1361,7 +1857,7 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                 className="min-w-0 bg-white border border-zinc-200 rounded-xl flex flex-col shrink-0 overflow-hidden shadow-sm z-40"
                 style={{ width: `calc(${rightWidth}% - 8px)` }}
               >
-                <PropertiesPanel 
+                <PropertiesPanel
                   selectedItem={selectedItem}
                   subtitleStyle={subtitleStyle}
                   setSubtitleStyle={setSubtitleStyle}
@@ -1372,11 +1868,21 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
                   audioEdit={audioEdit}
                   setAudioEdit={setAudioEdit}
                   onDelete={handleDeleteItem}
+                  onDeselect={() => setSelectedItem(null)}
                   subtitlePresets={subtitlePresets}
                   srtData={srtData}
                   setSrtData={setSrtData}
                   content={content}
                   setContent={setContent}
+                  sceneLayouts={sceneLayouts}
+                  setSceneLayouts={setSceneLayouts}
+                  sceneFilters={sceneFilters}
+                  setSceneFilters={setSceneFilters}
+                  stickers={stickers}
+                  setStickers={setStickers}
+                  sceneFits={sceneFits}
+                  setSceneFits={setSceneFits}
+                  mediaFitDefault={mediaFit}
                 />
               </div>
             </div>
@@ -1415,6 +1921,7 @@ const VideoEditor: React.FC<VideoEditorProps> = ({
               selectedItem={selectedItem}
               setSelectedItem={setSelectedItem}
               onDelete={handleDeleteItem}
+              audioUrl={audioUrl}
             />
           </div>
         </div>

@@ -168,6 +168,7 @@ class GenerateRequest(BaseModel):
     custom_instructions: Optional[str] = None
     duration: Optional[int] = 60
     template_id: Optional[str] = "news_duo"
+    script_id: Optional[str] = None  # SCRIPT 레이어: 카테고리별 대본 포맷
 
 
 class TTSRequest(BaseModel):
@@ -191,17 +192,22 @@ class VisualCandidateRequest(BaseModel):
     topic: Optional[str] = ""  # 추가: 검색 품질 향상을 위한 주제어
     visual_guide: Optional[str] = ""  # 추가: 검색 품질 향상을 위한 비주얼 가이드
     category: Optional[str] = ""  # 대본 카테고리 (news/recipe/review/knowledge, templates.py와 공유)
+    use_cache: Optional[bool] = True  # 캐시 사용 (기본 true)
+    refresh: Optional[bool] = False  # true면 캐시 무시하고 새로 수집 ("다시 생성"용)
 
 
 class SubtitleStyle(BaseModel):
-    preset: str = "youtube"
+    # 하단 자막 초기값은 상단 자막(CAPTION_PRESETS '기본')과 맞춘다.
+    preset: str = "default"
     font: str = "Noto Sans KR"
     font_size: int = 20
-    color: str = "white"
-    stroke_color: str = "black"
-    stroke_width: float = 2.0
-    bg_color: Optional[str] = None
+    color: str = "#FFD76A"
+    stroke_color: str = "transparent"
+    stroke_width: float = 0
+    bg_color: Optional[str] = "rgba(0,0,0,0.45)"
     position: str = "bottom"
+    text_align: str = "center"
+    animation: str = "none"  # none/fade/slide
     y_offset: int = 85  # % position from top
     x_offset: Optional[int] = 50 # % position from left
     show_subtitles: bool = True  # 자막 표시 여부 추가
@@ -231,6 +237,15 @@ class RenderRequest(BaseModel):
     aspect_ratio: str = "16:9 (Youtube)"  # 화면 비율 추가
     scene_captions: Optional[List[dict]] = None  # [{start, end, text}] 씬별 상단 자막 밴드
     caption_style: Optional[CaptionStyle] = None
+    transition: Optional[dict] = None  # {type: 'none'|'crossfade', duration: 초}
+    video_filter: Optional[str] = "none"  # none/bw/vivid/bright/cinematic
+    scene_filters: Optional[dict] = None  # {sceneIdx: filterName}
+    stickers: Optional[List[dict]] = None  # [{text, start, end, y_pct, size, color, animation}]
+    media_fit: Optional[str] = "fit"  # fit(원본 유지) / fill(너비 채우기) / crop(꽉 채우기)
+    scene_fits: Optional[dict] = None  # {sceneIdx: 'fit'|'fill'|'crop'} 장면별 맞춤 오버라이드
+    bg_style: Optional[str] = "blur"  # blur / black / color
+    bg_color: Optional[str] = None  # bg_style=color 일 때 단색
+    fit_zoom: Optional[float] = 1.0  # 전역 확대 배율 (1.0~2.0)
 
 
 class TTSPreviewRequest(BaseModel):
@@ -239,6 +254,18 @@ class TTSPreviewRequest(BaseModel):
     engine: Optional[str] = None
     rate: Optional[str] = "+0%"
     pitch: Optional[str] = "+0Hz"
+
+
+@app.get("/tts/typecast-actors")
+async def tts_typecast_actors():
+    """설정된 Typecast 키로 사용 가능한 actor 목록 조회 (프론트 목소리 선택용)."""
+    try:
+        from core.tts_engine import list_typecast_actors
+        config = load_config()
+        return {"actors": await list_typecast_actors(config)}
+    except Exception as e:
+        print(f"[Typecast Actors Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/tts/preview")
@@ -343,6 +370,17 @@ async def tts_preview(request: TTSPreviewRequest):
         # 3.4 Azure Base Generation
         if not success and (engine == 'azure' or (not engine and (config.get('use_azure_tts') or config.get('use_cloudflare_tts_proxy')))):
             success = await azure_tts_worker(request.text, request.voice, base_filepath, config, rate="+0%", pitch="+0Hz")
+
+        # 3.4b MiniMax / ElevenLabs / Typecast Base Generation
+        if not success and engine == 'minimax':
+            from core.tts_engine import minimax_tts_worker
+            success = await minimax_tts_worker(request.text, request.voice, base_filepath, config)
+        if not success and engine == 'elevenlabs':
+            from core.tts_engine import elevenlabs_tts_worker
+            success = await elevenlabs_tts_worker(request.text, request.voice, base_filepath, config)
+        if not success and engine == 'typecast':
+            from core.tts_engine import typecast_tts_worker
+            success = await typecast_tts_worker(request.text, request.voice, base_filepath, config)
 
         # 3.5 폴백: Edge TTS로 베이스 생성 (성별 인식 폴백 포함)
         if not success:
@@ -580,6 +618,15 @@ class ShortsCreateRequest(BaseModel):
     new_topic: str
     duration: Optional[int] = 40
     category: Optional[str] = "recipe_short"
+    format_id: Optional[str] = None  # 모듈형 포맷 (short_30/short_60/long_5, recipe 전용)
+    style_id: Optional[str] = None  # 모듈형 스타일 (realistic/jasuisaeng/asmr/cinematic)
+    platform_id: Optional[str] = None  # 메타데이터 규칙 (youtube/instagram/tiktok)
+    script_id: Optional[str] = None  # SCRIPT 레이어: 카테고리별 대본 포맷
+    hook_id: Optional[str] = None  # 훅 오프닝 변형 (question/provoke/empathy/number/twist/random)
+    preset_id: Optional[str] = None  # 이름 붙은 프리셋 (훅+톤+구조+CTA 세트, random 포함)
+    tone_id: Optional[str] = None  # 내레이션 톤 오버라이드
+    structure_id: Optional[str] = None  # 대본 구조 오버라이드
+    cta_id: Optional[str] = None  # 마무리 CTA 오버라이드
 
 
 class RefineClipInfo(BaseModel):
@@ -653,11 +700,66 @@ async def shorts_analyze_url(request: ShortsUrlRequest):
 async def shorts_create(request: ShortsCreateRequest):
     from core.shorts_lab import create_from_pattern
     try:
-        return create_from_pattern(request.reference, request.new_topic, request.duration, request.category or "recipe_short")
+        return create_from_pattern(request.reference, request.new_topic, request.duration, request.category or "recipe_short",
+                                   format_id=request.format_id, style_id=request.style_id, platform_id=request.platform_id,
+                                   script_id=request.script_id, hook_id=request.hook_id,
+                                   preset_id=request.preset_id, tone_id=request.tone_id,
+                                   structure_id=request.structure_id, cta_id=request.cta_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         print(f"[Shorts Create Error] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shorts/script-formats")
+async def shorts_script_formats(category: str = "cooking"):
+    """카테고리별 대본 포맷 목록 (추천 포함) — 제작 설정 대본 포맷 드롭다운용."""
+    from core.script_formats import list_script_formats, recommended_id, GROUP_NAMES
+    try:
+        return {
+            "category": category,
+            "category_name": GROUP_NAMES.get(category, category),
+            "recommended": recommended_id(category),
+            "formats": list_script_formats(category if category in GROUP_NAMES else None),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/shorts/recipe-options")
+async def shorts_recipe_options():
+    """모듈형 레시피 프롬프트 선택지 (포맷/스타일/플랫폼) — 프롬프트 설정 화면용."""
+    from core.recipe_prompts import list_recipe_options
+    try:
+        return list_recipe_options()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shorts/recipe-prompt-preview")
+async def shorts_recipe_prompt_preview(format_id: str = "auto", style_id: str = "realistic",
+                                       platform_id: str = "youtube", hook_id: str = "random",
+                                       duration_sec: int = 60, preset_id: str = "random",
+                                       tone_id: Optional[str] = None,
+                                       cta_id: Optional[str] = None,
+                                       structure_id: Optional[str] = None):
+    """조합된 모듈형 프롬프트 미리보기 (읽기 전용 확인용). format_id=auto면 길이로 자동결정."""
+    from core.recipe_prompts import (compose_recipe_prompt, get_format, get_style,
+                                     get_platform, resolve_format_for_duration)
+    try:
+        fid = (format_id or '').strip() or 'auto'
+        if fid == 'auto':
+            fid = resolve_format_for_duration(duration_sec)
+        fmt, style, plat = get_format(fid), get_style(style_id), get_platform(platform_id)
+        return {
+            "format": {"id": fmt["id"], "name": fmt["name"]},
+            "style": {"id": style["id"], "name": style["name"]},
+            "platform": {"id": plat["id"], "name": plat["name"]},
+            "prompt": compose_recipe_prompt(fmt["id"], style["id"], plat["id"],
+                                            hook_id=hook_id, target_sec=duration_sec,
+                                            preset_id=preset_id, tone_id=tone_id,
+                                            cta_id=cta_id, structure_id=structure_id),
+        }
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -707,10 +809,10 @@ async def upload_asset(file: UploadFile = File(...)):
 
 
 @app.get("/visuals/stock-videos")
-async def get_stock_videos(keyword: str, count: int = 4):
+async def get_stock_videos(keyword: str, count: int = 4, refresh: bool = False):
     from core.visual_engine import search_pexels_videos
     try:
-        videos = search_pexels_videos(keyword, min(max(count, 1), 8))
+        videos = search_pexels_videos(keyword, min(max(count, 1), 8), refresh=refresh)
         return {"videos": videos}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -772,7 +874,8 @@ async def generate(request: GenerateRequest):
             custom_instructions=request.custom_instructions, 
             duration=request.duration,
             progress_callback=progress_callback,
-            template_id=request.template_id
+            template_id=request.template_id,
+            script_id=request.script_id
         )
         # generator.py는 전 모델 실패 시 {"error": "..."} dict를 반환한다 (예외를 던지지 않음).
         # 그대로 200으로 돌려주면 프론트가 빈 화면이 되므로 여기서 상태코드로 변환한다.
@@ -874,6 +977,8 @@ async def get_visual_candidates(request: VisualCandidateRequest):
             topic=request.topic,  # 추가
             visual_guide=request.visual_guide,  # 추가
             category=request.category,  # 카테고리별 비주얼 프리셋
+            use_cache=request.use_cache if request.use_cache is not None else True,
+            refresh=request.refresh or False,
             cancel_check=cancel_check
         )
 
@@ -943,6 +1048,15 @@ async def render_video(request: RenderRequest):
                         aspect_ratio=request.aspect_ratio,
                         scene_captions=request.scene_captions,
                         caption_style=request.caption_style.model_dump() if request.caption_style else None,
+                        transition=request.transition,
+                        video_filter=request.video_filter or "none",
+                        scene_filters=request.scene_filters,
+                        stickers=request.stickers,
+                        media_fit=request.media_fit or "fit",
+                        scene_fits=request.scene_fits,
+                        bg_style=request.bg_style or "blur",
+                        bg_color=request.bg_color,
+                        fit_zoom=request.fit_zoom or 1.0,
                         progress_callback=progress_cb,
                         cancel_check=cancel_check
                     )
@@ -966,6 +1080,72 @@ async def render_video(request: RenderRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def _ensure_port_free(port, host="127.0.0.1"):
+    """포트가 사용 중이면 점유 프로세스를 종료하고 재시도한다.
+
+    안전을 위해 python.exe / you-backend.exe 이미지만 종료한다.
+    그 외 프로세스가 점유 중이면 False 반환 (호출자가 에러로 종료).
+    """
+    import socket as _socket
+    import subprocess as _sp
+    import time as _time
+
+    def _is_open():
+        try:
+            with _socket.create_connection((host, port), timeout=1.0):
+                return True
+        except OSError:
+            return False
+
+    for _ in range(6):
+        if not _is_open():
+            return True
+        # 점유 PID 탐색 (LISTEN 상태)
+        pids = set()
+        try:
+            out = _sp.check_output(["netstat", "-ano"], text=True, stderr=_sp.DEVNULL)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+                    addr = parts[1]
+                    if addr.endswith(f":{port}"):
+                        try:
+                            pids.add(int(parts[4]))
+                        except ValueError:
+                            pass
+        except Exception as e:
+            print(f"[Port] 점유 프로세스 조회 실패: {e}")
+            return False
+        if not pids:
+            _time.sleep(1.0)
+            continue
+        killed_any = False
+        for pid in pids:
+            if pid <= 4:
+                continue
+            try:
+                tl = _sp.check_output(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    text=True, stderr=_sp.DEVNULL,
+                ).strip().strip('"').lower()
+                image = tl.split('","')[0].strip('"') if '","' in tl else tl.split(',')[0]
+            except Exception:
+                continue
+            if image in ("python.exe", "pythonw.exe", "you-backend.exe"):
+                print(f"[Port] {port} 점유 중 ({image}, PID {pid}) → 종료 후 재시작합니다.")
+                try:
+                    _sp.run(["taskkill", "/F", "/PID", str(pid)],
+                            capture_output=True, text=True, timeout=10)
+                    killed_any = True
+                except Exception as e:
+                    print(f"[Port] 종료 실패 (PID {pid}): {e}")
+            else:
+                print(f"[Port] {port}를 다른 프로그램({image or 'unknown'}, PID {pid})이 사용 중이라 자동 종료하지 않습니다.")
+                return False
+        _time.sleep(2.0 if killed_any else 1.0)
+    return not _is_open()
+
+
 if __name__ == "__main__":
     import os as _os
     import sys as _sys
@@ -979,6 +1159,9 @@ if __name__ == "__main__":
         pass
     import uvicorn
     _port = int(_os.environ.get("YOU_BACKEND_PORT", "8000"))
+    if not _ensure_port_free(_port):
+        print(f"❌ 포트 {_port}를 비우지 못했습니다. 점유 프로그램을 직접 종료 후 다시 실행하세요.")
+        raise SystemExit(1)
     print("\n" + "="*50)
     print("🚀 AutoVideoSystem Backend Server Starting...")
     print(f"📡 API Address: http://localhost:{_port}")

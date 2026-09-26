@@ -355,6 +355,189 @@ async def qwen_tts_worker(text, voice, output_path, config):
         return False
 
 
+async def minimax_tts_worker(text, voice, output_path, config):
+    """MiniMax T2A v2를 이용한 TTS 생성. 실패 시 False (폴백 체인)."""
+    api_key = config.get('minimax_api_key')
+    if not api_key:
+        return False
+    try:
+        import httpx
+        model = config.get('minimax_tts_model', 'speech-2.5-hd')
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                'https://api.minimax.io/v1/t2a_v2',
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'model': model,
+                    'text': text,
+                    'stream': False,
+                    'voice_setting': {'voice_id': voice, 'speed': 1.0, 'vol': 1.0, 'pitch': 0},
+                    'audio_setting': {'sample_rate': 32000, 'bitrate': 128000, 'format': 'mp3'},
+                },
+            )
+            if resp.status_code != 200:
+                print(f"MiniMax TTS HTTP Error: {resp.status_code} {(resp.text or '')[:200]}")
+                return False
+            data = resp.json()
+            if not isinstance(data, dict) or (data.get('base_resp') or {}).get('status_code') not in (0, None):
+                # base_resp 없는 구버전 응답도 허용 (data.audio 존재 시)
+                if not isinstance((data or {}).get('data'), dict):
+                    print(f"MiniMax TTS API Error: {str(data)[:200]}")
+                    return False
+            audio_hex = ((data.get('data') or {}).get('audio') or '')
+            if not audio_hex:
+                print("MiniMax TTS Error: empty audio")
+                return False
+            with open(output_path, 'wb') as f:
+                f.write(bytes.fromhex(audio_hex))
+            return True
+    except Exception as e:
+        print(f"MiniMax TTS Error: {e}")
+        return False
+
+
+async def elevenlabs_tts_worker(text, voice, output_path, config):
+    """ElevenLabs를 이용한 TTS 생성. 실패 시 False (폴백 체인)."""
+    api_key = config.get('elevenlabs_api_key')
+    if not api_key:
+        return False
+    try:
+        import httpx
+        model = config.get('elevenlabs_model', 'eleven_multilingual_v2')
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f'https://api.elevenlabs.io/v1/text-to-speech/{voice}',
+                headers={
+                    'xi-api-key': api_key,
+                    'Content-Type': 'application/json',
+                    'Accept': 'audio/mpeg',
+                },
+                json={
+                    'text': text,
+                    'model_id': model,
+                    'voice_settings': {'stability': 0.5, 'similarity_boost': 0.75},
+                },
+            )
+            if resp.status_code != 200:
+                print(f"ElevenLabs TTS HTTP Error: {resp.status_code} {(resp.text or '')[:200]}")
+                return False
+            if not resp.content:
+                print("ElevenLabs TTS Error: empty audio")
+                return False
+            with open(output_path, 'wb') as f:
+                f.write(resp.content)
+            return True
+    except Exception as e:
+        print(f"ElevenLabs TTS Error: {e}")
+        return False
+
+
+async def typecast_tts_worker(text, voice, output_path, config, timeout_sec=120):
+    """Typecast speak+poll+download. 실패 시 False (폴백 체인)."""
+    api_key = config.get('typecast_api_key')
+    if not api_key:
+        return False
+    try:
+        import httpx
+        import asyncio
+        headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                'https://typecast.ai/api/speak',
+                headers=headers,
+                json={
+                    'text': text[:340],
+                    'lang': 'auto',
+                    'actor_id': voice,
+                    'model_version': 'latest',
+                    'xapi_hd': True,
+                    'xapi_audio_format': 'mp3',
+                    'volume': 100,
+                    'speed_x': 1,
+                    'tempo': 1,
+                    'pitch': 0,
+                },
+            )
+            if resp.status_code != 200:
+                print(f"Typecast speak HTTP Error: {resp.status_code} {(resp.text or '')[:200]}")
+                return False
+            body = resp.json() if resp.content else {}
+            result = (body.get('result') or {}) if isinstance(body, dict) else {}
+            status_url = result.get('speak_v2_url') or result.get('speak_url')
+            if not status_url:
+                print(f"Typecast speak Error: no status url in {str(body)[:200]}")
+                return False
+            # 폴링: done까지 대기 후 audio_download_url 다운로드
+            import time as _time
+            deadline = _time.time() + timeout_sec
+            audio_url = None
+            while _time.time() < deadline:
+                st = await client.get(status_url, headers={'Authorization': f'Bearer {api_key}'})
+                if st.status_code != 200:
+                    print(f"Typecast poll HTTP Error: {st.status_code}")
+                    return False
+                sbody = st.json() if st.content else {}
+                sres = (sbody.get('result') or {}) if isinstance(sbody, dict) else {}
+                status = str(sres.get('status') or '').lower()
+                if status == 'done':
+                    audio_url = sres.get('audio_download_url') or sres.get('audio_url')
+                    break
+                if status in ('failed', 'error', 'cancelled'):
+                    print(f"Typecast speak failed with status: {status}")
+                    return False
+                await asyncio.sleep(3)
+            if not audio_url:
+                print("Typecast speak Error: timeout waiting for done")
+                return False
+            dl = await client.get(audio_url)
+            if dl.status_code != 200 or not dl.content:
+                print(f"Typecast download Error: {dl.status_code}")
+                return False
+            with open(output_path, 'wb') as f:
+                f.write(dl.content)
+            return True
+    except Exception as e:
+        print(f"Typecast TTS Error: {e}")
+        return False
+
+
+async def list_typecast_actors(config):
+    """설정된 키로 Typecast actor 목록 조회. 실패 시 빈 리스트."""
+    api_key = (config or {}).get('typecast_api_key')
+    if not api_key:
+        return []
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                'https://typecast.ai/api/actor',
+                headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            )
+            if resp.status_code != 200:
+                print(f"Typecast actors HTTP Error: {resp.status_code}")
+                return []
+            body = resp.json() if resp.content else {}
+            result = body.get('result') if isinstance(body, dict) else None
+            actors = result if isinstance(result, list) else (result.get('actors') if isinstance(result, dict) else [])
+            out = []
+            for a in actors or []:
+                if not isinstance(a, dict):
+                    continue
+                aid = a.get('actor_id')
+                if not aid:
+                    continue
+                name = a.get('name') or {}
+                label = name.get('ko') or name.get('en') or aid
+                out.append({'actor_id': aid, 'label': label})
+            return out
+    except Exception as e:
+        print(f"Typecast actors Error: {e}")
+        return []
+
+
 # --- FFmpeg Auto-configuration for moviepy/pydub ---
 def configure_ffmpeg():
     """moviepy와 pydub이 FFmpeg를 찾을 수 있도록 환경 설정"""
@@ -598,7 +781,19 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
                             if config.get('dashscope_api_key'):
                                 base_success = await qwen_tts_worker(text_to_speak, voice, base_cache_path, config)
 
-                        # 3.1.4 폴백용 Edge TTS Base
+                        # 3.1.4 MiniMax Base
+                        if not base_success and engine == 'minimax':
+                            base_success = await minimax_tts_worker(text_to_speak, voice, base_cache_path, config)
+
+                        # 3.1.5 ElevenLabs Base
+                        if not base_success and engine == 'elevenlabs':
+                            base_success = await elevenlabs_tts_worker(text_to_speak, voice, base_cache_path, config)
+
+                        # 3.1.6 Typecast Base
+                        if not base_success and engine == 'typecast':
+                            base_success = await typecast_tts_worker(text_to_speak, voice, base_cache_path, config)
+
+                        # 3.1.7 폴백용 Edge TTS Base
                         if not base_success:
                             try:
                                 communicate = edge_tts.Communicate(text_to_speak, voice)
@@ -625,7 +820,8 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
                     subprocess.run([ffmpeg_exe, "-y", "-i", temp_segment_path, temp_wav_path], capture_output=True)
 
                     if os.path.exists(temp_wav_path):
-                        segment = AudioSegment.from_wav(temp_wav_path)
+                        with open(temp_wav_path, 'rb') as _wf:
+                            segment = AudioSegment.from_wav(_wf)
                         combined_audio += segment
 
                         # 길이는 ffmpeg -i 로 정확하게 측정 (pydub duration_seconds도 가능하지만 안전하게)
@@ -671,7 +867,8 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
                 os.remove(temp_segment_path)
 
         print(f"DEBUG: TTS segments generation finished. Total duration: {current_time_offset.total_seconds()}s")
-        combined_audio.export(final_audio_path, format="mp3")
+        with open(final_audio_path, 'wb') as _out:
+            combined_audio.export(_out, format="mp3")
         print(f"DEBUG: Exported final audio to {final_audio_path}. Size: {os.path.getsize(final_audio_path)}")
 
         # --- SRT Time Offset Correction ---

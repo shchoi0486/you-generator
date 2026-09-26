@@ -81,7 +81,10 @@ def tavily_search(query, api_key, count=4):
 def ddg_search(query, count=4):
     items = []
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             for r in ddgs.text(query, region="kr-kr", safesearch="moderate", max_results=count):
                 items.append({

@@ -276,6 +276,90 @@ const SettingsManager: React.FC<SettingsManagerProps> = ({
                   <p className="text-[10px] text-gray-400">OpenAI 엔진을 사용할 경우에만 입력이 필요합니다.</p>
                 </div>
               </div>
+
+              {/* MiniMax TTS */}
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <Zap size={16} className="text-indigo-500" />
+                  <span className="text-sm font-bold text-gray-800">MiniMax TTS API</span>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[11px] font-bold text-gray-500">MiniMax API Key</label>
+                  <div className="relative">
+                    <input
+                      type={visibleKeys.minimax_tts ? "text" : "password"}
+                      value={config?.minimax_api_key ?? ''}
+                      onChange={(e) => setConfig(prev => prev ? { ...prev, minimax_api_key: e.target.value } : null)}
+                      placeholder="eyJ..."
+                      className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setVisibleKeys(prev => ({ ...prev, minimax_tts: !prev.minimax_tts }))}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-indigo-600 transition-colors"
+                    >
+                      {visibleKeys.minimax_tts ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-gray-400">MiniMax 엔진을 사용할 경우에만 입력이 필요합니다.</p>
+                </div>
+              </div>
+
+              {/* ElevenLabs TTS */}
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <Zap size={16} className="text-emerald-500" />
+                  <span className="text-sm font-bold text-gray-800">ElevenLabs TTS API</span>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[11px] font-bold text-gray-500">ElevenLabs API Key</label>
+                  <div className="relative">
+                    <input
+                      type={visibleKeys.elevenlabs_tts ? "text" : "password"}
+                      value={config?.elevenlabs_api_key ?? ''}
+                      onChange={(e) => setConfig(prev => prev ? { ...prev, elevenlabs_api_key: e.target.value } : null)}
+                      placeholder="sk_..."
+                      className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setVisibleKeys(prev => ({ ...prev, elevenlabs_tts: !prev.elevenlabs_tts }))}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-indigo-600 transition-colors"
+                    >
+                      {visibleKeys.elevenlabs_tts ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-gray-400">ElevenLabs 엔진을 사용할 경우에만 입력이 필요합니다.</p>
+                </div>
+              </div>
+
+              {/* Typecast TTS */}
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <Zap size={16} className="text-amber-500" />
+                  <span className="text-sm font-bold text-gray-800">Typecast TTS API</span>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[11px] font-bold text-gray-500">Typecast API Key</label>
+                  <div className="relative">
+                    <input
+                      type={visibleKeys.typecast_tts ? "text" : "password"}
+                      value={config?.typecast_api_key ?? ''}
+                      onChange={(e) => setConfig(prev => prev ? { ...prev, typecast_api_key: e.target.value } : null)}
+                      placeholder="Bearer Token..."
+                      className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setVisibleKeys(prev => ({ ...prev, typecast_tts: !prev.typecast_tts }))}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-indigo-600 transition-colors"
+                    >
+                      {visibleKeys.typecast_tts ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-gray-400">Typecast 엔진을 사용할 경우에만 입력이 필요합니다. 키 등록 후 목소리 목록을 불러옵니다.</p>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -641,6 +725,31 @@ const SettingsManager: React.FC<SettingsManagerProps> = ({
                   >
                     <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${((config?.video_settings as Record<string, unknown> | undefined)?.kenburns !== false) ? 'left-6' : 'left-1'}`} />
                   </button>
+                </div>
+
+                <div className="space-y-2 rounded-2xl border border-dashed border-gray-200 bg-gray-50/60 p-4">
+                  <div className="flex items-center gap-2">
+                    <Video size={16} className="text-orange-500" />
+                    <span className="text-sm font-bold text-gray-800">AI 영상 생성 API</span>
+                    <span className="px-1.5 py-0.5 rounded-md text-[9px] font-black bg-amber-50 border border-amber-200 text-amber-600">준비중</span>
+                  </div>
+                  <label className="text-[11px] font-bold text-gray-500">영상 생성 프로바이더 (연동 후 사용)</label>
+                  <select
+                    value={((config?.video_gen as Record<string, unknown> | undefined)?.provider as string) ?? 'fal_ai'}
+                    onChange={(e) => setConfig(prev => {
+                      if (!prev) return null;
+                      const vg = (prev.video_gen as Record<string, unknown>) || {};
+                      return { ...prev, video_gen: { ...vg, provider: e.target.value } };
+                    })}
+                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 outline-none focus:border-orange-500 cursor-pointer"
+                    title="영상 생성 프로바이더"
+                  >
+                    <option value="fal_ai">fal.ai (Veo/Sora/Hailuo 통합) — FAL 키 재사용</option>
+                    <option value="minimax_h3">MiniMax H3 직접 연동</option>
+                    <option value="veo_direct">Google Veo 직접 연동</option>
+                    <option value="sora_direct">OpenAI Sora 직접 연동</option>
+                  </select>
+                  <p className="text-[10px] text-gray-400">키는 위 FAL API Key (또는 MiniMax API Key) 항목에 저장해 두면 연동 시 그대로 사용합니다. 백엔드 영상 파이프라인 연결 전에는 선택만 저장됩니다.</p>
                 </div>
 
                 <div className="space-y-2">

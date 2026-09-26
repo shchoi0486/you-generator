@@ -17,8 +17,8 @@ interface Step3VoiceProps {
   setVoiceMap: React.Dispatch<React.SetStateAction<Record<string, string>>>;
   voiceSettings: Record<string, { rate: string, pitch: string }>;
   setVoiceSettings: React.Dispatch<React.SetStateAction<Record<string, { rate: string, pitch: string }>>>;
-  selectedEngine: 'openai' | 'azure' | 'edge' | 'qwen';
-  setSelectedEngine: (engine: 'openai' | 'azure' | 'edge' | 'qwen') => void;
+  selectedEngine: 'openai' | 'azure' | 'edge' | 'qwen' | 'minimax' | 'elevenlabs' | 'typecast';
+  setSelectedEngine: (engine: 'openai' | 'azure' | 'edge' | 'qwen' | 'minimax' | 'elevenlabs' | 'typecast') => void;
   selectedLanguage: string;
   setSelectedLanguage: (lang: string) => void;
   gapDuration: number;
@@ -36,8 +36,9 @@ interface Step3VoiceProps {
   playVoiceSample: (speaker: string, voice: string, customText?: string) => void;
   getTimelineRange: (data: ScriptItem[] | undefined, currentIdx: number) => { start: string, end: string, duration: string };
   languages: Array<{ label: string, value: string }>;
-  voiceOptions: Record<'openai' | 'azure' | 'edge' | 'qwen', { label: string, value: string, lang?: string }[]>;
+  voiceOptions: Record<'openai' | 'azure' | 'edge' | 'qwen' | 'minimax' | 'elevenlabs' | 'typecast', { label: string, value: string, lang?: string }[]>;
   filteredVoices: { label: string, value: string, lang?: string }[];
+  isStale?: boolean;
 }
 
 const Step3Voice: React.FC<Step3VoiceProps> = ({
@@ -66,8 +67,12 @@ const Step3Voice: React.FC<Step3VoiceProps> = ({
   getTimelineRange,
   languages,
   voiceOptions,
-  filteredVoices
+  filteredVoices,
+  isStale = false
 }) => {
+  // 대본이 바뀌어 음성/자막이 어긋나면 다음 단계 버튼이 재생성을 겸함.
+  // 경고 배너 없이 버튼 하나로 처리 (재생성 후 handleGenerateTTS가 Step4로 이동).
+  const needsGen = !audio?.url || isStale;
   return (
     <div className="flex-1 flex flex-col min-h-0 space-y-3">
       <div className="flex items-center justify-between shrink-0">
@@ -119,18 +124,19 @@ const Step3Voice: React.FC<Step3VoiceProps> = ({
 
           <div className="h-4 w-px bg-gray-200 mx-1"></div>
 
-          <button 
+          <button
             onClick={() => {
-              if (!audio?.url) {
+              if (needsGen) {
                 handleGenerateTTS();
               } else {
                 setCurrentStep(4);
               }
             }}
             disabled={loading}
+            title={needsGen ? '현재 대본으로 음성을 생성하고 다음 단계로 이동' : '다음 단계로 이동'}
             className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-200 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow-md shadow-indigo-100"
           >
-            {audio?.url ? '시각화 단계로 이동' : '음성 생성 및 이동'}
+            {needsGen ? '음성 생성 및 이동' : '시각화 단계로 이동'}
             <ArrowRight size={16} />
           </button>
         </div>
@@ -163,17 +169,20 @@ const Step3Voice: React.FC<Step3VoiceProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-1.5">
+                <div className="grid grid-cols-2 gap-1.5">
                 {[
                   { id: 'edge', label: 'Edge' },
                   { id: 'qwen', label: 'Qwen' },
                   { id: 'openai', label: 'OpenAI' },
-                  { id: 'azure', label: 'Azure' }
+                  { id: 'azure', label: 'Azure' },
+                  { id: 'minimax', label: 'MiniMax' },
+                  { id: 'elevenlabs', label: 'ElevenLabs' },
+                  { id: 'typecast', label: 'Typecast' }
                 ].map((engine) => (
                   <button
                     key={engine.id}
                     onClick={() => {
-                      const newEngine = engine.id as 'openai' | 'azure' | 'edge' | 'qwen';
+                      const newEngine = engine.id as 'openai' | 'azure' | 'edge' | 'qwen' | 'minimax' | 'elevenlabs' | 'typecast';
                       setSelectedEngine(newEngine);
                       
                       const newVoiceMap = { ...voiceMap };
@@ -198,6 +207,17 @@ const Step3Voice: React.FC<Step3VoiceProps> = ({
                           if (speaker.includes('이슈왕') || speaker.toLowerCase().includes('bj')) newVoiceMap[speaker] = "echo";
                           else if (speaker.includes('앵커') || speaker.toLowerCase().includes('anchor')) newVoiceMap[speaker] = "nova";
                           else newVoiceMap[speaker] = "alloy";
+                        } else if (newEngine === 'minimax') {
+                          if (speaker.includes('이슈왕') || speaker.toLowerCase().includes('bj')) newVoiceMap[speaker] = "male-qn-qingse";
+                          else if (speaker.includes('앵커') || speaker.toLowerCase().includes('anchor')) newVoiceMap[speaker] = "female-shaonv";
+                          else newVoiceMap[speaker] = "female-shaonv";
+                        } else if (newEngine === 'elevenlabs') {
+                          if (speaker.includes('이슈왕') || speaker.toLowerCase().includes('bj')) newVoiceMap[speaker] = "pNInz6obpgDQGcFmaJgB";
+                          else if (speaker.includes('앵커') || speaker.toLowerCase().includes('anchor')) newVoiceMap[speaker] = "21m00Tcm4TlvDq8ikWAM";
+                          else newVoiceMap[speaker] = "21m00Tcm4TlvDq8ikWAM";
+                        } else if (newEngine === 'typecast') {
+                          const list = voiceOptions[newEngine as keyof typeof voiceOptions].filter(v => !v.lang || v.lang === selectedLanguage);
+                          newVoiceMap[speaker] = (list.length > 0 ? list[0] : voiceOptions[newEngine as keyof typeof voiceOptions][0])?.value || "";
                         } else {
                           const available = voiceOptions[newEngine as keyof typeof voiceOptions].filter(v => !v.lang || v.lang === selectedLanguage);
                           newVoiceMap[speaker] = (available.length > 0 ? available[0] : voiceOptions[newEngine as keyof typeof voiceOptions][0]).value;
@@ -216,6 +236,11 @@ const Step3Voice: React.FC<Step3VoiceProps> = ({
                   </button>
                 ))}
               </div>
+              {selectedEngine === 'typecast' && filteredVoices.length === 0 && (
+                <p className="text-[10px] text-amber-600 font-bold bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                  설정에서 Typecast API 키를 입력하면 목소리 목록을 불러옵니다.
+                </p>
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto pr-1 custom-scrollbar space-y-2.5 pb-10">
@@ -225,7 +250,7 @@ const Step3Voice: React.FC<Step3VoiceProps> = ({
                   : Object.keys(voiceMap);
                 
                 return speakers.map((speaker: string) => {
-                  const currentVoice = voiceMap[speaker] || (filteredVoices.length > 0 ? filteredVoices[0].value : voiceOptions[selectedEngine][0].value);
+                  const currentVoice = voiceMap[speaker] || filteredVoices[0]?.value || voiceOptions[selectedEngine][0]?.value || '';
                   
                   return (
                     <div key={speaker} className="p-3 bg-gray-50 rounded-xl border border-gray-100 space-y-2.5">
@@ -359,7 +384,7 @@ div                            </div>
               <div className="flex-1 overflow-y-auto p-2 custom-scrollbar space-y-1 min-h-0 bg-gray-50/20 pb-10">
                 {((Array.isArray(content.script) ? content.script : Object.values(content.script)) as ScriptItem[]).map((item: ScriptItem, idx: number) => {
                   const speaker = item.speaker || 'Narrator';
-                  const voiceValue = voiceMap[speaker] || (filteredVoices.length > 0 ? filteredVoices[0].value : voiceOptions[selectedEngine][0].value);
+                  const voiceValue = voiceMap[speaker] || filteredVoices[0]?.value || voiceOptions[selectedEngine][0]?.value || '';
                   const isSegmentPlaying = playingSpeaker === `segment-${item.text.substring(0, 10)}` || playingSegmentIndex === idx;
                   const isSegmentLoading = isPreviewLoading === `segment-${item.text.substring(0, 10)}`;
                   

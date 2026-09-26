@@ -1,10 +1,12 @@
 import React from 'react';
-import { 
-  Video, 
-  Home, 
-  Folder, 
+import {
+  Video,
+  Home,
+  Folder,
   Settings as SettingsIcon,
-  Film
+  Film,
+  Megaphone,
+  Send
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -56,11 +58,23 @@ const Sidebar: React.FC<SidebarProps> = ({ activeMenu, setActiveMenu }) => {
           active={activeMenu === 'Projects'} 
           onClick={() => setActiveMenu('Projects')} 
         />
-        <SidebarItem 
-          icon={Film} 
-          label="Editor" 
-          active={activeMenu === 'Editor'} 
-          onClick={() => setActiveMenu('Editor')} 
+        <SidebarItem
+          icon={Film}
+          label="Editor"
+          active={activeMenu === 'Editor'}
+          onClick={() => setActiveMenu('Editor')}
+        />
+        <SidebarItem
+          icon={Megaphone}
+          label="Marketing"
+          active={activeMenu === 'Marketing'}
+          onClick={() => setActiveMenu('Marketing')}
+        />
+        <SidebarItem
+          icon={Send}
+          label="Posting"
+          active={activeMenu === 'Posting'}
+          onClick={() => setActiveMenu('Posting')}
         />
         <SidebarItem 
           icon={SettingsIcon} 

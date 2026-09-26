@@ -71,10 +71,21 @@ export interface ImageGenConfig {
   [key: string]: unknown;
 }
 
+export interface RecipePromptPreset {
+  format: string;
+  style: string;
+  platform: string;
+  hook?: string;
+}
+
 export interface AppConfig {
   engine?: string;
   language?: string;
   openai_api_key?: string;
+  minimax_api_key?: string;
+  elevenlabs_api_key?: string;
+  typecast_api_key?: string;
+  recipe_prompt_preset?: RecipePromptPreset;
   image_gen?: ImageGenConfig;
   [key: string]: unknown;
 }
@@ -162,6 +173,16 @@ export interface GenerateRequest {
   custom_instructions?: string;
   duration?: number;
   template_id?: string;
+  script_id?: string;
+}
+
+export interface ScriptFormatOption {
+  id: string;
+  name: string;
+  group: string;
+  flow: string;
+  desc: string;
+  recommended: boolean;
 }
 
 export interface TTSRequest {
@@ -171,6 +192,8 @@ export interface TTSRequest {
   };
   output_name?: string;
   engine?: string;
+  rate?: string;
+  pitch?: string;
   gap_duration?: number;
 }
 
@@ -191,6 +214,8 @@ export interface VisualCandidateRequest {
   topic?: string;
   visual_guide?: string;
   category?: string;
+  use_cache?: boolean;
+  refresh?: boolean;
 }
 
 export interface ClipTrim {
@@ -218,6 +243,18 @@ export interface CaptionStyle {
   color: string;
   bg_color?: string;
   y_offset: number;
+  animation?: string;
+}
+
+export interface StickerItem {
+  id: string;
+  text: string;
+  scene: number;
+  start: number;
+  end: number;
+  y: number;
+  size: number;
+  color: string;
 }
 
 export interface RenderRequest {
@@ -233,6 +270,8 @@ export interface RenderRequest {
     stroke_color: string;
     stroke_width: number;
     bg_color?: string;
+    text_align?: string;
+    animation?: string;
     y_offset: number;
     show_subtitles: boolean;
   };
@@ -248,8 +287,18 @@ export interface RenderRequest {
     color: string;
     bg_color?: string;
     y_offset: number;
+    animation?: string;
   };
   aspect_ratio?: string;
+  transition?: { type: string; duration: number };
+  video_filter?: string;
+  scene_filters?: Record<number, string>;
+  stickers?: StickerItem[];
+  media_fit?: string;
+  scene_fits?: Record<number, string>;
+  bg_style?: string;
+  bg_color?: string;
+  fit_zoom?: number;
 }
 
 const handleFetch = async (url: string, options: RequestInit) => {
@@ -324,8 +373,8 @@ export const api = {
     });
   },
 
-  getStockVideos: async (keyword: string, count: number = 4) => {
-    return handleFetch(`${API_BASE_URL}/visuals/stock-videos?keyword=${encodeURIComponent(keyword)}&count=${count}`, {});
+  getStockVideos: async (keyword: string, count: number = 4, refresh: boolean = false) => {
+    return handleFetch(`${API_BASE_URL}/visuals/stock-videos?keyword=${encodeURIComponent(keyword)}&count=${count}&refresh=${refresh ? 'true' : 'false'}`, {});
   },
 
   getPromptTemplate: async (category: string) => {
@@ -350,12 +399,28 @@ export const api = {
     });
   },
 
-  createShorts: async (data: { reference: string; new_topic: string; duration?: number; category?: string }) => {
+  createShorts: async (data: { reference: string; new_topic: string; duration?: number; category?: string; format_id?: string; style_id?: string; platform_id?: string; script_id?: string; hook_id?: string; preset_id?: string; tone_id?: string; structure_id?: string; cta_id?: string }) => {
     return handleFetch(`${API_BASE_URL}/shorts/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
+  },
+
+  getRecipeOptions: async () => {
+    return handleFetch(`${API_BASE_URL}/shorts/recipe-options`, {});
+  },
+
+  getRecipePromptPreview: async (format: string, style: string, platform: string, hook: string = 'random', durationSec: number = 60, preset: string = 'random', tone?: string, structure?: string, cta?: string) => {
+    const q = `format_id=${encodeURIComponent(format)}&style_id=${encodeURIComponent(style)}&platform_id=${encodeURIComponent(platform)}&hook_id=${encodeURIComponent(hook)}&duration_sec=${encodeURIComponent(String(durationSec))}&preset_id=${encodeURIComponent(preset)}`
+      + (tone ? `&tone_id=${encodeURIComponent(tone)}` : '')
+      + (structure ? `&structure_id=${encodeURIComponent(structure)}` : '')
+      + (cta ? `&cta_id=${encodeURIComponent(cta)}` : '');
+    return handleFetch(`${API_BASE_URL}/shorts/recipe-prompt-preview?${q}`, {});
+  },
+
+  getScriptFormats: async (category: string) => {
+    return handleFetch(`${API_BASE_URL}/shorts/script-formats?category=${encodeURIComponent(category)}`, {});
   },
 
   refineScene: async (data: { scene: Record<string, unknown>; clips: RefineClip[]; topic?: string; category?: string }) => {
@@ -404,6 +469,10 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, voice, engine, rate, pitch }),
     });
+  },
+
+  getTypecastActors: async (): Promise<{ actors: Array<{ actor_id: string; label: string }> }> => {
+    return handleFetch(`${API_BASE_URL}/tts/typecast-actors`, {});
   },
 
   // Project Management API

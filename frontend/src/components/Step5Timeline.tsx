@@ -1,5 +1,5 @@
 import React from 'react';
-import { type AppContent, type SceneCandidates, type ScriptItem, type SceneLayout, type CaptionStyle } from '../services/api';
+import { type AppContent, type SceneCandidates, type ScriptItem, type SceneLayout, type CaptionStyle, type StickerItem } from '../services/api';
 import VideoEditor from './VideoEditor';
 
 interface Step5TimelineProps {
@@ -40,6 +40,7 @@ interface Step5TimelineProps {
     stroke_width: number;
     stroke_color: string;
     bg_color: string;
+    text_align?: string;
   };
   setSubtitleStyle: React.Dispatch<React.SetStateAction<{
     preset: string;
@@ -53,6 +54,7 @@ interface Step5TimelineProps {
     stroke_width: number;
     stroke_color: string;
     bg_color: string;
+    text_align?: string;
   }>>;
   srtData: { id: number; start: number; end: number; text: string }[];
   setSrtData: React.Dispatch<React.SetStateAction<{ id: number; start: number; end: number; text: string }[]>>;
@@ -72,6 +74,19 @@ interface Step5TimelineProps {
   subtitlePresets: Record<string, { label: string, font_size: number, color: string, stroke_width: number, stroke_color: string, bg_color: string }>;
   aspectRatio: string;
   setAspectRatio: (ratio: string) => void;
+  transition: { type: string; duration: number };
+  setTransition: React.Dispatch<React.SetStateAction<{ type: string; duration: number }>>;
+  videoFilter: string;
+  setVideoFilter: (f: string) => void;
+  sceneFilters: Record<number, string>;
+  setSceneFilters: React.Dispatch<React.SetStateAction<Record<number, string>>>;
+  stickers: StickerItem[];
+  setStickers: React.Dispatch<React.SetStateAction<StickerItem[]>>;
+  audioUrl?: string;
+  mediaFit: string;
+  sceneFits: Record<number, string>;
+  setSceneFits: React.Dispatch<React.SetStateAction<Record<number, string>>>;
+  mediaZoom: number;
 }
 
 const Step5Timeline: React.FC<Step5TimelineProps> = (props) => {

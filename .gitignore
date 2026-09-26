@@ -41,3 +41,7 @@ npm-debug.log*
 # --- Rust ---
 target/
 # NOTE: Cargo.lock은 앱 재현 빌드를 위해 커밋 유지 (라이브러리라면 무시)
+
+# --- browser automation profiles (20MB+ per run, never commit) ---
+backend/chrome_profile/
+**/chrome_profile/

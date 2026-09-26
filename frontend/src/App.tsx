@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { 
+import {
   AlertCircle,
   CheckCircle2,
   Trash2,
   Download,
-  X
+  X,
+  SlidersHorizontal,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import {
   api,
@@ -17,18 +20,25 @@ import {
   type ShortsReport,
   type ClipRef,
   type SceneLayout,
+  type StickerItem,
   type StockVideo,
   type CaptionStyle,
   API_BASE_URL,
   assetUrl
 } from './services/api';
 import Step1Input from './components/Step1Input';
+import { buildCutInstructions, SUBTITLE_SIZES, scriptGroupOf, RECOMMENDED_SCRIPTS } from './components/VideoPresetPanel';
+import type { ScriptFormatOption } from './components/VideoPresetPanel';
+import VideoPresetPanel from './components/VideoPresetPanel';
 import Step2Review from './components/Step2Review';
 import Step3Voice from './components/Step3Voice';
 import Step4Visual from './components/Step4Visual';
 import Step5Timeline from './components/Step5Timeline';
 import Step6Export from './components/Step6Export';
 import VideoEditor from './components/VideoEditor';
+import HubHome from './components/HubHome';
+import MarketingHub from './components/MarketingHub';
+import PostingHub from './components/PostingHub';
 import LoadingOverlay from './components/LoadingOverlay';
 import ProjectList from './components/ProjectList';
 import SettingsManager from './components/SettingsManager';
@@ -52,28 +62,61 @@ interface SrtItem { id: number; start: number; end: number; text: string; scene?
 /** 한 번에 표시할 자막 최대 글자수 */
 export const SUBTITLE_MAX_CHARS = 16;
 
-/** 긴 자막을 단어 경계에서 쪼갬 (한국어: 공백 우선, 장문 단어는 강제 절단) */
+/** 긴 자막을 어절 경계에서 쪼갬.
+ *  기계적 글자수 절단이 아니라 구(節) 단위로 끊는다:
+ *  - 구두점(,.!?~…) 뒤에서 끊는 것을 우선
+ *  - 조사만 남는 자투리(", 안", "더" 등 2글자 이하 꼬리)는 다음 조각으로 넘김
+ *  - 구두점으로 닫히는 다음 어절이 여유분(+6자) 안에 들어오면 끌어옴
+ *  한국어: 공백 우선, 장문 단어는 강제 절단 */
 const splitSubtitleText = (text: string, maxChars: number): string[] => {
   const t = (text || '').trim().replace(/\s+/g, ' ');
   if (t.length <= maxChars) return [t];
+  const isClauseEnd = (w: string) => /[,.!?~…]+$/.test(w);
+  const isDangling = (w: string) => w.length <= 2 && !/[,.!?~…]+$/.test(w);
+  const hardCut = (w: string): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < w.length; i += maxChars) out.push(w.slice(i, i + maxChars));
+    return out;
+  };
   const words = t.split(' ');
   const chunks: string[] = [];
-  let cur = '';
-  const push = (s: string) => { if (s) chunks.push(s); };
-  for (const w of words) {
-    if ((cur + (cur ? ' ' : '') + w).length <= maxChars) {
-      cur = cur ? `${cur} ${w}` : w;
-    } else {
-      push(cur);
-      cur = '';
-      if (w.length <= maxChars) {
-        cur = w;
-      } else {
-        for (let i = 0; i < w.length; i += maxChars) push(w.slice(i, i + maxChars));
+  let i = 0;
+  let guard = 0;
+  while (i < words.length && guard++ < 1000) {
+    let cur = words[i++];
+    // 탐욕 채우기 (단, 한 어절이 기준을 넘으면 강제 절단)
+    if (cur.length > maxChars) {
+      const cuts = hardCut(cur);
+      chunks.push(...cuts.slice(0, -1));
+      cur = cuts[cuts.length - 1];
+    }
+    while (i < words.length && (cur + ' ' + words[i]).length <= maxChars) {
+      cur += ' ' + words[i++];
+    }
+    // 끌어오기: 다음 어절이 구를 닫으면 여유분 안에서 합침
+    if (i < words.length) {
+      const toks = cur.split(' ');
+      const lastTok = toks[toks.length - 1];
+      if (!isClauseEnd(lastTok) && isClauseEnd(words[i]) && (cur + ' ' + words[i]).length <= maxChars + 6) {
+        cur += ' ' + words[i++];
       }
     }
+    // 밀어내기: ", 안" 같은 자투리 꼬리는 다음 조각으로
+    const toks = cur.split(' ');
+    if (i < words.length && toks.length > 1) {
+      const last = toks[toks.length - 1];
+      if (last.endsWith(',') || isDangling(last)) {
+        i -= 1;
+        cur = toks.slice(0, -1).join(' ');
+      }
+    }
+    if (cur) {
+      chunks.push(cur);
+    } else {
+      // 빈 조각 방지: 다음 어절 강제 전진 (무한루프 가드)
+      chunks.push(words[i++]);
+    }
   }
-  push(cur);
   return chunks.filter(Boolean);
 };
 
@@ -152,8 +195,16 @@ function App() {
   const [projectId, setProjectId] = useState<string>(() => {
     return localStorage.getItem('video-creator-current-project-id') || `project-${Date.now()}`;
   });
+  // 로컬 복원 완료 전 저장 이펙트 차단용 (빈 상태로 덮어쓰기 방지)
+  const loadedRef = React.useRef(false);
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [activeMenu, setActiveMenu] = useState('Home');
+  // Home 허브: 'hubs' = 3개 허브 선택 화면, 'auto' = 기존 Step 1~6 자동화 영상 흐름
+  const [homeHub, setHomeHub] = useState<'hubs' | 'auto'>('hubs');
+  // Step1 내부 단계 (pick: 카테고리 선택 / input: 입력+설정) — 레일은 input에서만 표시
+  const [step1Phase, setStep1Phase] = useState<'pick' | 'input'>('pick');
+  // 제작 설정 레일 접기/펼치기 (접으면 위에 펼치기 버튼만)
+  const [presetRailOpen, setPresetRailOpen] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -180,7 +231,7 @@ function App() {
   const [shortsHint, setShortsHint] = useState('');
   const [shortsReport, setShortsReport] = useState<ShortsReport | null>(null);
   const [shortsTopic, setShortsTopic] = useState('');
-  const [shortsDuration, setShortsDuration] = useState(40);
+  const [shortsReference, setShortsReference] = useState('');
   const [shortsCategory, setShortsCategory] = useState('recipe_short');
   const [inputType, setInputType] = useState<'url' | 'text'>('url');
   const [article, setArticle] = useState<Article | null>(null);
@@ -238,9 +289,17 @@ function App() {
   const [playingSpeaker, setPlayingSpeaker] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const mainAudioRef = useRef<HTMLAudioElement | null>(null);
-  const [selectedEngine, setSelectedEngine] = useState<'openai' | 'azure' | 'edge' | 'qwen'>('edge');
+  const [selectedEngine, setSelectedEngine] = useState<'openai' | 'azure' | 'edge' | 'qwen' | 'minimax' | 'elevenlabs' | 'typecast'>('edge');
+  // Typecast actor 목록 (설정된 키로 동적 로드)
+  const [typecastActors, setTypecastActors] = useState<Array<{ label: string; value: string; lang?: string }>>([]);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('ko');
   const [selectedAiModel, setSelectedAiModel] = useState<string>('pollinations');
+  const [videoModel, setVideoModel] = useState<string>(() => {
+    try { return localStorage.getItem('preset-video-model') || ''; } catch { return ''; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('preset-video-model', videoModel); } catch { /* 무시 */ }
+  }, [videoModel]);
   const selectedAiModelRef = useRef(selectedAiModel);
 
   useEffect(() => {
@@ -255,6 +314,8 @@ function App() {
   const [isGeneratingAll, setIsGeneratingAll] = useState(false);
   const stopGenerationRef = useRef<boolean>(false);
   const [generationProgress, setGenerationProgress] = useState({ current: 0, total: 0 });
+  // 진행 중인 수집 작업 종류 (버튼별 진행률 표시용: ai/search/stock/all/null)
+  const [activeTask, setActiveTask] = useState<'ai' | 'search' | 'stock' | 'all' | null>(null);
   const [activeSceneIndex, setActiveSceneIndex] = useState(0);
   const [editingSceneIndex, setEditingSceneIndex] = useState<number | null>(null);
   const [editSceneValues, setEditSceneValues] = useState({ keyword: '', description: '' });
@@ -263,15 +324,31 @@ function App() {
   const [isFetchingUsage, setIsFetchingUsage] = useState(false);
 
   // --- 편집기 관련 상태 ---
-  const [subtitleStyle, setSubtitleStyle] = useState({
-    preset: 'youtube',
+  const [subtitleStyle, setSubtitleStyle] = useState<{
+    preset: string;
+    font: string;
+    font_size: number;
+    color: string;
+    stroke_color: string;
+    stroke_width: number;
+    bg_color: string;
+    position: string;
+    text_align?: string;
+    animation?: string;
+    y_offset: number;
+    x_offset: number;
+    show_subtitles: boolean;
+  }>({
+    preset: 'default',
     font: 'Noto Sans KR',
     font_size: 20,
-    color: 'white',
-    stroke_color: 'black',
-    stroke_width: 2.0,
-    bg_color: 'transparent',
+    color: '#FFD76A',
+    stroke_color: 'transparent',
+    stroke_width: 0,
+    bg_color: 'rgba(0,0,0,0.45)',
     position: 'bottom',
+    text_align: 'center',
+    animation: 'none',
     y_offset: 85,
     x_offset: 50,
     show_subtitles: true // 자막 표시 여부
@@ -282,10 +359,84 @@ function App() {
     font_size: 13,
     color: '#FFD76A',
     bg_color: 'rgba(0,0,0,0.45)',
-    y_offset: 7
+    y_offset: 12,
+    animation: 'none'
   });
 
+  // 출력 효과: 장면 전환 + 전체 컬러 필터 (OpenCut식, 렌더에 반영)
+  const [transition, setTransition] = useState<{ type: string; duration: number }>({ type: 'none', duration: 0.5 });
+  const [videoFilter, setVideoFilter] = useState<string>('none');
+  // 미디어 맞춤 + 배경 (전역 기본값) / 장면별 맞춤 오버라이드
+  const [mediaFit, setMediaFit] = useState<'fit' | 'fill' | 'crop'>('fit');
+  const [bgStyle, setBgStyle] = useState<'blur' | 'black' | 'color'>('blur');
+  const [bgColor, setBgColor] = useState<string>('#000000');
+  const [sceneFits, setSceneFits] = useState<Record<number, string>>({});
+  const [zoomPct, setZoomPct] = useState<number>(100);
+  // 장면별 개별 필터 + 스티커 오버레이
+  const [sceneFilters, setSceneFilters] = useState<Record<number, string>>({});
+  const [stickers, setStickers] = useState<StickerItem[]>([]);
+
   const [aspectRatio, setAspectRatio] = useState<string>("16:9 (Youtube)"); // 화면 비율 추가
+  // 제작 전 설정 (VideoPresetPanel): 영상마다 제작 직전에 미리 정하는 프리셋
+  const [cutSpeed, setCutSpeed] = useState<'fast' | 'slow'>('fast');
+  const [scriptId, setScriptId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('preset-script-id') || 'news_briefing';
+    } catch { return 'news_briefing'; }
+  });
+  const [scriptOptions, setScriptOptions] = useState<ScriptFormatOption[]>([]);
+  // 카테고리별 대본 포맷 목록 로드 + 카테고리 변경 시 ★ 추천으로 자동 리셋
+  const fetchScriptOptions = React.useCallback(async (tplId: string, keepCurrent: boolean) => {
+    const group = scriptGroupOf(tplId);
+    try {
+      const r = await api.getScriptFormats(group);
+      const list = (r?.formats || []) as ScriptFormatOption[];
+      if (list.length > 0) {
+        setScriptOptions(list);
+        const rec = (r?.recommended as string) || RECOMMENDED_SCRIPTS[group];
+        setScriptId((prev) => (keepCurrent && list.some((f) => f.id === prev) ? prev : rec));
+        return;
+      }
+    } catch { /* 폴백 */ }
+    const rec = RECOMMENDED_SCRIPTS[group];
+    setScriptOptions([{ id: rec, name: '추천 포맷', group, flow: '', desc: '', recommended: true }]);
+    if (!keepCurrent) setScriptId(rec);
+  }, []);
+  useEffect(() => {
+    fetchScriptOptions(templateId, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem('preset-script-id', scriptId); } catch { /* 무시 */ }
+  }, [scriptId]);
+  const [voiceRate, setVoiceRate] = useState<string>('+0%');
+  const [subtitleSize, setSubtitleSize] = useState<'small' | 'medium' | 'large'>('medium');
+  // 모듈형 레시피 프롬프트 프리셋 (포맷/스타일/플랫폼/훅) — 전역 설정, 로컬+백엔드 config에 저장
+  const [recipePreset, setRecipePreset] = useState<{ format: string; style: string; platform: string; hook?: string; preset?: string; tone?: string; structure?: string; cta?: string }>(() => {
+    try {
+      const raw = localStorage.getItem('recipe-prompt-preset');
+      if (raw) {
+        const p = JSON.parse(raw);
+        // 영상 구조 선택 UI 제거 — 항상 자동
+        return {
+          format: 'auto',
+          style: typeof p.style === 'string' ? p.style : 'realistic',
+          platform: typeof p.platform === 'string' ? p.platform : 'youtube',
+          hook: typeof p.hook === 'string' ? p.hook : 'random',
+          preset: typeof p.preset === 'string' ? p.preset : 'random',
+          tone: typeof p.tone === 'string' ? p.tone : '',
+          structure: typeof p.structure === 'string' ? p.structure : '',
+          cta: typeof p.cta === 'string' ? p.cta : '',
+        };
+      }
+    } catch { /* 기본값 사용 */ }
+    return { format: 'auto', style: 'realistic', platform: 'youtube', hook: 'random', preset: 'random', tone: '', structure: '', cta: '' };
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem('recipe-prompt-preset', JSON.stringify(recipePreset));
+    } catch { /* 무시 */ }
+  }, [recipePreset]);
   const [audioEdit, setAudioEdit] = useState<{
     bgm_path: string | null;
     bgm_volume: number;
@@ -313,7 +464,9 @@ function App() {
 
 
   const openEditorMenu = React.useCallback(() => {
-    setShouldShowEditorPicker(true);
+    // 사이드바 Editor 클릭 시 팝업 없이 마지막 작업 화면으로 바로 이동.
+    // 프로젝트 변경은 에디터 헤더의 '프로젝트 선택' 버튼에서.
+    setShouldShowEditorPicker(false);
     setActiveMenu('Editor');
   }, []);
 
@@ -566,8 +719,21 @@ function App() {
         if (parsed.selectedLanguage) setSelectedLanguage(parsed.selectedLanguage);
         if (parsed.voiceSettings) setVoiceSettings(parsed.voiceSettings);
         if (parsed.gapDuration) setGapDuration(parsed.gapDuration);
+        if (parsed.cutSpeed) setCutSpeed(parsed.cutSpeed);
+        if (parsed.scriptId) setScriptId(parsed.scriptId);
+        if (parsed.voiceRate) setVoiceRate(parsed.voiceRate);
+        if (parsed.subtitleSize) setSubtitleSize(parsed.subtitleSize);
         if (parsed.srtData) setSrtData(parsed.srtData);
         if (parsed.captionStyle) setCaptionStyle((prev) => ({ ...prev, ...parsed.captionStyle }));
+        if (parsed.transition) setTransition(parsed.transition);
+        if (parsed.videoFilter) setVideoFilter(parsed.videoFilter);
+        if (parsed.mediaFit) setMediaFit(parsed.mediaFit);
+        if (parsed.zoomPct) setZoomPct(parsed.zoomPct);
+        if (parsed.bgStyle) setBgStyle(parsed.bgStyle);
+        if (parsed.bgColor) setBgColor(parsed.bgColor);
+        if (parsed.sceneFits) setSceneFits(parsed.sceneFits);
+        if (parsed.sceneFilters) setSceneFilters(parsed.sceneFilters);
+        if (parsed.stickers) setStickers(parsed.stickers);
       } catch (e) {
         console.error('Failed to load project from localStorage', e);
       }
@@ -580,10 +746,12 @@ function App() {
         window.location.reload();
       }
     }
+    loadedRef.current = true;
   }, [projectId]);
 
-  // Persistence: Save to LocalStorage
+  // Persistence: Save to LocalStorage (로드 완료 전에는 저장 금지 — 복원 데이터 덮어쓰기 방지)
   useEffect(() => {
+    if (!loadedRef.current) return;
     const projectData = {
       projectId,
       currentStep,
@@ -603,14 +771,31 @@ function App() {
       selectedLanguage,
       voiceSettings,
       gapDuration,
+      cutSpeed,
+      scriptId,
+      voiceRate,
+      subtitleSize,
       srtData,
       captionStyle,
+      transition,
+      videoFilter,
+      sceneFilters,
+      stickers,
+      mediaFit,
+      bgStyle,
+      bgColor,
+      sceneFits,
+      zoomPct,
       lastModified: new Date().toISOString()
     };
     
-    // Save project data
-    localStorage.setItem(`video-creator-project-${projectId}`, JSON.stringify(projectData));
-    localStorage.setItem('video-creator-current-project-id', projectId);
+    // Save project data (모바일 웹뷰 quota 초과 대비 — 실패해도 백엔드 저장은 별도 유지)
+    try {
+      localStorage.setItem(`video-creator-project-${projectId}`, JSON.stringify(projectData));
+      localStorage.setItem('video-creator-current-project-id', projectId);
+    } catch (e) {
+      console.error('Failed to save project to localStorage (quota?):', e);
+    }
 
     // Update projects list
     const projectsListStr = localStorage.getItem('video-creator-projects-list') || '[]';
@@ -637,8 +822,20 @@ function App() {
     projectId, currentStep, activeMenu, url, directText, projectName, duration, 
     inputType, article, content, audio, visualCandidates, 
     selectedVisuals, clipTrims, sceneLayouts, showSceneCaptions, extraMedia, voiceMap, selectedEngine, selectedLanguage, 
-    voiceSettings, gapDuration, srtData, captionStyle
+    voiceSettings, gapDuration, cutSpeed, scriptId, voiceRate, subtitleSize, srtData, captionStyle,
+    transition, videoFilter, sceneFilters, stickers, mediaFit, bgStyle, bgColor, sceneFits
   ]);
+
+  // 새 대본이 오면 이전 주제의 시각 상태를 버린다 (같은 프로젝트에서 주제 변경 시
+  // 옛날 후보/선택이 남아 bulk 수집 skip + 옛날 썸네일이 보이는 문제 방지).
+  // 프로젝트 불러오기/타임라인 편집에서는 호출하지 않는다.
+  const resetVisualState = React.useCallback(() => {
+    setVisualCandidates({});
+    setSelectedVisuals({});
+    setExtraMedia({});
+    setClipTrims({});
+    setSceneLayouts({});
+  }, []);
 
   const handleNewProject = React.useCallback((skipConfirm = false) => {
     if (skipConfirm || window.confirm('새 프로젝트를 시작하시겠습니까?')) {
@@ -650,6 +847,7 @@ function App() {
       setProjectName('새 프로젝트');
       setDuration(60);
       setInputType('url');
+      setStep1Phase('pick');
       setArticle(null);
       setContent(null);
       setAudio(null);
@@ -667,22 +865,38 @@ function App() {
         font_size: 13,
         color: '#FFD76A',
         bg_color: 'rgba(0,0,0,0.45)',
-        y_offset: 7
+        y_offset: 12,
+        animation: 'none'
       });
       setSubtitleStyle({
-        preset: 'youtube',
+        preset: 'default',
         font: 'Noto Sans KR',
         font_size: 70,
-        color: 'white',
-        stroke_color: 'black',
-        stroke_width: 2.0,
-        bg_color: 'transparent',
+        color: '#FFD76A',
+        stroke_color: 'transparent',
+        stroke_width: 0,
+        bg_color: 'rgba(0,0,0,0.45)',
         position: 'bottom',
+        text_align: 'center',
+        animation: 'none',
         y_offset: 85,
         x_offset: 50,
         show_subtitles: true
       });
       setAspectRatio("16:9 (Youtube)");
+      setCutSpeed('fast');
+      setScriptId(RECOMMENDED_SCRIPTS[scriptGroupOf(templateId)]);
+      setVoiceRate('+0%');
+      setSubtitleSize('medium');
+      setTransition({ type: 'none', duration: 0.5 });
+      setVideoFilter('none');
+      setMediaFit('fit');
+      setZoomPct(100);
+      setBgStyle('blur');
+      setBgColor('#000000');
+      setSceneFits({});
+      setSceneFilters({});
+      setStickers([]);
       setAudioEdit({
         bgm_path: null,
         bgm_volume: 0.2,
@@ -690,7 +904,7 @@ function App() {
       });
       setSrtData([]); setSrtScriptSig(null);
       setAudioScriptSig(null);
-      setShortsReport(null); setShortsTopic(''); setShortsYtUrl('');
+      setShortsReport(null); setShortsTopic(''); setShortsYtUrl(''); setShortsReference('');
       setSceneDurations([]);
       setEditingSrtId(null);
       setIsPlaying(false);
@@ -735,8 +949,21 @@ function App() {
         if (mergedData.selectedLanguage) setSelectedLanguage(mergedData.selectedLanguage);
         if (mergedData.voiceSettings) setVoiceSettings(mergedData.voiceSettings);
         if (mergedData.gapDuration !== undefined) setGapDuration(mergedData.gapDuration);
+        if (mergedData.cutSpeed) setCutSpeed(mergedData.cutSpeed);
+        if (mergedData.scriptId) setScriptId(mergedData.scriptId);
+        if (mergedData.voiceRate) setVoiceRate(mergedData.voiceRate);
+        if (mergedData.subtitleSize) setSubtitleSize(mergedData.subtitleSize);
         if (mergedData.subtitleStyle) setSubtitleStyle(mergedData.subtitleStyle);
         if (mergedData.captionStyle) setCaptionStyle((prev) => ({ ...prev, ...mergedData.captionStyle }));
+        if (mergedData.transition) setTransition(mergedData.transition);
+        if (mergedData.videoFilter) setVideoFilter(mergedData.videoFilter);
+        if (mergedData.mediaFit) setMediaFit(mergedData.mediaFit);
+        if (mergedData.zoomPct) setZoomPct(mergedData.zoomPct);
+        if (mergedData.bgStyle) setBgStyle(mergedData.bgStyle);
+        if (mergedData.bgColor) setBgColor(mergedData.bgColor);
+        if (mergedData.sceneFits) setSceneFits(mergedData.sceneFits);
+        if (mergedData.sceneFilters) setSceneFilters(mergedData.sceneFilters);
+        if (mergedData.stickers) setStickers(mergedData.stickers);
         if (mergedData.aspectRatio) setAspectRatio(mergedData.aspectRatio);
         if (mergedData.audioEdit) setAudioEdit(mergedData.audioEdit);
         if (mergedData.srtData) {
@@ -828,7 +1055,10 @@ function App() {
       selectedLanguage,
       voiceSettings,
       gapDuration,
-      subtitleStyle,
+          cutSpeed,
+          scriptId,
+          voiceRate,
+          subtitleStyle,
       aspectRatio,
       audioEdit,
       srtData,
@@ -873,13 +1103,26 @@ function App() {
           selectedEngine,
           selectedLanguage,
           voiceSettings,
-          gapDuration,
+      gapDuration,
+          cutSpeed,
+          scriptId,
+          voiceRate,
+          subtitleSize,
           subtitleStyle,
           captionStyle,
           aspectRatio,
           audioEdit,
           srtData,
           sceneDurations,
+          transition,
+          videoFilter,
+          sceneFilters,
+          stickers,
+          mediaFit,
+          bgStyle,
+          bgColor,
+          sceneFits,
+          zoomPct,
           lastModified: new Date().toISOString()
         }
       });
@@ -902,8 +1145,8 @@ function App() {
     projectId, currentStep, activeMenu, url, directText, projectName, 
     duration, inputType, article, content, audio, visualCandidates, 
     selectedVisuals, voiceMap, selectedEngine, selectedLanguage, 
-    voiceSettings, gapDuration, subtitleStyle, captionStyle, aspectRatio, audioEdit, 
-    srtData, sceneDurations
+    voiceSettings, gapDuration, cutSpeed, scriptId, voiceRate, subtitleSize, subtitleStyle, captionStyle, aspectRatio, audioEdit,
+    srtData, sceneDurations, transition, videoFilter, sceneFilters, stickers, mediaFit, bgStyle, bgColor, sceneFits, zoomPct
   ]);
 
   const updatePlayAllState = (val: boolean) => {
@@ -915,11 +1158,27 @@ function App() {
 
 
 
+  const effectiveVoiceOptions = useMemo(() => ({
+    ...voiceOptions,
+    typecast: typecastActors.length > 0 ? typecastActors : voiceOptions.typecast,
+  }), [typecastActors]);
+
+  useEffect(() => {
+    if (selectedEngine !== 'typecast' || typecastActors.length > 0) return;
+    api.getTypecastActors()
+      .then((d) => {
+        const list = ((d as { actors?: Array<{ actor_id: string; label: string }> })?.actors || [])
+          .map((a) => ({ label: `${a.label} (Typecast)`, value: a.actor_id, lang: 'ko' }));
+        if (list.length > 0) setTypecastActors(list);
+      })
+      .catch(() => {});
+  }, [selectedEngine, typecastActors.length]);
+
   const filteredVoices = useMemo(() => {
-    return voiceOptions[selectedEngine].filter(v => 
+    return effectiveVoiceOptions[selectedEngine].filter(v =>
       !v.lang || v.lang === selectedLanguage
     );
-  }, [selectedEngine, selectedLanguage, voiceOptions]);
+  }, [selectedEngine, selectedLanguage, effectiveVoiceOptions]);
 
   useEffect(() => {
     if (content?.script) {
@@ -931,7 +1190,7 @@ function App() {
       const newVoiceMap = { ...voiceMap };
       let changed = false;
 
-      const availableVoicesValues = voiceOptions[selectedEngine].map(v => v.value);
+      const availableVoicesValues = effectiveVoiceOptions[selectedEngine].map(v => v.value);
 
       speakers.forEach(speaker => {
         const currentVoice = newVoiceMap[speaker];
@@ -951,6 +1210,17 @@ function App() {
             if (speaker.includes('이슈왕') || speaker.toLowerCase().includes('bj') || speaker.includes('진우')) newVoiceMap[speaker] = "ko-KR-JinwooNeural";
             else if (speaker.includes('앵커') || speaker.toLowerCase().includes('anchor')) newVoiceMap[speaker] = "ko-KR-HyejinNeural";
             else newVoiceMap[speaker] = "ko-KR-SunHiNeural";
+          } else if (selectedEngine === 'minimax') {
+            if (speaker.includes('이슈왕') || speaker.toLowerCase().includes('bj')) newVoiceMap[speaker] = "male-qn-qingse";
+            else if (speaker.includes('앵커') || speaker.toLowerCase().includes('anchor')) newVoiceMap[speaker] = "female-shaonv";
+            else newVoiceMap[speaker] = "female-shaonv";
+          } else if (selectedEngine === 'elevenlabs') {
+            if (speaker.includes('이슈왕') || speaker.toLowerCase().includes('bj')) newVoiceMap[speaker] = "pNInz6obpgDQGcFmaJgB";
+            else if (speaker.includes('앵커') || speaker.toLowerCase().includes('anchor')) newVoiceMap[speaker] = "21m00Tcm4TlvDq8ikWAM";
+            else newVoiceMap[speaker] = "21m00Tcm4TlvDq8ikWAM";
+          } else if (selectedEngine === 'typecast') {
+            // actor 목록은 키 등록 후 로드되므로 첫 항목으로 두고 사용자가 직접 선택
+            newVoiceMap[speaker] = availableVoicesValues[0] || "";
           } else {
             newVoiceMap[speaker] = availableVoicesValues[0] || "";
           }
@@ -1211,6 +1481,7 @@ function App() {
       // '전체 생성' 중이었다면 해당 플래그도 해제
       if (isGeneratingAll) {
         setIsGeneratingAll(false);
+        setActiveTask(null);
         stopGenerationRef.current = true;
       }
     } catch (err: unknown) {
@@ -1265,7 +1536,9 @@ function App() {
       const result = await api.generateContent({ 
         article_text: article.full_text as string,
         duration: duration,
-        template_id: templateId
+        template_id: templateId,
+            custom_instructions: buildCutInstructions(cutSpeed),
+            script_id: scriptId,
       });
       // 구 백엔드 호환: {"error": "..."} 형태로 올 수도 있다
       if (!result || (result as { error?: string }).error) {
@@ -1276,6 +1549,7 @@ function App() {
         return;
       }
       setContent(result);
+      resetVisualState();
       // Stay in Step 2 for Review
       setCurrentStep(2);
     } catch (err: unknown) {
@@ -1290,7 +1564,7 @@ function App() {
   };
 
   // 숏폼 바로 만들기 (분석 스킵, 카테고리 기본 패턴 + 웹 근거)
-  const handleShortsDirectCreate = async (topic: string, dur: number, category: string) => {
+  const handleShortsDirectCreate = async (topic: string, dur: number, category: string, reference: string = '') => {
     if (!topic.trim()) return;
     setLoading(true);
     setError(null);
@@ -1299,15 +1573,27 @@ function App() {
     setProgress({ step: 'generate', status: 'starting', progress: 10, message: 'AI 대본 생성을 요청하고 있습니다...' });
     try {
       const result = await api.createShorts({
-        reference: '',
+        reference: reference || '',
         new_topic: topic.trim(),
         duration: dur,
         category,
+        script_id: scriptId,
+        ...(category === 'recipe_short' ? {
+          ...(recipePreset.format && recipePreset.format !== 'auto' ? { format_id: recipePreset.format } : {}),
+          style_id: recipePreset.style,
+          platform_id: recipePreset.platform,
+          hook_id: recipePreset.hook || 'random',
+          preset_id: recipePreset.preset || 'random',
+          ...(recipePreset.tone ? { tone_id: recipePreset.tone } : {}),
+          ...(recipePreset.structure ? { structure_id: recipePreset.structure } : {}),
+          ...(recipePreset.cta ? { cta_id: recipePreset.cta } : {}),
+        } : {}),
       });
       const contentTyped = result as AppContent;
       const title = contentTyped.title || topic.trim().slice(0, 50);
-      setArticle({ title, full_text: title });
+      setArticle({ title, full_text: reference ? `${title}\n\n[원본 레시피]\n${reference.slice(0, 2000)}` : title });
       setContent(contentTyped);
+      resetVisualState();
       setCurrentStep(2);
     } catch (err: unknown) {
       setError((err as Error).message || '대본 생성 중 오류가 발생했습니다.');
@@ -1348,7 +1634,7 @@ function App() {
   const handleGenerateTTSRef = useRef<(() => Promise<void>) | null>(null);
 
   // Step4Visual의 스톡 검색을 전체 생성 루프에서 호출하기 위한 ref
-  const stockFetchRef = useRef<((idx: number, silent?: boolean) => Promise<void>) | null>(null);
+  const stockFetchRef = useRef<((idx: number, silent?: boolean, force?: boolean) => Promise<void>) | null>(null);
 
   // 다듬기 결과 적용: 해당 씬 대본/자막 교체 + srtData 구간 교체 + 음성 무효화
   const onRefineApply = (idx: number, r: {
@@ -1385,6 +1671,20 @@ function App() {
     setAudioScriptSig(null);
   };
   
+  /** 단계 이동 게이트: 앞 단계는 바로, 뒷 단계는 준비물이 있어야 이동한다.
+   *  스텝퍼 클릭과 '이전' 버튼이 같은 규칙을 쓴다. */
+  const goToStep = (stepId: number) => {
+    if (loading) return;
+    if (stepId === 2 && !article && !content) return;
+    if (stepId === 3 && !content) return;
+    if (stepId === 4 && !audio?.url) {
+      handleGenerateTTS();
+      return;
+    }
+    if (stepId === 5 && Object.keys(selectedVisuals).length === 0) return;
+    setCurrentStep(stepId);
+  };
+
   const handleGenerateTTS = async () => {
     if (!content?.script || content.script.length === 0) return;
     setLoading(true);
@@ -1401,6 +1701,7 @@ function App() {
         script: content.script as { text: string; speaker: string; }[],
         voice_map: voiceData,
         engine: selectedEngine,
+        rate: voiceRate,
         gap_duration: gapDuration,
         output_name: `audio_${Date.now()}`
       });
@@ -1432,7 +1733,7 @@ function App() {
     handleGenerateTTSRef.current = handleGenerateTTS;
   });
 
-  const fetchCandidates = React.useCallback(async (index: number, type: 'all' | 'ai' | 'search' = 'all', forcedModel?: string, isAppend: boolean = false, customKeyword?: string) => {
+  const fetchCandidates = React.useCallback(async (index: number, type: 'all' | 'ai' | 'search' = 'all', forcedModel?: string, isAppend: boolean = false, customKeyword?: string, refresh: boolean = false) => {
     if (!content?.scenes || !content.scenes[index]) return;
     
     // 개별 타입별 로딩 상태 관리를 위해 키 생성
@@ -1477,18 +1778,21 @@ function App() {
         });
       }
 
-      const data = await api.getVisualCandidates({ 
+      const data = await api.getVisualCandidates({
         scene: {
           keyword: (scene as { keyword?: string }).keyword || '',
           description: scene.description,
           keywords: searchKeywords
-        }, 
+        },
         index,
         project_id: projectId,
         // 추가 생성 시에는 1개씩만 요청
         ai_count: (type === 'all' || type === 'ai') ? (isAppend ? 1 : 1) : 0,
         search_count: (type === 'all' || type === 'search') ? (isAppend ? 1 : 5) : 0,
         ai_model: currentModel,
+        use_cache: !refresh,
+        // 추가 생성(isAppend)은 새 결과가 필요하므로 캐시를 우회 (키워드 변주와 무관하게)
+        refresh: refresh || isAppend,
         // 백엔드 검색어 오염 방지: 프로젝트명이 기본값이면 기사 제목 사용, 둘 다 없으면 빈 문자열
         topic: (projectName && projectName !== '새 프로젝트') ? projectName : (article?.title || ''),
         visual_guide: (scene as { keyword?: string }).keyword || scene.description,
@@ -1557,6 +1861,7 @@ function App() {
     if (!content?.scenes) return;
     const sceneCount = content.scenes.length;
     setIsGeneratingAll(true);
+    setActiveTask('all');
     stopGenerationRef.current = false;
     setGenerationProgress({ current: 0, total: sceneCount });
     
@@ -1596,16 +1901,19 @@ function App() {
         console.error(`Stock fetch failed for scene ${i}:`, e);
       }
     }
-    
+
     setIsGeneratingAll(false);
+    setActiveTask(null);
     setGenerationProgress({ current: 0, total: 0 });
   }, [content?.scenes, fetchCandidates, visualCandidates]);
 
   // 소스별 전체 수집: AI / 웹검색 이미지 / 스톡 비디오를 각각 전 장면에 실행
-  const fetchAllByType = React.useCallback(async (type: 'ai' | 'search' | 'stock') => {
+  // 헤더 버튼은 항상 강제 재생성 (씬별 ⟳는 단일 장면용). 캐시 우회 + 새로고침.
+  const fetchAllByType = React.useCallback(async (type: 'ai' | 'search' | 'stock', force: boolean = false) => {
     if (!content?.scenes) return;
     const sceneCount = content.scenes.length;
     setIsGeneratingAll(true);
+    setActiveTask(type);
     stopGenerationRef.current = false;
     setGenerationProgress({ current: 0, total: sceneCount });
 
@@ -1614,13 +1922,13 @@ function App() {
       setGenerationProgress(prev => ({ ...prev, current: i + 1 }));
       try {
         if (type === 'ai') {
-          if (visualCandidates[i]?.ai && visualCandidates[i].ai.length > 0) continue;
-          await fetchCandidates(i, 'ai', selectedAiModelRef.current);
+          if (!force && visualCandidates[i]?.ai && visualCandidates[i].ai.length > 0) continue;
+          await fetchCandidates(i, 'ai', selectedAiModelRef.current, false, undefined, force);
         } else if (type === 'search') {
-          if (visualCandidates[i]?.search && visualCandidates[i].search.length > 0) continue;
-          await fetchCandidates(i, 'search');
+          if (!force && visualCandidates[i]?.search && visualCandidates[i].search.length > 0) continue;
+          await fetchCandidates(i, 'search', undefined, false, undefined, force);
         } else {
-          await stockFetchRef.current?.(i, true);
+          await stockFetchRef.current?.(i, true, force);
         }
       } catch (e) {
         console.error(`Bulk ${type} fetch failed for scene ${i}:`, e);
@@ -1629,12 +1937,14 @@ function App() {
     }
 
     setIsGeneratingAll(false);
+    setActiveTask(null);
     setGenerationProgress({ current: 0, total: 0 });
   }, [content?.scenes, fetchCandidates, visualCandidates]);
 
   const stopGeneration = () => {
     stopGenerationRef.current = true;
     setIsGeneratingAll(false);
+    setActiveTask(null);
   };
 
   const handleMoveToEdit = async () => {
@@ -1688,17 +1998,282 @@ function App() {
     }
   }, [content, srtData.length, getTimelineRange]);
 
-  const handleFinalRender = async () => {
-    if (!audio || !selectedVisuals || !content?.scenes) return;
+  type RenderOverrides = {
+    audio?: { url?: string; srtUrl?: string; audio_path?: string; srt_path?: string; [key: string]: unknown } | null;
+    visuals?: Record<number, string[]>;
+    content?: AppContent | null;
+    srt?: SrtItem[];
+    ranges?: Array<{ start: number; end: number; duration: number }>;
+  };
+
+  // 원클릭 자동 제작: Step1 입력 → 대본 → TTS → 비주얼 수집·선택 → 렌더까지 자동 연결.
+  // 수동 모드의 "자동 선택 금지"와 별개로, 이 모드를 명시적으로 누른 경우에만 첫 후보를 자동 선택한다.
+  const handleAutoMake = async (source: 'news' | 'shorts') => {
+    setLoading(true);
+    setError(null);
+    try {
+      // ---- 1. 대본 ----
+      setProgress({ step: 'generate', status: 'starting', progress: 5, message: '자동 제작: 대본을 생성하고 있습니다...' });
+      let contentData: AppContent | null = content;
+      let articleData = article;
+      let isNewContent = false;
+      if (!contentData) {
+        isNewContent = true;
+        if (source === 'news') {
+          if (inputType === 'text') {
+            if (!directText.trim()) throw new Error('대본 본문을 입력해주세요.');
+            articleData = { title: directText.split('\n')[0].substring(0, 50) + '...', full_text: directText };
+            setArticle(articleData);
+          } else {
+            if (!url) throw new Error('기사 URL을 입력해주세요.');
+            const scraped = await api.scrapeNews({ url });
+            articleData = scraped;
+            setArticle(scraped);
+          }
+          if (!articleData?.full_text) throw new Error('기사 본문을 가져오지 못했습니다.');
+          const result = await api.generateContent({
+            article_text: articleData.full_text as string,
+            duration: duration,
+            template_id: templateId,
+        custom_instructions: buildCutInstructions(cutSpeed),
+        script_id: scriptId,
+          });
+          if (!result || (result as { error?: string }).error) {
+            throw new Error((result as { error?: string } | null)?.error || 'AI 대본 생성에 실패했습니다.');
+          }
+          contentData = result as AppContent;
+        } else {
+          if (!shortsTopic.trim()) throw new Error('주제를 입력해주세요.');
+          const result = await api.createShorts({
+            reference: shortsReference || '',
+            new_topic: shortsTopic.trim(),
+            duration,
+            category: shortsCategory,
+            script_id: scriptId,
+            ...(shortsCategory === 'recipe_short' ? {
+              ...(recipePreset.format && recipePreset.format !== 'auto' ? { format_id: recipePreset.format } : {}),
+              style_id: recipePreset.style,
+              platform_id: recipePreset.platform,
+              hook_id: recipePreset.hook || 'random',
+              preset_id: recipePreset.preset || 'random',
+              ...(recipePreset.tone ? { tone_id: recipePreset.tone } : {}),
+              ...(recipePreset.structure ? { structure_id: recipePreset.structure } : {}),
+              ...(recipePreset.cta ? { cta_id: recipePreset.cta } : {}),
+            } : {}),
+          });
+          const contentTyped = result as AppContent;
+          const title = contentTyped.title || shortsTopic.trim().slice(0, 50);
+          articleData = { title, full_text: title };
+          setArticle(articleData);
+          contentData = contentTyped;
+        }
+        setContent(contentData);
+        if (isNewContent) resetVisualState();
+        setSrtData([]); setSrtScriptSig(null);
+        setAudio(null); setAudioScriptSig(null);
+        setCurrentStep(2);
+      }
+      if (!contentData?.script || !contentData?.scenes) throw new Error('대본 생성에 실패했습니다.');
+
+      // ---- 2. TTS ----
+      setProgress({ step: 'tts', status: 'starting', progress: 5, message: '자동 제작: 음성을 생성하고 있습니다...' });
+      const voiceData = { ...voiceMap, settings: voiceSettings };
+      const ttsData = await api.generateTTS({
+        script: contentData.script as { text: string; speaker: string; }[],
+        voice_map: voiceData,
+        engine: selectedEngine,
+        rate: voiceRate,
+        gap_duration: gapDuration,
+        output_name: `audio_${Date.now()}`
+      });
+      if (!ttsData) throw new Error('음성 생성에 실패했습니다.');
+      const mappedAudio = {
+        ...ttsData,
+        url: (ttsData as { audio_url?: string; url?: string }).audio_url || (ttsData as { url?: string }).url,
+        srtUrl: (ttsData as { srt_url?: string; srtUrl?: string }).srt_url || (ttsData as { srtUrl?: string }).srtUrl
+      };
+      setAudio(mappedAudio);
+      setAudioScriptSig(contentData.script.map((s) => `${s.speaker}:${s.text}`).join('\n'));
+      setCurrentStep(3);
+
+      // ---- 3. SRT 파싱 ----
+      const rawSrtUrl = typeof mappedAudio.srtUrl === 'string' ? mappedAudio.srtUrl
+        : (typeof mappedAudio.srt_path === 'string' ? '' : '');
+      const srtPathStr = typeof mappedAudio.srt_path === 'string' ? mappedAudio.srt_path : '';
+      let srtList: SrtItem[] = [];
+      {
+        let srtUrl = '';
+        if (rawSrtUrl) {
+          srtUrl = assetUrl(rawSrtUrl);
+        } else if (srtPathStr) {
+          const fileName = srtPathStr.split(/[\\/]/).pop();
+          srtUrl = assetUrl(`/assets/audio/${fileName}`);
+        }
+        if (!srtUrl) throw new Error('자막 파일을 찾을 수 없습니다.');
+        const response = await fetch(srtUrl as RequestInfo);
+        if (!response.ok) throw new Error(`자막 로드 실패: ${response.status}`);
+        const parsed = parseSrtText(await response.text());
+        if (parsed.length === 0) throw new Error('자막 파싱에 실패했습니다.');
+        srtList = splitLongSubtitles(parsed, contentData.script.length);
+        setSrtData(srtList);
+        setSrtScriptSig(contentData.script.map((s) => `${s.speaker}:${s.text}`).join('\n'));
+      }
+      const totalDuration = srtList[srtList.length - 1].end;
+      setVideoDuration(totalDuration);
+      if (contentData.scenes) {
+        setSceneDurations(contentData.scenes.map(() => totalDuration / contentData.scenes.length));
+      }
+
+      // ---- 4. 비주얼 수집 + 첫 후보 자동 선택 ----
+      setIsGeneratingAll(true);
+      setActiveTask('all');
+      stopGenerationRef.current = false;
+      const sceneCount = contentData.scenes.length;
+      setGenerationProgress({ current: 0, total: sceneCount });
+      const newCandidates: Record<number, SceneCandidates> = {};
+      const newExtra: Record<number, StockVideo[]> = {};
+      const newSelected: Record<number, string[]> = {};
+      const categoryFor = templateId === 'news_duo' || templateId === 'news_solo' ? 'news'
+        : templateId.endsWith('_short') ? templateId
+        : (shortsCategory || 'news');
+      const topicName = (projectName && projectName !== '새 프로젝트') ? projectName : (articleData?.title || '');
+      for (let i = 0; i < sceneCount; i++) {
+        if (stopGenerationRef.current) break;
+        setProgress({ step: 'visuals', status: 'starting', progress: 5, message: `자동 제작: 장면 ${i + 1}/${sceneCount} 소재를 모으고 있습니다...` });
+        setGenerationProgress({ current: i + 1, total: sceneCount });
+        const scene = contentData.scenes[i] as unknown as Record<string, unknown>;
+        const keyword = String(scene.keyword || '');
+        try {
+          const vc = await api.getVisualCandidates({
+            scene: { keyword, description: String(scene.description || ''), keywords: [keyword] },
+            index: i,
+            project_id: projectId,
+            ai_count: 1,
+            search_count: 5,
+            ai_model: selectedAiModel,
+            topic: topicName,
+            visual_guide: keyword || String(scene.description || ''),
+            category: categoryFor,
+          });
+          newCandidates[i] = {
+            ai: vc?.candidates?.ai || [],
+            search: vc?.candidates?.search || [],
+            graph: vc?.candidates?.graph || [],
+          };
+        } catch (e) {
+          console.error(`Auto visuals failed for scene ${i}:`, e);
+          newCandidates[i] = { ai: [], search: [], graph: [] };
+        }
+        try {
+          const base = String((scene.stock_query as string) || keyword || '').trim();
+          const descHead = (!scene.stock_query && scene.description
+            ? String(scene.description).split(',')[0].slice(0, 60).trim() : '');
+          const kw = `${base} ${descHead}`.trim();
+          const stockData = kw ? await api.getStockVideos(kw, 4) : { videos: [] };
+          const vids: StockVideo[] = ((stockData as { videos?: StockVideo[] })?.videos || [])
+            .map((v) => ({ ...v, kind: 'video', source: 'stock' }));
+          newExtra[i] = vids;
+        } catch (e) {
+          console.error(`Auto stock failed for scene ${i}:`, e);
+          newExtra[i] = [];
+        }
+        const first = newCandidates[i].ai[0]?.url
+          || newCandidates[i].search[0]?.url
+          || newExtra[i][0]?.url;
+        if (first) newSelected[i] = [first];
+      }
+      setIsGeneratingAll(false);
+      setActiveTask(null);
+      setGenerationProgress({ current: 0, total: 0 });
+      // 중단해도 모은 만큼은 state에 반영
+      setVisualCandidates((prev) => ({ ...prev, ...newCandidates }));
+      setExtraMedia((prev) => {
+        const merged: Record<number, StockVideo[]> = { ...prev };
+        Object.entries(newExtra).forEach(([k, v]) => {
+          const idx = Number(k);
+          const existing = new Set((merged[idx] || []).map((m) => m.url));
+          merged[idx] = [...(merged[idx] || []), ...v.filter((m) => !existing.has(m.url))];
+        });
+        return merged;
+      });
+      const sanitized = sanitizeSelectedVisuals(newSelected);
+      if (stopGenerationRef.current) {
+        setSelectedVisuals((prev) => {
+          const merged: Record<number, string[]> = { ...prev };
+          Object.entries(sanitized).forEach(([k, v]) => {
+            const idx = Number(k);
+            if (!(merged[idx] || []).length) merged[idx] = v;
+          });
+          return merged;
+        });
+        setCurrentStep(4);
+        return;
+      }
+      setSelectedVisuals(sanitized);
+      setCurrentStep(5);
+
+      // ---- 5. 전부 모였으면 바로 렌더 ----
+      const complete = contentData.scenes.every((_, idx) => (sanitized[idx] || []).length > 0);
+      if (!complete) {
+        setError('일부 장면의 소재가 비어 있어 편집 단계에서 멈췄습니다. 직접 채운 뒤 내보내기를 눌러주세요.');
+        return;
+      }
+      // 씬 구간 계산 (getTimelineRange의 SRT 분기 로직과 동일)
+      const ranges = contentData.scenes.map((_, idx) => {
+        const scoped = srtList.filter((s) => (s as { scene?: number }).scene === idx);
+        if (scoped.length === 0) {
+          return { start: 0, end: 0, duration: 0 };
+        }
+        const start = scoped[0].start;
+        const nextScoped = srtList.filter((s) => ((s as { scene?: number }).scene ?? -1) === idx + 1);
+        let end: number;
+        if (nextScoped.length > 0) {
+          end = nextScoped[0].start;
+        } else if (idx < contentData.scenes.length - 1) {
+          const later = srtList.filter((s) => (((s as { scene?: number }).scene ?? -1) > idx));
+          end = later.length > 0 ? later[0].start : scoped[scoped.length - 1].end;
+        } else {
+          end = scoped[scoped.length - 1].end + gapDuration;
+        }
+        return { start, end, duration: Math.max(0, end - start) };
+      });
+      await handleFinalRender({
+        audio: mappedAudio,
+        visuals: sanitized,
+        content: contentData,
+        srt: srtList,
+        ranges,
+      });
+    } catch (err: unknown) {
+      setError((err as Error).message || '자동 제작 중 오류가 발생했습니다.');
+      setIsGeneratingAll(false);
+      setActiveTask(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFinalRender = async (overrides?: RenderOverrides) => {
+    const audioData = overrides?.audio !== undefined ? overrides.audio : audio;
+    const visualsData = overrides?.visuals ?? selectedVisuals;
+    const contentData = overrides?.content !== undefined ? overrides.content : content;
+    const srtList = overrides?.srt ?? srtData;
+    if (!audioData || !contentData?.scenes) return;
+    // 구간: 자동 모드에서 직접 계산한 값을 우선 사용 (state 비동기 문제 회피)
+    const getRange = (idx: number) => {
+      if (overrides?.ranges && overrides.ranges[idx]) return overrides.ranges[idx];
+      const r = getTimelineRange(contentData.script, idx);
+      return { start: parseFloat(r.start), end: parseFloat(r.end), duration: parseFloat(r.duration) };
+    };
     setLoading(true);
     setError(null);
     setProgress({ step: 'render', status: 'starting', progress: 5, message: '최종 영상 렌더링을 준비하고 있습니다...' });
     try {
       // 자동 할당 없음: 비어 있는 씬이 있으면 렌더를 막고 직접 고르게 함
-      const finalVisuals: Record<number, string[]> = { ...selectedVisuals };
+      const finalVisuals: Record<number, string[]> = { ...visualsData };
       const missingScenes: number[] = [];
 
-      content.scenes.forEach((_, idx) => {
+      contentData.scenes.forEach((_, idx) => {
         if (!finalVisuals[idx] || finalVisuals[idx].length === 0) {
           missingScenes.push(idx + 1);
         }
@@ -1711,8 +2286,8 @@ function App() {
 
       // 백엔드 렌더링을 위해 이미지 리스트와 각 장면의 길이를 전달
       // 영상 클립은 in/out 트림을 함께 전달 ({path, in, out})
-      const bg_images: Array<[Array<string | ClipRef>, number]> = content.scenes.map((_, idx) => {
-        const range = getTimelineRange(content.script, idx);
+      const bg_images: Array<[Array<string | ClipRef>, number]> = contentData.scenes.map((_, idx) => {
+        const range = getRange(idx);
         const trims = clipTrims[idx] || {};
         const layout = sceneLayouts[idx];
         const hasLayout = layout && (Math.abs(layout.scale - 1) > 1e-6 || Math.abs(layout.x) > 1e-6 || Math.abs(layout.y) > 1e-6);
@@ -1730,12 +2305,12 @@ function App() {
         });
         return [
           clips,
-          parseFloat(range.duration)
+          range.duration
         ];
       });
-      
+
       // SRT 데이터를 다시 SRT 포맷으로 변환 (편집된 내용 반영)
-      const formatSRT = (data: typeof srtData) => {
+      const formatSRT = (data: typeof srtList) => {
         return data.map(item => {
           const secondsToTime = (s: number) => {
             const h = Math.floor(s / 3600).toString().padStart(2, '0');
@@ -1748,24 +2323,24 @@ function App() {
         }).join('\n');
       };
 
-      const editedSrtContent = formatSRT(srtData);
+      const editedSrtContent = formatSRT(srtList);
 
       // 씬 자막(상단 밴드): Step2의 씬별 subtitle을 씬 구간에 맞춰 전달
       const sceneCaptions = showSceneCaptions
-        ? content.scenes.flatMap((scene, idx) => {
+        ? contentData.scenes.flatMap((scene, idx) => {
             const text = (scene.subtitle || '').trim();
             if (!text) return [];
-            const range = getTimelineRange(content.script, idx);
-            const start = parseFloat(range.start);
-            const end = parseFloat(range.end);
+            const range = getRange(idx);
+            const start = range.start;
+            const end = range.end;
             if (!(end > start)) return [];
             return [{ start, end, text }];
           })
         : [];
 
       const data = await api.renderVideo({
-        audio_path: audio.audio_path as string,
-        srt_path: audio.srt_path as string,
+        audio_path: audioData.audio_path as string,
+        srt_path: audioData.srt_path as string,
         bg_images: bg_images,
         output_name: `video_${Date.now()}`,
         subtitle_style: {
@@ -1783,6 +2358,15 @@ function App() {
         edited_srt: editedSrtContent, // 백엔드에서 이 필드를 처리하도록 함
         aspect_ratio: aspectRatio, // 화면 비율 추가
         scene_captions: sceneCaptions,
+        transition: transition,
+        video_filter: videoFilter,
+        scene_filters: sceneFilters,
+        stickers: stickers,
+        media_fit: mediaFit,
+        scene_fits: sceneFits,
+        bg_style: bgStyle,
+        bg_color: bgColor,
+        fit_zoom: zoomPct / 100,
         caption_style: {
           ...captionStyle,
           bg_color: captionStyle.bg_color === 'transparent' ? undefined : captionStyle.bg_color
@@ -1828,46 +2412,153 @@ function App() {
         }} 
       />
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col relative min-w-0 overflow-hidden">
-        <Header 
-          activeMenu={activeMenu} 
-          handleNewProject={handleNewProject} 
-          handleSaveProject={handleSaveProject} 
-          isSaving={isSaving} 
+      {/* Right column: 헤더는 사이드바 바로 오른쪽에 고정, 레일은 헤더 아래 행에 도킹 */}
+      <div className="flex-1 flex flex-col relative min-w-0 min-h-0 overflow-hidden">
+        <Header
+          activeMenu={activeMenu}
+          handleNewProject={handleNewProject}
+          handleSaveProject={handleSaveProject}
+          isSaving={isSaving}
         />
-        {/* Content Area */}
-        <div className={`flex-1 pt-2 flex flex-col min-h-0 min-w-0 overflow-hidden ${activeMenu === 'Editor' || (activeMenu === 'Home' && currentStep === 5) ? 'pl-0 pr-2 md:pr-3 pb-0 items-stretch' : 'px-4 md:px-8 pb-6 items-center'}`}>
-          <div className={`w-full flex-1 flex flex-col min-h-0 min-w-0 ${(activeMenu === 'Editor' || (activeMenu === 'Home' && currentStep === 5)) ? 'max-w-none' : 'max-w-7xl'}`}>
+        <div className="flex-1 flex min-h-0 min-w-0 overflow-hidden">
+      {/* 제작 설정 레일: 헤더 아래 행에 도킹. 카테고리를 고른 뒤(input)부터 표시. 접으면 펼치기 버튼만 */}
+      {activeMenu === 'Home' && homeHub === 'auto' && currentStep === 1 && step1Phase === 'input' && (
+        presetRailOpen ? (
+        <aside className="w-80 shrink-0 h-full min-h-0 overflow-y-auto custom-scrollbar bg-white border-r border-gray-200 z-10">
+          <button
+            onClick={() => setPresetRailOpen(false)}
+            title="제작 설정 접기 (펼치기 버튼만 남음)"
+            className="sticky top-0 z-10 w-full flex items-center gap-2 bg-indigo-600 text-white px-4 py-3 hover:bg-indigo-700 transition-colors"
+          >
+            <SlidersHorizontal size={14} />
+            <span className="text-sm font-extrabold">제작 설정</span>
+            <ChevronLeft size={16} className="ml-auto" />
+          </button>
+          <VideoPresetPanel
+            bare
+            aspectRatio={aspectRatio}
+            setAspectRatio={setAspectRatio}
+            duration={duration}
+            setDuration={setDuration}
+            cutSpeed={cutSpeed}
+            setCutSpeed={setCutSpeed}
+            scriptOptions={scriptOptions}
+            scriptId={scriptId}
+            onScriptChange={setScriptId}
+            selectedEngine={selectedEngine}
+            setSelectedEngine={setSelectedEngine}
+            voiceRate={voiceRate}
+            setVoiceRate={setVoiceRate}
+            selectedAiModel={selectedAiModel}
+            setSelectedAiModel={setSelectedAiModel}
+            videoModel={videoModel}
+            setVideoModel={setVideoModel}
+            hasMinimaxKey={!!(config?.minimax_api_key as string)}
+            hasFalKey={!!(config?.fal_key as string)}
+            mediaFit={mediaFit}
+            setMediaFit={setMediaFit}
+            bgStyle={bgStyle}
+            setBgStyle={setBgStyle}
+            bgColor={bgColor}
+            setBgColor={setBgColor}
+            zoomPct={zoomPct}
+            setZoomPct={setZoomPct}
+            subtitlePreset={subtitleStyle.preset}
+            onSubtitlePresetChange={(id) => setSubtitleStyle((prev) => {
+              const preset = (subtitlePresets as Record<string, Partial<typeof prev>>)[id];
+              const factor = SUBTITLE_SIZES.find((s) => s.id === subtitleSize)?.factor ?? 1;
+              const base = (preset as { font_size?: number } | undefined)?.font_size ?? 20;
+              return { ...prev, preset: id, ...preset, font_size: Math.round(base * factor) };
+            })}
+            subtitleSize={subtitleSize}
+            onSubtitleSizeChange={(s) => {
+              setSubtitleSize(s);
+              const factor = SUBTITLE_SIZES.find((x) => x.id === s)?.factor ?? 1;
+              setSubtitleStyle((prev) => {
+                const base = (subtitlePresets as Record<string, { font_size: number }>)[prev.preset]?.font_size ?? 20;
+                return { ...prev, font_size: Math.round(base * factor) };
+              });
+            }}
+            showSubtitles={subtitleStyle.show_subtitles}
+            onToggleSubtitles={(v) => setSubtitleStyle((prev) => ({ ...prev, show_subtitles: v }))}
+            subtitleY={subtitleStyle.y_offset ?? 85}
+            onSubtitleYChange={(y) => setSubtitleStyle((prev) => ({ ...prev, y_offset: y }))}
+            captionStyle={captionStyle}
+            setCaptionStyle={setCaptionStyle}
+            showSceneCaptions={showSceneCaptions}
+            setShowSceneCaptions={setShowSceneCaptions}
+          />
+          <div className="sticky bottom-0 bg-white border-t border-gray-100 p-4">
+            <button
+              onClick={handleSaveProject}
+              disabled={isSaving}
+              className="w-full py-3 bg-indigo-600 text-white rounded-xl text-sm font-extrabold hover:bg-indigo-700 disabled:bg-gray-300 shadow-lg shadow-indigo-200 transition-all"
+            >
+              {isSaving ? '저장 중...' : '설정 저장 완료'}
+            </button>
+          </div>
+        </aside>
+        ) : (
+        <div className="shrink-0 h-full flex flex-col py-4 pl-0 z-10">
+          <button
+            onClick={() => setPresetRailOpen(true)}
+            title="제작 설정 펼치기"
+            className="flex items-center justify-center pl-1 pr-1.5 py-3 rounded-r-lg bg-white border border-l-0 border-gray-200 text-gray-400 hover:text-indigo-600 shadow-sm transition-all"
+          >
+            <ChevronRight size={16} />
+          </button>
+        </div>
+        )
+      )}
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col relative min-w-0 min-h-0 overflow-hidden">
+        {/* Content Area — 자동화 흐름 전 단계 공통: 넓게 stretch */}
+        <div className={`flex-1 pt-2 flex flex-col min-h-0 min-w-0 overflow-hidden ${activeMenu === 'Editor' || (activeMenu === 'Home' && homeHub === 'auto') ? 'pl-0 pr-2 md:pr-3 pb-1 items-stretch' : 'px-4 md:px-8 pb-6 items-center'}`}>
+          <div className={`w-full flex-1 flex flex-col min-h-0 min-w-0 ${(activeMenu === 'Editor' || (activeMenu === 'Home' && homeHub === 'auto')) ? 'max-w-none' : 'max-w-7xl'}`}>
             {activeMenu === 'Home' ? (
+              homeHub === 'hubs' ? (
+              <HubHome
+                onSelect={(hub) => {
+                  if (hub === 'auto') setHomeHub('auto');
+                  else if (hub === 'marketing') setActiveMenu('Marketing');
+                  else setActiveMenu('Posting');
+                }}
+              />
+              ) : (
               <div className="flex-1 flex flex-col min-h-0 min-w-0">
-                {/* Stepper (Sticky) */}
-                <div className={`z-20 bg-white/95 backdrop-blur-md py-3 px-6 border border-gray-100 shadow-sm rounded-2xl shrink-0 ${currentStep === 5 ? 'mb-2' : 'mb-4'}`}>
-                  <div className={`${currentStep === 5 ? 'max-w-none' : 'max-w-7xl'} mx-auto flex justify-between items-center relative`}>
+                {/* Stepper (Sticky) — 전 단계 공통 크롬: 허브 버튼 내장 + 컴팩트 */}
+                <div className="z-20 bg-white/95 backdrop-blur-md py-2 px-4 border border-gray-100 shadow-sm rounded-2xl shrink-0 mb-1">
+                  <div className="max-w-none mx-auto flex items-center gap-3 relative">
+                    <button
+                      onClick={() => setHomeHub('hubs')}
+                      title="허브로 돌아가기"
+                      className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold border border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700 transition-all"
+                    >
+                      ← 허브
+                    </button>
+                    {currentStep > 1 && (
+                      <button
+                        onClick={() => goToStep(currentStep - 1)}
+                        title={`이전 단계로 (${currentStep - 1}. ${steps.find((s) => s.id === currentStep - 1)?.label ?? ''})`}
+                        className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold border border-gray-200 bg-white text-gray-500 hover:border-indigo-300 hover:text-indigo-600 transition-all"
+                      >
+                        ← 이전
+                      </button>
+                    )}
+                    <div className="flex-1 flex justify-between items-center relative">
                     <div className="absolute top-4 left-0 right-0 h-0.5 bg-gray-200 z-0 mx-8 md:mx-16" />
                     {steps.map((step) => (
-                      <StepItem 
+                      <StepItem
                         key={step.id}
                         number={step.id}
                         label={step.label}
                         active={currentStep === step.id}
                         completed={currentStep > step.id}
-                        onClick={() => {
-                          // 각 단계별 요구사항 체크
-                          if (loading) return;
-                          
-                          if (step.id === 2 && !article && !content) return;
-                          if (step.id === 3 && !content) return;
-                          if (step.id === 4 && !audio?.url) {
-                            handleGenerateTTS();
-                            return;
-                          }
-                          if (step.id === 5 && Object.keys(selectedVisuals).length === 0) return;
-                          
-                          setCurrentStep(step.id);
-                        }}
+                        compact
+                        onClick={() => goToStep(step.id)}
                       />
                     ))}
+                    </div>
                   </div>
                 </div>
 
@@ -1880,42 +2571,6 @@ function App() {
                       progress={progress} 
                       handleCancelTask={handleCancelTask} 
                     />
-
-                {audioStale && (
-                  <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-amber-700 animate-in fade-in slide-in-from-top-2 duration-300">
-                    <AlertCircle size={20} className="shrink-0 mt-0.5" />
-                    <div className="flex-1">
-                      <p className="font-bold text-sm">음성이 대본과 맞지 않습니다</p>
-                      <p className="text-xs opacity-80">
-                        대본 수정·타임라인 편집 이후라 음성이 어긋났습니다. 그대로 렌더하면 소리와 자막이 다릅니다. TTS를 다시 생성하세요.
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => handleGenerateTTS()}
-                      className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition-colors"
-                    >
-                      TTS 다시 생성
-                    </button>
-                  </div>
-                )}
-
-                {subsStale && currentStep >= 3 && (
-                  <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-amber-700 animate-in fade-in slide-in-from-top-2 duration-300">
-                    <AlertCircle size={20} className="shrink-0 mt-0.5" />
-                    <div className="flex-1">
-                      <p className="font-bold text-sm">자막이 대본과 맞지 않습니다</p>
-                      <p className="text-xs opacity-80">
-                        자막이 이전 대본 기준입니다. TTS를 다시 생성하면 현재 대본으로 맞춰집니다.
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => handleGenerateTTS()}
-                      className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition-colors"
-                    >
-                      TTS 다시 생성
-                    </button>
-                  </div>
-                )}
 
                 {error && (
                   <div className="mb-6 p-4 bg-red-50 border border-red-100 rounded-xl flex items-start gap-3 text-red-600 animate-in fade-in slide-in-from-top-2 duration-300">
@@ -1982,10 +2637,10 @@ function App() {
                     setShortsReport={setShortsReport}
                     shortsTopic={shortsTopic}
                     setShortsTopic={setShortsTopic}
-                    shortsDuration={shortsDuration}
-                    setShortsDuration={setShortsDuration}
                     shortsCategory={shortsCategory}
                     setShortsCategory={setShortsCategory}
+                    shortsReference={shortsReference}
+                    setShortsReference={setShortsReference}
                     onShortsComplete={(article, content) => {
                       setArticle(article);
                       setContent(content);
@@ -1996,6 +2651,13 @@ function App() {
                     onShortsDirectCreate={handleShortsDirectCreate}
                     handleScrape={handleScrape}
                     loading={loading}
+                    onAutoMake={handleAutoMake}
+                    recipePreset={recipePreset}
+                    setRecipePreset={setRecipePreset}
+                    phase={step1Phase}
+                    setPhase={setStep1Phase}
+                    onCategoryPick={(tplId) => fetchScriptOptions(tplId, false)}
+                    scriptId={scriptId}
                   />
                 )}
 
@@ -2005,7 +2667,6 @@ function App() {
                     article={article}
                     content={content}
                     duration={duration}
-                    setDuration={setDuration}
                     handleGenerate={handleGenerateContent}
                     setContent={setContent}
                     setAudio={setAudio}
@@ -2043,8 +2704,9 @@ function App() {
                     playVoiceSample={playVoiceSample}
                     getTimelineRange={getTimelineRange}
                     languages={languages}
-                    voiceOptions={voiceOptions}
+                    voiceOptions={effectiveVoiceOptions}
                     filteredVoices={filteredVoices}
+                    isStale={audioStale || subsStale}
                   />
                 )}
 
@@ -2060,6 +2722,7 @@ function App() {
                     setVisualCandidates={setVisualCandidates}
                     isGeneratingAll={isGeneratingAll}
                     generationProgress={generationProgress}
+                    activeTask={activeTask}
                     stopGeneration={stopGeneration}
                     selectedAiModel={selectedAiModel}
                     setSelectedAiModel={setSelectedAiModel}
@@ -2129,6 +2792,19 @@ function App() {
                     subtitlePresets={subtitlePresets}
                     aspectRatio={aspectRatio}
                     setAspectRatio={setAspectRatio}
+                    transition={transition}
+                    setTransition={setTransition}
+                    videoFilter={videoFilter}
+                    setVideoFilter={setVideoFilter}
+                    sceneFilters={sceneFilters}
+                    setSceneFilters={setSceneFilters}
+                    stickers={stickers}
+                    setStickers={setStickers}
+                    mediaFit={mediaFit}
+                    sceneFits={sceneFits}
+                    setSceneFits={setSceneFits}
+                    mediaZoom={zoomPct}
+                    audioUrl={typeof audio?.url === 'string' ? assetUrl(audio.url) : undefined}
                   />
                 )}
 
@@ -2142,6 +2818,7 @@ function App() {
                   </div>
                 </div>
               </div>
+              )
             ) : activeMenu === 'Editor' ? (
               <VideoEditor 
                 content={content}
@@ -2185,6 +2862,19 @@ function App() {
                 subtitlePresets={subtitlePresets}
                 aspectRatio={aspectRatio}
                 setAspectRatio={setAspectRatio}
+                transition={transition}
+                setTransition={setTransition}
+                videoFilter={videoFilter}
+                setVideoFilter={setVideoFilter}
+                sceneFilters={sceneFilters}
+                setSceneFilters={setSceneFilters}
+                stickers={stickers}
+                setStickers={setStickers}
+                mediaFit={mediaFit}
+                sceneFits={sceneFits}
+                setSceneFits={setSceneFits}
+                mediaZoom={zoomPct}
+                audioUrl={typeof audio?.url === 'string' ? assetUrl(audio.url) : undefined}
                 showBackButton={false}
                 title="ADVANCED EDITOR"
                 isStandalone={true}
@@ -2212,10 +2902,20 @@ function App() {
               isFetchingUsage={isFetchingUsage}
               cfUsage={cfUsage}
             />
+          ) : activeMenu === 'Marketing' ? (
+            <MarketingHub />
+          ) : activeMenu === 'Posting' ? (
+            <PostingHub
+              config={config}
+              setConfig={setConfig}
+              handleSaveConfig={handleSaveConfig}
+            />
           ) : null}
         </div>
       </div>
     </main>
+        </div>
+      </div>
 
       {/* Image Zoom Modal */}
       {zoomedImage && (

@@ -6,7 +6,6 @@ interface Step2ReviewProps {
   article: Article | null;
   content: AppContent | null;
   duration: number;
-  setDuration: (duration: number) => void;
   handleGenerate: () => void;
   setContent: (content: AppContent | null) => void;
   setAudio: (audio: { url?: string; srtUrl?: string; audio_path?: string; srt_path?: string; [key: string]: unknown } | null) => void;
@@ -20,7 +19,6 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
   article,
   content,
   duration,
-  setDuration,
   handleGenerate,
   setContent,
   setAudio,
@@ -54,21 +52,9 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
           <div className="bg-indigo-50/50 rounded-2xl p-4 border border-indigo-100 flex items-center justify-between gap-4 shrink-0">
             <label className="text-sm font-bold text-indigo-900 flex items-center gap-2 shrink-0">
               <Clock size={16} /> 예상 영상 길이: <span className="text-indigo-600">{duration}초</span>
+              <span className="text-[11px] font-medium text-indigo-400">· 제작 설정에서 변경</span>
             </label>
             <div className="flex flex-wrap gap-2 justify-end">
-              {[30, 60, 180, 300].map((sec) => (
-                <button
-                  key={sec}
-                  onClick={() => setDuration(sec)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
-                    duration === sec 
-                      ? 'bg-indigo-600 text-white shadow-md' 
-                      : 'bg-white text-gray-500 border border-gray-200 hover:border-indigo-300'
-                  }`}
-                >
-                  {sec >= 60 ? `${sec/60}분` : `${sec}초`}
-                </button>
-              ))}
               <button 
                 onClick={handleGenerate}
                 disabled={loading}
@@ -211,7 +197,7 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
                       <div className="w-1 h-3 bg-indigo-500 rounded-full"></div>
-                      <label className="text-[9px] font-black text-gray-500 uppercase tracking-widest">Voice Script</label>
+                      <label className="text-[9px] font-black text-gray-500 uppercase tracking-widest">Voice Script · 하단 자막(TTS)</label>
                     </div>
                     <textarea 
                       title="대본 내용"
@@ -265,6 +251,21 @@ const Step2Review: React.FC<Step2ReviewProps> = ({
                       placeholder="이미지/비디오 생성을 위한 프롬프트를 입력하세요..."
                     />
                   </div>
+                </div>
+                <div className="flex items-center gap-2 pt-1">
+                  <span className="text-[9px] font-black text-amber-600 uppercase tracking-widest whitespace-nowrap" title="영상 상단에 표시되는 씬 요약 자막">TOP 상단 자막</span>
+                  <textarea
+                    rows={2}
+                    value={scene.subtitle || ''}
+                    onChange={(e) => {
+                      const newScenes = [...content.scenes];
+                      newScenes[idx].subtitle = e.target.value;
+                      setContent({ ...content, scenes: newScenes });
+                    }}
+                    placeholder="상단 밴드 자막 (Enter=줄바꿈, 재료+분량 목록 가능)"
+                    title="상단 자막"
+                    className="flex-1 resize-none leading-snug text-[11px] font-bold text-gray-700 bg-amber-50/60 border border-amber-200/60 rounded-lg px-2.5 py-1.5 outline-none focus:border-amber-500 transition-all custom-scrollbar"
+                  />
                 </div>
               </div>
             ))}

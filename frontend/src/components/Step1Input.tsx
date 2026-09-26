@@ -1,5 +1,5 @@
 import React from 'react';
-import { Edit2, FileText, ExternalLink, Clock, Sparkles, Users, Clapperboard, ChefHat, ShoppingBag, Lightbulb, Plane } from 'lucide-react';
+import { Edit2, FileText, ExternalLink, Sparkles, Users, Clapperboard, ChefHat, ShoppingBag, Lightbulb, Plane, ArrowLeft, ArrowRight, Zap } from 'lucide-react';
 import ShortsLab from './ShortsLab';
 import type { AppContent, Article, ShortsReport } from '../services/api';
 
@@ -25,7 +25,7 @@ interface Step1InputProps {
   directText: string;
   setDirectText: (text: string) => void;
   duration: number;
-  setDuration: (duration: number) => void;
+  setDuration: (v: number) => void;
   templateId: string;
   setTemplateId: (id: string) => void;
   shortsMode: 'file' | 'youtube';
@@ -38,14 +38,21 @@ interface Step1InputProps {
   setShortsReport: (r: ShortsReport | null) => void;
   shortsTopic: string;
   setShortsTopic: (v: string) => void;
-  shortsDuration: number;
-  setShortsDuration: (v: number) => void;
   shortsCategory: string;
   setShortsCategory: (v: string) => void;
   onShortsComplete: (article: Article, content: AppContent) => void;
-  onShortsDirectCreate: (topic: string, duration: number, category: string) => void;
+  onShortsDirectCreate: (topic: string, duration: number, category: string, reference?: string) => void | Promise<void>;
   handleScrape: () => void;
   loading: boolean;
+  onAutoMake: (source: 'news' | 'shorts') => void;
+  recipePreset: { format: string; style: string; platform: string; hook?: string };
+  setRecipePreset: (p: { format: string; style: string; platform: string }) => void;
+  phase: 'pick' | 'input';
+  setPhase: (p: 'pick' | 'input') => void;
+  onCategoryPick?: (tplId: string) => void;
+  scriptId?: string;
+  shortsReference: string;
+  setShortsReference: (v: string) => void;
 }
 
 const Step1Input: React.FC<Step1InputProps> = ({
@@ -71,84 +78,134 @@ const Step1Input: React.FC<Step1InputProps> = ({
   setShortsReport,
   shortsTopic,
   setShortsTopic,
-  shortsDuration,
-  setShortsDuration,
   shortsCategory,
   setShortsCategory,
   onShortsComplete,
   onShortsDirectCreate,
   handleScrape,
-  loading
+  loading,
+  onAutoMake,
+  recipePreset,
+  setRecipePreset,
+  phase,
+  setPhase,
+  onCategoryPick,
+  scriptId = '',
+  shortsReference,
+  setShortsReference
 }) => {
   const isNews = templateId === 'news_duo' || templateId === 'news_solo';
   const isShortsCat = templateId === 'recipe_short' || templateId === 'review_short' || templateId === 'knowledge_short' || templateId === 'travel_short';
   const isShortsLab = templateId === 'shorts_lab' || isShortsCat;
+  // 1단계: 카테고리 먼저 선택 → 2단계: 입력 프로세스
+  // (자동 제작은 각 카테고리 입력 화면 안에서 선택. 카드에는 액션 없음)
+  // phase는 App에서 관리 (제작 설정 레일 표시 여부와 공유)
+
+  const SHORTS_CARDS = SHORTS_CATEGORIES.map((c) => ({
+    id: c.id, cat: c.id as string | undefined, name: c.name, desc: c.desc, icon: c.icon,
+  }));
+  const LONGFORM_CARD = {
+    id: 'news_duo', cat: undefined as string | undefined,
+    name: '뉴스 / 이슈 브리핑', desc: '기사 URL로 대본 생성', icon: Users,
+  };
+  const ANALYZE_CARD = {
+    id: 'shorts_lab', cat: undefined as string | undefined,
+    name: '숏폼 분석·재창작', desc: '파일/유튜브 분석 후 패턴으로 새로 만들기', icon: Clapperboard,
+  };
+
+  const pickCategory = (tplId: string, catId?: string) => {
+    setTemplateId(tplId);
+    if (catId) setShortsCategory(catId);
+    setPhase('input');
+    onCategoryPick?.(tplId);
+  };
+
+  const pickedCard =
+    [...SHORTS_CARDS, LONGFORM_CARD, ANALYZE_CARD].find((c) => c.id === templateId)
+    || SHORTS_CARDS.find((c) => c.id === shortsCategory);
+
+  const renderPickCard = (c: { id: string; cat: string | undefined; name: string; desc: string; icon: React.FC<{ size: number; className?: string }> }) => {
+    const Icon = c.icon;
+    return (
+      <button
+        key={c.id}
+        onClick={() => pickCategory(c.id, c.cat)}
+        title={`${c.name} - ${c.desc}`}
+        className="group flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-gray-200 bg-white hover:border-indigo-300 hover:shadow-lg hover:shadow-indigo-100/50 transition-all text-left w-full h-full min-h-[74px]"
+      >
+        <div className="w-9 h-9 flex items-center justify-center rounded-xl bg-gray-100 text-gray-500 group-hover:bg-indigo-600 group-hover:text-white transition-all shrink-0">
+          <Icon size={18} />
+        </div>
+        <div className="min-w-0 flex-1 leading-tight">
+          <p className="text-sm font-bold text-gray-800 whitespace-nowrap">{c.name}</p>
+          <p className="text-xs text-gray-400 font-medium truncate mt-0.5">{c.desc}</p>
+        </div>
+        <ArrowRight size={16} className="text-gray-200 group-hover:text-indigo-500 group-hover:translate-x-0.5 transition-all shrink-0" />
+      </button>
+    );
+  };
+
   return (
     <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar pb-10">
-      <div className="space-y-8 max-w-4xl mx-auto">
+      <div className="space-y-8 max-w-5xl mx-auto">
         {/* Title Section */}
       <div className="space-y-2">
         <h2 className="text-3xl font-extrabold text-gray-900 tracking-tight">어떤 영상을 만들고 싶으세요?</h2>
         <p className="text-gray-500 font-medium">주제나 대본을 입력하면 구조화를 도와드립니다.</p>
       </div>
-      
-      <div className="space-y-6">
-        {/* Template Select */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <button
-            onClick={() => setTemplateId(templateId === 'news_solo' ? 'news_solo' : 'news_duo')}
-            className={`flex items-center gap-3 p-4 rounded-xl border-2 text-left transition-all ${
-              isNews
-                ? 'border-indigo-500 bg-indigo-50/60 shadow-md shadow-indigo-100'
-                : 'border-gray-200 bg-white hover:border-gray-300'
-            }`}
-          >
-            <div className={`p-2 rounded-lg ${isNews ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-500'}`}>
-              <Users size={18} />
-            </div>
-            <div>
-              <p className={`text-sm font-bold ${isNews ? 'text-indigo-700' : 'text-gray-700'}`}>뉴스 / 이슈 브리핑</p>
-              <p className="text-[11px] text-gray-400 font-medium">기사 URL로 대본 생성</p>
-            </div>
-          </button>
-          <button
-            onClick={() => setTemplateId('shorts_lab')}
-            className={`flex items-center gap-3 p-4 rounded-xl border-2 text-left transition-all ${
-              isShortsLab
-                ? 'border-indigo-500 bg-indigo-50/60 shadow-md shadow-indigo-100'
-                : 'border-gray-200 bg-white hover:border-gray-300'
-            }`}
-          >
-            <div className={`p-2 rounded-lg ${isShortsLab ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-500'}`}>
-              <Clapperboard size={18} />
-            </div>
-            <div>
-              <p className={`text-sm font-bold ${isShortsLab ? 'text-indigo-700' : 'text-gray-700'}`}>숏폼 분석·재창작</p>
-              <p className="text-[11px] text-gray-400 font-medium">파일/유튜브 분석 후 패턴으로 새로 만들기</p>
-            </div>
-          </button>
-        </div>
 
-        {isShortsLab && (
-          <div className="flex items-center gap-1.5 flex-wrap">
-            {SHORTS_CATEGORIES.map((c) => {
-              const Icon = c.icon;
-              const active = shortsCategory === c.id;
-              return (
-                <button
-                  key={c.id}
-                  onClick={() => setShortsCategory(c.id)}
-                  title={c.desc}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${active ? 'bg-indigo-50 border-indigo-200 text-indigo-600' : 'bg-white border-gray-100 text-gray-400'}`}
-                >
-                  <Icon size={14} />
-                  {c.name}
-                </button>
-              );
-            })}
+      <div className="space-y-6">
+        {phase === 'pick' ? (
+          /* 1단계: 동일 비율 2열. 좌=숏폼 4장 세로 쌓기 / 우=롱폼+가져오기 2장 세로 쌓기 */
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+            <div className="space-y-2.5">
+              <div className="flex items-center gap-2 h-6">
+                <span className="px-2 py-0.5 rounded-md bg-gray-900 text-white text-[10px] font-black tracking-wide">쇼츠 9:16</span>
+                <span className="text-xs font-bold text-gray-400">짧고 강한 한 편</span>
+              </div>
+              <div className="flex flex-col gap-3">
+                {SHORTS_CARDS.map(renderPickCard)}
+              </div>
+            </div>
+            <div className="flex flex-col gap-4">
+              <div className="space-y-2.5">
+                <div className="flex items-center gap-2 h-6">
+                  <span className="px-2 py-0.5 rounded-md bg-gray-900 text-white text-[10px] font-black tracking-wide">롱폼 16:9</span>
+                  <span className="text-xs font-bold text-gray-400">깊이 있는 한 편</span>
+                </div>
+                {renderPickCard(LONGFORM_CARD)}
+              </div>
+              <div className="space-y-2.5">
+                <div className="flex items-center gap-2 h-6">
+                  <span className="px-2 py-0.5 rounded-md bg-gray-200 text-gray-600 text-[10px] font-black tracking-wide">가져오기</span>
+                  <span className="text-xs font-bold text-gray-400">있는 영상을 분석해서 새로 만들기</span>
+                </div>
+                {renderPickCard(ANALYZE_CARD)}
+              </div>
+            </div>
+          </div>
+        ) : (
+          /* 2단계: 선택된 카테고리 표시 + 변경 */
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPhase('pick')}
+              title="카테고리 다시 선택"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold border border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700 transition-all"
+            >
+              <ArrowLeft size={14} />
+              카테고리 변경
+            </button>
+            {pickedCard && (
+              <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-indigo-50 border border-indigo-200 text-indigo-600">
+                <pickedCard.icon size={14} />
+                {pickedCard.name}
+              </span>
+            )}
           </div>
         )}
 
+        {phase === 'input' && (
+          <div className="space-y-6">
         {isNews && (
           <div className="flex items-center gap-1.5">
             {NEWS_SUBMODES.map((m) => (
@@ -164,7 +221,7 @@ const Step1Input: React.FC<Step1InputProps> = ({
           </div>
         )}
 
-        {isShortsLab ? (
+        {(isShortsLab ? (
           <ShortsLab
             onComplete={onShortsComplete}
             mode={shortsMode}
@@ -177,11 +234,17 @@ const Step1Input: React.FC<Step1InputProps> = ({
             setReport={setShortsReport}
             topic={shortsTopic}
             setTopic={setShortsTopic}
-            duration={shortsDuration}
-            setDuration={setShortsDuration}
+            duration={duration}
+            setDuration={setDuration}
             category={shortsCategory}
             setCategory={setShortsCategory}
             onDirectCreate={onShortsDirectCreate}
+            onAutoMake={() => onAutoMake('shorts')}
+            recipePreset={recipePreset}
+            setRecipePreset={setRecipePreset}
+            scriptId={scriptId}
+            sourceRef={shortsReference}
+            setSourceRef={setShortsReference}
           />
         ) : (
         <>
@@ -251,50 +314,15 @@ const Step1Input: React.FC<Step1InputProps> = ({
           )}
         </div>
 
-        {/* Bottom Action Bar */}
+        {/* Bottom Action Bar (영상 길이는 상단 제작 설정에서 정함) */}
         <div className="flex flex-wrap items-center justify-between gap-4 pt-4 border-t border-gray-50">
           <div className="text-xs font-bold text-gray-300 tabular-nums">
             {inputType === 'text' ? `${directText.length} / 7,200 자` : 'URL 분석 대기 중'}
           </div>
-          
-          <div className="flex items-center gap-3 ml-auto">
-              <div className="flex items-center gap-1.5 mr-2">
-                {[
-                  { label: '30초', value: 30 },
-                  { label: '1분', value: 60 },
-                  { label: '3분', value: 180 },
-                  { label: '5분', value: 300 },
-                  { label: '10분', value: 600 },
-                  { label: '15분', value: 900 }
-                ].map((preset) => (
-                  <button
-                    key={preset.value}
-                    onClick={() => setDuration(preset.value)}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all border ${
-                      duration === preset.value 
-                        ? 'bg-indigo-50 border-indigo-200 text-indigo-600' 
-                        : 'bg-white border-gray-100 text-gray-400 hover:border-gray-200 hover:text-gray-600'
-                    }`}
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
 
-              <div className="flex items-center gap-2 bg-white px-3 py-2 rounded-xl border border-gray-200" aria-label="영상 길이(초)">
-                <Clock size={16} className="text-gray-400" />
-                <input 
-                  type="number" 
-                  value={duration}
-                  onChange={(e) => setDuration(parseInt(e.target.value) || 0)}
-                  placeholder="초"
-                  title="영상 길이(초)"
-                  className="w-14 bg-transparent text-sm font-bold text-gray-700 outline-none"
-                />
-                <span className="text-xs font-bold text-gray-400">초 분량 대본 생성</span>
-              </div>
-            
-            <button 
+          <div className="flex items-center gap-3 ml-auto">
+            <span className="text-xs font-bold text-gray-400 tabular-nums">{duration}초 분량 대본 생성</span>
+            <button
               onClick={handleScrape}
               disabled={(inputType === 'url' ? !url : !directText.trim()) || loading}
               className="flex items-center gap-2 px-6 py-2.5 bg-indigo-600 text-white rounded-xl font-bold text-sm hover:bg-indigo-700 disabled:bg-gray-200 shadow-lg shadow-indigo-100 transition-all"
@@ -302,9 +330,29 @@ const Step1Input: React.FC<Step1InputProps> = ({
               <Sparkles size={16} />
               대본 생성하기
             </button>
+            <button
+              onClick={() => onAutoMake('news')}
+              disabled={(inputType === 'url' ? !url : !directText.trim()) || loading}
+              title="대본부터 최종 영상까지 자동으로 만듭니다 (첫 후보 자동 선택)"
+              className="flex items-center gap-2 px-6 py-2.5 bg-amber-500 text-white rounded-xl font-bold text-sm hover:bg-amber-600 disabled:bg-gray-200 shadow-lg shadow-amber-100 transition-all"
+            >
+              <Zap size={16} />
+              자동으로 끝까지 만들기
+            </button>
           </div>
         </div>
         </>
+        ))}
+          </div>
+        )}
+        {phase === 'pick' && (
+          <div className="flex items-center gap-3 pt-2">
+            <div className="flex-1 h-px bg-gray-100" />
+            <p className="text-xs text-gray-400 font-medium whitespace-nowrap">
+              만들 영상 종류를 먼저 고르면 입력 화면이 나타납니다
+            </p>
+            <div className="flex-1 h-px bg-gray-100" />
+          </div>
         )}
       </div>
     </div>

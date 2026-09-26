@@ -58,9 +58,21 @@ async def check_login_and_setup(crawler, settings):
 async def get_news_content(url, cancel_check=None):
     """
     URL에서 뉴스 본문을 마크다운 형식으로 추출합니다.
+    0차 시도: 네이버 블로그 전용 추출 (JS 껍데기 우회, PostView 직접 요청)
     1차 시도: Crawl4AI (Playwright 기반)
     2차 시도: Requests + BeautifulSoup (백업)
     """
+    # 0. 네이버 블로그: 본문이 iframe/JS로 로드되므로 PostView를 직접 요청
+    if 'blog.naver.com' in url:
+        try:
+            blog_text = _scrape_naver_blog(url)
+            if blog_text and len(blog_text.strip()) > 200:
+                print("Naver blog scraping success")
+                return blog_text
+            print("Naver blog scraping too short, fallback to generic flow...")
+        except Exception as e:
+            print(f"Naver blog scraping failed: {e}. Fallback to generic flow...")
+
     # 1. Domain-specific selectors (requests first for speed & precision)
     # Crawl4AI often captures sidebars/footers which confuses the AI.
     # So we try requests + precise selectors first for known major news sites.
@@ -236,11 +248,98 @@ async def get_news_content(url, cancel_check=None):
         print(f"Fallback scraping failed: {e}")
         return None
 
+
+def _scrape_naver_blog(url):
+    """네이버 블로그 본문 추출 (동기, requests 전용).
+
+    blog.naver.com 페이지는 JS 껍데기라 본문이 iframe에 있다.
+    PostView.naver를 직접 요청하면 서버 렌더된 본문을 받을 수 있다.
+    반환: "# 제목\\n\\n본문" 또는 None.
+    """
+    import re as _re
+    from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Referer': 'https://blog.naver.com/',
+    }
+
+    blog_id, log_no = None, None
+    parsed = _urlparse(url)
+    qs = _parse_qs(parsed.query)
+    if qs.get('blogId') and qs.get('logNo'):
+        blog_id, log_no = qs['blogId'][0], qs['logNo'][0]
+    else:
+        m = _re.search(r'blog\.naver\.com/([^/?#]+)/(\d+)', url)
+        if m:
+            blog_id, log_no = m.group(1), m.group(2)
+    if not blog_id or not log_no:
+        return None
+
+    candidates = [
+        f"https://blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}",
+        f"https://m.blog.naver.com/PostView.naver?blogId={blog_id}&logNo={log_no}",
+    ]
+    title, body_text = "", ""
+    for target in candidates:
+        try:
+            resp = requests.get(target, headers=headers, timeout=12)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, 'html.parser')
+
+            # 제목: 스마트에디터 제목 → 구에디터 제목 → og:title → title 태그 순
+            if not title:
+                for sel in ('.se-title-text', '.pcol1 .htitle span', '.post_tit', '.tit_h3'):
+                    el = soup.select_one(sel)
+                    if el and el.get_text(strip=True):
+                        title = el.get_text(strip=True)
+                        break
+            if not title:
+                og = soup.select_one('meta[property="og:title"]')
+                if og and og.get('content'):
+                    title = og['content'].strip()
+            if not title:
+                t = soup.find('title')
+                if t and t.get_text(strip=True):
+                    title = t.get_text(strip=True)
+            title = _re.sub(r'\s*:\s*네이버 블로그\s*$', '', title or '').strip()
+
+            # 본문: 스마트에디터 → 구에디터 순
+            body_el = (
+                soup.select_one('.se-main-container')
+                or soup.select_one('#postViewArea')
+                or soup.select_one('#postListBody')
+                or soup.select_one('.post-body')
+            )
+            if body_el:
+                for tag in body_el.select('script, style, iframe'):
+                    tag.decompose()
+                body_text = body_el.get_text(separator="\n", strip=True)
+            if body_text and len(body_text.strip()) > 200:
+                break
+        except Exception as e:
+            print(f"Naver blog candidate failed ({target}): {e}")
+            continue
+
+    body_text = (body_text or '').strip()
+    if len(body_text) <= 200:
+        return None
+    # 이미지 설명 등 빈 줄 정리 + 제로폭/제어문자 제거
+    body_text = _re.sub(r'[\u200b\u200c\u200d\ufeff\x00-\x08\x0b\x0c\x0e-\x1f]', '', body_text)
+    lines = [ln.strip() for ln in body_text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return f"# {title or '네이버 블로그 레시피'}\n\n" + "\n".join(lines)
+
+
 if __name__ == "__main__":
     # Test the scraper
     async def main():
-        url = "https://n.news.naver.com/article/215/0001242516"  # Example URL
-        content = await get_news_content(url)
+        test_url = "https://n.news.naver.com/article/215/0001242516"  # Example URL
+        content = await get_news_content(test_url)
         if content:
             print(content[:500])
 

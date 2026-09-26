@@ -11,7 +11,10 @@ import json
 import os
 import re
 
-import google.generativeai as genai
+try:
+    from .llm import configure as _llm_configure, get_model as _llm_model
+except (ImportError, ValueError):
+    from llm import configure as _llm_configure, get_model as _llm_model
 
 try:
     from .config_utils import load_config, get_asset_dir
@@ -20,8 +23,12 @@ except (ImportError, ValueError):
 
 try:
     from .generator import _convert_storyboard_items
+    from .generator import MIN_DURATION_RATIO as _MIN_RATIO
+    from .generator import MAX_DURATION_RATIO as _MAX_RATIO
 except (ImportError, ValueError):
     from generator import _convert_storyboard_items
+    from generator import MIN_DURATION_RATIO as _MIN_RATIO
+    from generator import MAX_DURATION_RATIO as _MAX_RATIO
 try:
     from .templates import get_template
 except (ImportError, ValueError):
@@ -75,29 +82,98 @@ def _get_api_key():
     return api_key, config
 
 
+def _strip_fences(t):
+    """코드펜스/설명 텍스트를 걷어내고 가장 바깥 JSON 블록만 뽑는다."""
+    t = (t or "").strip()
+    if not t:
+        return ""
+    # ```json ... ``` 또는 ``` ... ```
+    if "```" in t:
+        import re as _re_f
+        m = _re_f.search(r"```(?:json)?\s*(.*?)```", t, _re_f.S)
+        if m:
+            t = m.group(1)
+    t = t.strip()
+    # 설명이 앞/뒤에 붙으면 첫 '{' ~ 마지막 '}' 사이만 본다.
+    a = t.find("{")
+    b = t.rfind("}")
+    if a != -1 and b > a:
+        t = t[a:b + 1]
+    return t.strip()
+
+
+def _repair_json_text(t):
+    """LLM이 자주 틀리는 JSON 문법을 순서대로 고친다(원본 훼손 없음)."""
+    import re as _re_r
+    prev = None
+    while prev != t:
+        prev = t
+        # 트레일링 콤마: {"a":1,} / [1,2,]
+        t = _re_r.sub(r",\s*([}\]])", r"\1", t)
+        # 문자열 바깥의 스마트 따옴표 → 일반 따옴표
+        t = t.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    # 파이썬 리터럴 → JSON
+    t = _re_r.sub(r"\bNone\b", "null", t)
+    t = _re_r.sub(r"\bTrue\b", "true", t)
+    t = _re_r.sub(r"\bFalse\b", "false", t)
+    # 따옴표 없는 키: {section: "HOOK"} → {"section": "HOOK"}
+    t = _re_r.sub(r'([{,\[]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', t)
+    # 문자열 내부의 실제 개행 → \n (JSON에서 제어문자는 무효)
+    def _fix_ctrl(m):
+        body = m.group(1).replace("\r", "").replace("\n", "\\n").replace("\t", "\\t")
+        return '"' + body + '"'
+    t = _re_r.sub(r'"((?:[^"\\]|\\.)*)"', _fix_ctrl, t, flags=_re_r.S)
+    return t
+
+
 def _parse_json_response(text):
-    t = (text or "").strip()
-    if t.startswith("```json"):
-        t = t[7:]
-    elif t.startswith("```"):
-        t = t[3:]
-    if t.endswith("```"):
-        t = t[:-3]
-    return json.loads(t.strip())
+    """엄격 json.loads 1회 → 코드펜스 제거 → 다층 수리 순으로 시도."""
+    raw = _strip_fences(text)
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    for fixer in (lambda s: s, _repair_json_text):
+        cand = fixer(raw)
+        try:
+            return json.loads(cand)
+        except Exception as e:
+            last = e
+    # 마지막 resort: 오류 위치 주변을 로그로 남겨 원인을 볼 수 있게 한다.
+    try:
+        json.loads(_repair_json_text(raw))
+    except Exception as e:
+        pos = getattr(e, "pos", None)
+        if isinstance(pos, int):
+            ctx = raw[max(0, pos - 120):pos + 120]
+            print(f"[Shorts JSON] 최종 파싱 실패: {e}")
+            print(f"[Shorts JSON] 문제가 있던 구간: ...{ctx}...")
+    raise ValueError(f"JSON 파싱 실패 (응답 길이 {len(raw)}자)")
 
 
 # storyboard 아이템으로 인정하는 키. 이 중 하나도 없으면 스키마 위반으로 재시도.
 _KNOWN_ITEM_KEYS = ("narration_ko", "text", "voice_script", "voice", "subtitle_ko")
 
 
-def _call_storyboard_json(model, prompt, what="대본"):
-    """LLM 호출 + JSON 파싱 + 스키마 검증을 최대 2회 시도한다."""
+def _call_storyboard_json(model, prompt, what="대본", max_attempts=3):
+    """LLM 호출 + JSON 파싱 + 스키마 검증.
+
+    재시도마다 출력 크기를 줄여 실제로 성공률을 올린다.
+    - 1회차: 원본 프롬프트
+    - 2회차: 'JSON만' 재강조
+    - 3회차: 장면 수를 강제로 줄여 JSON이 작아지도록 유도
+      (파싱 실패는 대체로 큰 storyboard 배열의 문법 오류에서 난다)
+    """
     last_err = ""
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         try:
             p = prompt
-            if attempt > 0:
+            if attempt == 1:
                 p = prompt + "\n반드시 유효한 JSON만 출력하라. 키 이름은 예시와 정확히 같아야 한다. 설명·마크다운 금지."
+            elif attempt >= 2:
+                p = (prompt + "\n반드시 유효한 JSON만 출력하라. 설명·마크다운 금지."
+                     "\n문법 오류가 났다. 마지막 콤마(,)를 절대 쓰지 말고 모든 문자열에 큰따옴표를 붙여라."
+                     "\n이번엔 장면을 최대한 적게(3개 이내) 써서 JSON을 짧게 만들어라.")
             result_json = _parse_json_response(model.generate_content(p).text)
             items = result_json.get("storyboard", []) or []
             usable = [it for it in items if isinstance(it, dict) and any(k in it for k in _KNOWN_ITEM_KEYS)]
@@ -145,8 +221,8 @@ def analyze_upload(file_bytes, mime_type, hint=""):
         raise ValueError("File is empty or exceeds 100MB.")
 
     api_key, _ = _get_api_key()
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(_analysis_model())
+    _llm_configure(api_key=api_key)
+    model = _llm_model(_analysis_model())
 
     is_video = mime_type.startswith("video/")
     kind = "숏폼 영상" if is_video else "이미지"
@@ -263,8 +339,8 @@ def analyze_youtube(url):
     transcript = fetch_transcript(video_id)
     stats = fetch_youtube_stats(video_id, config.get("youtube_api_key"))
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(_analysis_model())
+    _llm_configure(api_key=api_key)
+    model = _llm_model(_analysis_model())
     prompt = f"""
     아래는 유튜브 숏폼 레퍼런스의 수집 데이터이다. 영상 파일은 없으므로 자막+메타데이터로 분석하라.
     수치가 없으면(stats 없음) 반응 이유를 지어내지 말고 '수치 미확인'이라 명시하라.
@@ -306,11 +382,17 @@ def _compact_reference(reference_summary):
     return "\n".join(keep)
 
 
-def create_from_pattern(reference_summary, new_topic, duration=40, category="recipe_short"):
+def create_from_pattern(reference_summary, new_topic, duration=40, category="recipe_short",
+                        format_id=None, style_id=None, platform_id=None, script_id=None, hook_id=None,
+                        preset_id=None, tone_id=None, structure_id=None, cta_id=None):
     """분석 리포트의 성공 패턴을 새 주제에 적용해 풀 패키지 생성.
 
     반환: 제목 + Hook Idea + 톤앤매너 + 해시태그 + 섹션 구조 스토리보드.
     shape은 /generate와 호환 (script/scenes/total_duration/target_duration).
+
+    recipe_short + format 지정 시 모듈형 프롬프트(recipe_prompts.py:
+    CORE + FORMAT + STYLE + VISUAL + OUTPUT + PLATFORM 조합)를 사용한다.
+    그 외 카테고리는 기존 templates.py 지침을 그대로 사용한다.
     """
     if not new_topic or not new_topic.strip():
         raise ValueError("새 주제를 입력하세요.")
@@ -318,11 +400,37 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
         duration = int(duration or 40)
     except (TypeError, ValueError):
         duration = 40
-    duration = max(15, min(duration, 180))
+    # 포맷 결정: 길이(제작 설정)가 유일한 진실.
+    # format_id 미지정/'auto'면 길이로 자동결정, 스냅(강제 target 맞춤)은 하지 않는다.
+    # 포맷은 장면 구조용, 목표 시간은 duration 그대로 프롬프트에 전달한다.
+    _recipe_fmt = None
+    if category == "recipe_short":
+        try:
+            from .recipe_prompts import get_format as _get_fmt, resolve_format_for_duration as _resolve_fmt
+        except (ImportError, ValueError):
+            from recipe_prompts import get_format as _get_fmt, resolve_format_for_duration as _resolve_fmt
+        _fid = (format_id or '').strip() if isinstance(format_id, str) else format_id
+        if not _fid or _fid == 'auto':
+            _fid = _resolve_fmt(duration)
+            print(f"[Shorts Format] duration {duration}s → 포맷 자동결정: {_fid} (스냅 없음)")
+        _recipe_fmt = _get_fmt(_fid)
+        try:
+            _hi = int(_recipe_fmt["max_sec"])
+        except (TypeError, ValueError, KeyError):
+            _hi = 330
+        duration = max(15, min(duration, _hi + 300))
+    else:
+        duration = max(15, min(duration, 180))
     topic = new_topic.strip()
 
     # 40초 기준 최소 6씬, 씬당 4~8초. 3줄 요약으로 끝나지 못하게 하한 강제.
-    min_scenes = max(5, min(12, duration // 7))
+    # 모듈형 포맷 지정 시 포맷의 장면 수 범위를 따른다.
+    if _recipe_fmt:
+        _pace = 7 if _recipe_fmt["target_sec"] <= 90 else 12
+        min_scenes = max(_recipe_fmt["scene_min"],
+                         min(_recipe_fmt["scene_max"], duration // _pace))
+    else:
+        min_scenes = max(5, min(12, duration // 7))
 
     # 카테고리 프리셋 (templates.py): 지침 + 섹션 구조를 여기서 공급
     template = get_template(category)
@@ -350,9 +458,9 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
         numeric_rule = "통계·연구 수치는 확정 팩트에 있는 것만 인용하라"
 
     api_key, _ = _get_api_key()
-    genai.configure(api_key=api_key)
+    _llm_configure(api_key=api_key)
     # 대본 생성은 지시 이행력이 중요 → workhorse 모델 사용 (분석용 lite와 분리)
-    model = genai.GenerativeModel(_workhorse_model())
+    model = _llm_model(_workhorse_model())
     # 근거 없을 때는 표준 패턴으로 (분석 스킵 '바로 만들기' 경로)
     pattern_text = _compact_reference(reference_summary)
     if not pattern_text:
@@ -378,7 +486,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     fact_lines = extract_fact_sentences(evidence, limit=12)
     facts_text = ""
     if fact_lines:
-        lite = genai.GenerativeModel(_analysis_model())
+        lite = _llm_model(_analysis_model())
         fact_prompt = (
             f"주제 '{topic}'의 레시피/제작 정보를 아래 문장에서 뽑아 JSON만 출력하라.\n"
             '{"ingredients": [{"name": "재료명", "amount": "분량"}], '
@@ -398,6 +506,46 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     extra_block = ""
     if extra_instructions:
         extra_block = "[사용자 추가 지시 - 카테고리 지침보다 최우선 적용]\n    " + extra_instructions
+    # 모듈형 프롬프트 (recipe_short + 포맷 지정 시): 기존 단일 지침을
+    # CORE + FORMAT + STYLE + VISUAL + OUTPUT + PLATFORM 조합으로 대체한다.
+    # 명시 파라미터 > 저장된 프리셋 > 기본값 순으로 style/platform을 결정한다.
+    modular_block = ""
+    category_instructions = template["instructions"]
+    resolved_axes = None
+    if _recipe_fmt:
+        try:
+            from .recipe_prompts import compose_recipe_prompt, resolve_recipe_axes
+        except (ImportError, ValueError):
+            from recipe_prompts import compose_recipe_prompt, resolve_recipe_axes
+        try:
+            _preset_cfg = load_config().get("recipe_prompt_preset") or {}
+        except Exception:
+            _preset_cfg = {}
+        _pid = preset_id or _preset_cfg.get("preset") or "random"
+        _hook = hook_id or _preset_cfg.get("hook") or "random"
+        _tone = tone_id or _preset_cfg.get("tone") or None
+        _struct = structure_id or _preset_cfg.get("structure") or None
+        _cta = cta_id or _preset_cfg.get("cta") or None
+        # 재생성·수리 프롬프트에서도 같은 축을 쓰도록 확정해 둔다.
+        resolved_axes = resolve_recipe_axes(_pid, _hook, _tone, _struct, _cta)
+        modular_block = compose_recipe_prompt(
+            format_id=_recipe_fmt["id"],
+            style_id=style_id or _preset_cfg.get("style") or "realistic",
+            platform_id=platform_id or _preset_cfg.get("platform") or "youtube",
+            hook_id=_hook,
+            target_sec=duration,
+            preset_id=_pid,
+            tone_id=_tone,
+            structure_id=_struct,
+            cta_id=_cta,
+        )
+        category_instructions = ""
+    # SCRIPT 레이어: 카테고리별 대본 포맷 (recipe 모듈과 독립적으로 동작, 전 카테고리 적용)
+    try:
+        from .script_formats import format_block as _script_block
+    except (ImportError, ValueError):
+        from script_formats import format_block as _script_block
+    script_block = _script_block(script_id) if script_id else ""
     prompt = f"""
     [선택된 카테고리: {template_name}]
     {role_intro}
@@ -413,6 +561,8 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     3. 섹션 구성 (순서 고정, section 값은 아래 영문 태그 그대로):
 {sections_spec}
        - MAIN이 여러 개면 같은 태그를 반복 사용해도 된다.
+       - 섹션 태그는 분류용 표식일 뿐이다. HOOK 다음에 곧바로 STEP이 와도 된다.
+         실제로 사람이 읽는 대본의 서술 순서는 아래 [최종 적용] 블록의 '서술 순서'를 따른다.
     4. visual.keyword는 반드시 한국어 명사구(예: "된장찌개 끓는 냄비")로 장면 주제를 설명하고,
        description은 영어 B-roll 묘사(AI 생성용). keyword에 'blank sign'이나 이미지 지시어를 쓰지 마라.
     5. 간판·자막 문구를 읽을 수 있게 쓰지 마라 (필요시 description 안에서만 blank sign으로 묘사).
@@ -456,8 +606,10 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     {(evidence_block[:800] + '...') if facts_text and len(evidence_block) > 800 else (evidence_block if evidence_block else '(근거 없음)')}
 
     [카테고리 전용 지침 - 위 일반 규칙보다 우선 적용]
-    {template["instructions"]}
+    {category_instructions}
     {extra_block}
+    {modular_block}
+    {script_block}
 
     [확정 팩트 - 대본의 모든 수치는 이 목록에서만 가져와라, 목록 외 수치는 절대 지어내지 마라]
     {facts_text if facts_text else '(확정 팩트 없음 - 아래 규칙을 따를 것)'}
@@ -492,7 +644,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
             t += (calculate_duration(tx) if tx else min(max(float(it.get("duration_sec") or 3), 1.0), 15.0)) + 0.5
         return t
 
-    if _total(items) < duration * 0.7 and len(items) < 15:
+    if _total(items) < duration * _MIN_RATIO and len(items) < 15:
         last = "\n".join(f"- {i.get('section', '')}: {i.get('text', '')}" for i in items[-3:])
         ext_prompt = f"""
         위 대본은 {len(items)}개 장면으로 목표 {duration}초에 못 미친다.
@@ -515,60 +667,176 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     if not script_list:
         raise ValueError("모델 응답에 유효한 장면이 없습니다. 다시 생성을 눌러주세요.")
 
-    # 수치 검증 + 1회 수리: HOOK/CTA/INGREDIENTS 제외하고 숫자 없는 장면이 있으면 확정 팩트로 고침
-    if facts_text:
-        import re as _re2
-        bare = [i for i, s in enumerate(script_list)
-                if (scene_guide_list[i].get("section", "") not in ("HOOK", "CTA", "INGREDIENTS"))
-                and not _re2.search(r"\d", (s.get("text", "") or "") + " " + (s.get("subtitle", "") or ""))]
-        if bare:
-            print(f"[Shorts Repair] {len(bare)} scenes lack numbers, repairing once...")
-            numbered = "\n".join(
-                f"{i + 1}. [{scene_guide_list[i].get('section', '')}] {s.get('text', '')}"
-                for i, s in enumerate(script_list)
-            )
-            repair_prompt = f"""
-            아래 {len(script_list)}개 장면 대본 중 숫자 없는 장면을 확정 팩트 수치로 고쳐라.
-            구조·순서·섹션은 그대로 두고 대사 텍스트만 수정, 전체를 같은 JSON 스키마
-            (title/hook_idea/tone_and_manner/hashtags/storyboard)로 다시 출력하라.
-            storyboard 아이템 키는 section/speaker/narration_ko/subtitle_ko/sfx/duration_sec/visual 만 사용하라.
-            확정 팩트 외의 새 수치를 지어내지 마라.
+    # 계량 검증: (1) 숫자 아예 없음  (2) 숫자는 있는데 단위가 없음 ('국간장 1과', '통깨 0.5')
+    _EXEMPT_SEC = ("HOOK", "CTA", "INGREDIENTS")
+    _UNIT_AFTER = (
+        r"^\s*(?:/\s*\d+(?:\.\d+)?\s*)?"
+        r"(?:g|kg|ml|L|㎖|큰술|작은술|중술|스푼|티스푼|tablespoon|teaspoon|컵|공기|인분|쪽|개|장|대|모|알|통|봉지|팩|병|그릇|접시|냄비|분|초|도|도금|번|가지|뭉치|T|S)"
+    )
+    import re as _re2
+    _no_num, _no_unit = [], []
+    for i, s in enumerate(script_list):
+        if (scene_guide_list[i].get("section", "") or "").upper() in _EXEMPT_SEC:
+            continue
+        txt = (s.get("text", "") or "") + " " + (s.get("subtitle", "") or "")
+        nums = list(_re2.finditer(r"\d+(?:\.\d+)?", txt))
+        if not nums:
+            _no_num.append(i)
+            continue
+        good = sum(1 for m in nums if _re2.match(_UNIT_AFTER, txt[m.end():]))
+        if good == 0:
+            _no_unit.append(i)
 
-            [확정 팩트]
-            {facts_text[:1500]}
+    # 확정 팩트가 없으면 없는 숫자를 지어낼 수 없으므로 단위 누락만 고친다.
+    _need_fix = _no_unit + (_no_num if facts_text else [])
+    numbered = "\n".join(
+        f"{i + 1}. [{scene_guide_list[i].get('section', '')}] {s.get('text', '')}"
+        for i, s in enumerate(script_list)
+    )
+
+    if _need_fix:
+        _why = []
+        if _no_num and facts_text:
+            _why.append(f"숫자 없는 장면 {len(_no_num)}개 → 확정 팩트 수치 삽입")
+        if _no_unit:
+            _why.append(f"단위 없는 장면 {len(_no_unit)}개 → 단위 첨부")
+        print(f"[Shorts Repair] {len(_need_fix)} scenes need unit/measure fix ({'; '.join(_why)})...")
+        repair_prompt = f"""
+        아래 {len(script_list)}개 장면 대본에서 계량 문제를 고쳐라.
+        - 숫자가 아예 없는 장면: 확정 팩트 수치를 넣어라.
+        - 숫자는 있는데 단위가 빠진 장면: 반드시 단위를 붙여라
+          (나쁜 예: '국간장 1과', '버터 2를', '통깨 0.5를' → '국간장 1큰술', '버터 2큰술', '통깨 0.5큰술').
+          단위는 g, ml, 큰술, 작은술, 스푼, 컵, 개, 장, 대, 통, 분, 초, 도만 사용한다.
+          분량을 지어내지 말고, 모르면 확정 팩트에 있는 값만 쓴다.
+        구조·순서·섹션·문체는 그대로 두고 대사 텍스트만 수정,
+        전체를 같은 JSON 스키마(title/hook_idea/tone_and_manner/hashtags/storyboard)로 다시 출력하라.
+        storyboard 아이템 키는 section/speaker/narration_ko/subtitle_ko/sfx/duration_sec/visual 만 사용하라.
+
+        [확정 팩트]
+        {(facts_text[:1500]) if facts_text else '(확정 팩트 없음)'}
+
+        [현재 대본]
+        {numbered}
+        """
+        try:
+            rep_json = _call_storyboard_json(model, repair_prompt, what="repair")
+            rep_items = rep_json.get("storyboard", [])
+            if rep_items and len(rep_items) == len(items):
+                _rs, _rg, _rt = _convert_storyboard_items(rep_items, 0, 0, allow_empty_text=True)
+                if _rs:
+                    items = rep_items
+                    result_json = rep_json
+                    script_list, scene_guide_list, current_time = _rs, _rg, _rt
+                    print("[Shorts Repair] applied.")
+                else:
+                    print("[Shorts Repair] skipped (repair returned empties, keeping original).")
+            else:
+                print("[Shorts Repair] skipped (shape mismatch).")
+        except Exception as rep_e:
+            print(f"[Shorts Repair] failed: {rep_e}")
+
+    # 톤/구조 준수 검사 + 1회 재생성.
+    # 프롬프트로만 지시하면 LLM이 늘 평서문으로 돌아가므로, 기계적으로 잡아낸다.
+    if resolved_axes:
+        try:
+            from .recipe_prompts import check_tone_compliance, style_enforce_block
+        except (ImportError, ValueError):
+            from recipe_prompts import check_tone_compliance, style_enforce_block
+        _narr = [(s.get("text") or "") for s in script_list]
+        _viol = check_tone_compliance(_narr, resolved_axes["tone"], resolved_axes["structure"])
+        if _viol:
+            print(f"[Shorts Tone] {len(_viol)} violation(s), rewriting once: {_viol}")
+            # 전체 JSON을 다시 받으면 스키마/장면수가 드리프트해 버려진다(실측).
+            # 대사 텍스트만 JSON 배열로 받아 기존 장면에 이식한다.
+            # 장면 수·타임라인·섹션·비주얼이 그대로 유지되고 응답도 훨씬 짧다.
+            indexed = "\n".join(
+                f"{i + 1}. {s.get('text', '') or ''}" for i, s in enumerate(script_list)
+            )
+            tone_prompt = f"""
+            아래 {len(script_list)}개 줄은 각 장면의 대사다. 이 대사만 지정된 문체·구조로 고쳐라.
+
+            현재 위반:
+            {chr(10).join('- ' + v for v in _viol)}
+
+            {style_enforce_block(resolved_axes)}
+
+            규칙:
+            - 계량 수치(숫자+단위)는 그대로 두고 문체와 서술 순서만 고친다. 새 수치를 지어내지 마라.
+            - 대사 길이는 원래와 비슷한 길이로 유지한다.
+            - 빈 문자열로 만들지 마라.
+
+            반드시 JSON 배열로만 출력하라. 설명·마크다운·코드펜스 금지.
+            배열 길이는 정확히 {len(script_list)}개여야 하며, 각 원소는 해당 장면의 새 대사다.
 
             [현재 대본]
-            {numbered}
+            {indexed}
             """
             try:
-                rep_json = _call_storyboard_json(model, repair_prompt, what="repair")
-                rep_items = rep_json.get("storyboard", [])
-                if rep_items and len(rep_items) == len(items):
-                    _rs, _rg, _rt = _convert_storyboard_items(rep_items, 0, 0, allow_empty_text=True)
-                    if _rs:
-                        items = rep_items
-                        result_json = rep_json
-                        script_list, scene_guide_list, current_time = _rs, _rg, _rt
-                        print("[Shorts Repair] applied.")
+                tone_txt = model.generate_content(tone_prompt).text
+                new_narr = _parse_json_response(tone_txt)
+                if isinstance(new_narr, dict):
+                    new_narr = new_narr.get("narrations") or new_narr.get("list") or []
+                if isinstance(new_narr, list) and len(new_narr) == len(script_list) \
+                        and all(isinstance(x, str) and x.strip() for x in new_narr):
+                    for _i, _txt in enumerate(new_narr):
+                        script_list[_i]["text"] = _txt.strip()
+                    _still = check_tone_compliance([(s.get("text") or "") for s in script_list],
+                                                  resolved_axes["tone"], resolved_axes["structure"])
+                    if _still:
+                        print(f"[Shorts Tone] still violating after rewrite, keeping rewrite "
+                              f"({len(_still)} left): {_still}")
                     else:
-                        print("[Shorts Repair] skipped (repair returned empties, keeping original).")
+                        print("[Shorts Tone] applied.")
                 else:
-                    print("[Shorts Repair] skipped (shape mismatch).")
-            except Exception as rep_e:
-                print(f"[Shorts Repair] failed: {rep_e}")
-    # 섹션 정보 유지 (Step2 뱃지 표시용)
+                    _got = len(new_narr) if isinstance(new_narr, list) else type(new_narr).__name__
+                    print(f"[Shorts Tone] skipped (expected {len(script_list)} strings, got {_got}).")
+            except Exception as tone_e:
+                print(f"[Shorts Tone] failed: {tone_e}")
+        else:
+            print("[Shorts Tone] compliant.")
+    # 섹션 정보 유지 (Step2 뱃지 표시용, section/type 둘 다 허용)
     for sc, it in zip(scene_guide_list, items):
-        sec = (it.get("section") or "").strip().upper()
+        sec = (it.get("section") or it.get("type") or "").strip().upper()
         if sec:
             sc["section"] = sec
-    # visual.keyword 유실/오염 시 주제어로 폴백
-    for sc in scene_guide_list:
-        kw = (sc.get("keyword") or "").strip()
+    # visual.keyword/description 유실·오염 시 씬별 폴백 (전 씬 동일 문구 금지)
+    # 섹션별 영문 장면 묘사로 differentiated fallback 생성
+    _SEC_EN = {
+        'HOOK': 'finished dish appetizing close-up',
+        'INGREDIENTS': 'ingredients laid out on table',
+        'PREP': 'hands preparing ingredients on cutting board',
+        'HEAT': 'heating cookware on stove',
+        'CORE': 'main cooking in progress',
+        'SEASONING': 'adding seasoning to dish',
+        'PLATING': 'plating the finished dish',
+        'TASTE': 'tasting the finished dish',
+        'CTA': 'finished dish presentation',
+    }
+
+    def _short_ko(t, n=20):
+        t = (t or '').strip()
+        if len(t) <= n:
+            return t
+        cut = t[:n].rsplit(' ', 1)
+        return cut[0] if len(cut) > 1 and cut[0] else t[:n]
+
+    for _fi, sc in enumerate(scene_guide_list):
+        _it = items[_fi] if _fi < len(items) and isinstance(items[_fi], dict) else {}
+        _sec = str(sc.get('section') or '').strip().upper()
+        _narr = str(_it.get('narration_ko') or _it.get('text') or '').strip()
+        kw = (sc.get('keyword') or '').strip()
         if not kw or kw == "news" or kw.lower() in (
             'blank sign', 'blank signs', 'blank', 'no text', 'textless',
             'blank labels', 'no readable text',
         ):
-            sc["keyword"] = topic[:20]
+            # 해당 장면 대사의 앞부분을 키워드로 (씬마다 달라짐)
+            sc["keyword"] = _short_ko(_narr) or topic[:20]
+        desc = (sc.get("description") or '').strip()
+        if not desc or desc == "news" or desc == kw:
+            # 섹션별 영문 묘사 + 키워드로 씬마다 다른 프롬프트 복구
+            _en = _SEC_EN.get(_sec, 'cooking scene in progress')
+            fixed_kw = (sc.get("keyword") or topic[:20]).strip()
+            sc["description"] = f"{_en}, {fixed_kw} cooking, steam rising, photorealistic food photography"
 
     out = {
         "grounded": bool(evidence_block),
@@ -586,9 +854,9 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
         "total_duration": round(current_time, 1),
         "target_duration": duration,
     }
-    if current_time < duration * 0.7:
+    if current_time < duration * _MIN_RATIO:
         out["warning"] = f"요청 {duration}초 중 약 {current_time:.0f}초 분량만 생성되었습니다. 다시 생성을 눌러 보완하세요."
-    elif current_time > duration * 1.15:
+    elif current_time > duration * _MAX_RATIO:
         out["warning"] = f"요청 {duration}초를 초과해 약 {current_time:.0f}초 분량이 생성되었습니다. 대본을 줄이거나 다시 생성하세요."
     print(f"[Shorts Create] {len(script_list)} scenes, {current_time:.1f}s / target {duration}s.")
     return out
@@ -689,8 +957,8 @@ def refine_scene(scene, clips, topic="", category="recipe_short"):
         raise ValueError("다듬기에 쓸 클립이 없습니다. 클립을 1개 이상 선택하세요.")
 
     api_key, _ = _get_api_key()
-    genai.configure(api_key=api_key)
-    vision = genai.GenerativeModel(_analysis_model())
+    _llm_configure(api_key=api_key)
+    vision = _llm_model(_analysis_model())
 
     clip_notes = []
     for i, c in enumerate(clips):
@@ -709,7 +977,7 @@ def refine_scene(scene, clips, topic="", category="recipe_short"):
         desc = summary or note or "(분석 생략: 원격 파일)"
         clip_notes.append(f"클립{i + 1} [{source or '?'}]: {desc}")
 
-    workhorse = genai.GenerativeModel(_workhorse_model())
+    workhorse = _llm_model(_workhorse_model())
     scene_sec = scene.get("section", "")
     scene_text = scene.get("text", "")
     scene_sub = scene.get("subtitle", "")

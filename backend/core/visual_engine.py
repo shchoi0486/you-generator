@@ -16,6 +16,11 @@ except (ImportError, ValueError):
     from assets_downloader import clean_keyword
 
 try:
+    from . import media_cache
+except (ImportError, ValueError):
+    import media_cache
+
+try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
@@ -25,13 +30,12 @@ try:
     import pollinations
 except ImportError:
     pollinations = None
-    print("Warning: 'pollinations' module not found. AI generation might be limited.")
+    # HTTP 폴백(generate_image_pollinations)이 있으므로 기능 제한 없음
 
 try:
-    import fal_client
+    import fal_client  # noqa: F401 (향후 fal.ai 영상 연동용으로 유지)
 except ImportError:
     fal_client = None
-    print("Warning: 'fal-client' module not found. Paid Flux generation will be disabled.")
 
 import yaml
 import matplotlib.pyplot as plt
@@ -44,6 +48,7 @@ ASPECT_RATIOS = {
     "16:9 (Youtube)": (1280, 720),
     "9:16 (Shorts)": (720, 1280),
     "1:1 (Square)": (1024, 1024),
+    "3:4 (Portrait)": (768, 1024),
     "4:3 (Classic)": (1024, 768),
     "21:9 (Ultrawide)": (1536, 640)
 }
@@ -179,16 +184,26 @@ def search_web_image(keyword, cancel_check=None):
     return None
 
 
-async def search_web_images_list(keyword, count=5, engine="bing", cancel_check=None):
+async def search_web_images_list(keyword, count=5, engine="bing", cancel_check=None, use_cache=True, refresh=False):
     """
     빙과 덕덕고 엔진을 사용하여 최소 count개의 이미지 URL을 수집합니다.
     이미 정제된 키워드가 들어올 경우(부정어 포함) 그대로 사용합니다.
+    캐시: (엔진, 검색어, 개수) 키로 URL 목록 재사용. refresh=True면 새로 검색.
     """
     if cancel_check and cancel_check():
         raise InterruptedError("User requested cancellation")
 
     print(f"Searching web images list for: {keyword} using {engine}")
     results = []
+
+    # 캐시 조회 (URL 목록 재사용 — 다운로드/검색 비용 절감)
+    cache_key = ""
+    if use_cache and not refresh:
+        cache_key = media_cache.make_key(engine, keyword, count)
+        cached = media_cache.get("search", cache_key)
+        if isinstance(cached, list) and len(cached) >= count:
+            print(f"[Search] cache hit ({len(cached)} urls)")
+            return cached[:count]
 
     # [수정] 이미 정제된 키워드(부정어 '-' 포함)가 들어오는 경우, 추가 정제 없이 그대로 사용
     if " -" in keyword:
@@ -320,8 +335,11 @@ async def search_web_images_list(keyword, count=5, engine="bing", cancel_check=N
         if url not in seen:
             unique_results.append(url)
             seen.add(url)
-            
-    return unique_results[:count]
+
+    out = unique_results[:count]
+    if use_cache and cache_key and len(out) >= count:
+        media_cache.put("search", cache_key, out)
+    return out
 
 def _clean_prompt_text(text):
     if not text:
@@ -1498,8 +1516,9 @@ def download_visual_content(scene, index, output_dir=None, cancel_check=None):
     return None
 
 
-def search_pexels_videos(keyword, count=4):
-    """Pexels 스톡 비디오 검색 → mp4 로컬 다운로드. [{url, path, preview}]"""
+def search_pexels_videos(keyword, count=4, use_cache=True, refresh=False):
+    """Pexels 스톡 비디오 검색 → mp4 로컬 다운로드. [{url, path, preview}]
+    캐시: (쿼리, 개수) 키로 결과 재사용. 파일명은 URL 해시라 중복 다운로드 없음."""
     config = load_config()
     img_conf = config.get("image_gen", {})
     api_key = img_conf.get("pexels_api_key")
@@ -1508,6 +1527,16 @@ def search_pexels_videos(keyword, count=4):
 
     preview_base = os.path.join(get_asset_dir(), "previews", "stock")
     os.makedirs(preview_base, exist_ok=True)
+
+    stock_key = ""
+    if use_cache and not refresh:
+        stock_key = media_cache.make_key(keyword, count)
+        cached = media_cache.get("stock", stock_key)
+        if isinstance(cached, list) and cached and all(
+            isinstance(v, dict) and os.path.exists(v.get("path", "")) for v in cached
+        ):
+            print(f"[Pexels] cache hit ({len(cached)} videos)")
+            return cached
 
     def _query(q):
         resp = requests.get(
@@ -1533,7 +1562,6 @@ def search_pexels_videos(keyword, count=4):
         videos = _query(en_q)
 
     results = []
-    import time as _t
     for idx, v in enumerate(videos[:count]):
         files = [f for f in (v.get("video_files") or []) if (f.get("link") or "").endswith(".mp4")]
         if not files:
@@ -1544,24 +1572,26 @@ def search_pexels_videos(keyword, count=4):
             dl = requests.get(pick["link"], timeout=60)
             if dl.status_code != 200 or len(dl.content) < 50000:
                 continue
-            # 씬이 달라도 같은 초에 저장하면 파일명이 겹쳐 덮어써지므로 uuid 포함
-            fname = f"stock_{int(_t.time())}_{idx}_{uuid.uuid4().hex[:6]}.mp4"
-            path = os.path.join(preview_base, fname)
-            with open(path, "wb") as f:
-                f.write(dl.content)
+            # URL 해시 파일명: 같은 영상은 한 번만 저장 (씬 달라도 재사용)
+            path = media_cache.hashed_media_path("stock", pick["link"], "mp4")
+            if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                with open(path, "wb") as f:
+                    f.write(dl.content)
             rel = os.path.relpath(path, get_asset_dir())
             results.append({
                 "url": f"/assets/{rel.replace(os.sep, '/')}",
                 "path": path,
                 "preview": v.get("image", ""),
             })
-            print(f"[Pexels] Saved {fname} ({len(dl.content)//1024}KB)")
+            print(f"[Pexels] Saved {os.path.basename(path)} ({len(dl.content)//1024}KB)")
         except Exception as e:
             print(f"[Pexels] Download failed: {e}")
+    if stock_key and results:
+        media_cache.put("stock", stock_key, results)
     return results
 
 
-async def generate_scene_candidates(scene, index, project_id="default", ai_count=1, search_count=5, generate_ai=True, generate_search=True, width=1280, height=720, style="", ai_model="pollinations", search_engine="bing", topic="", visual_guide="", cancel_check=None, category=""):
+async def generate_scene_candidates(scene, index, project_id="default", ai_count=1, search_count=5, generate_ai=True, generate_search=True, width=1280, height=720, style="", ai_model="pollinations", search_engine="bing", topic="", visual_guide="", cancel_check=None, category="", use_cache=True, refresh=False):
     """
     UI 미리보기용으로 AI 후보(ai_count)와 검색 후보(search_count)를 생성/수집하여 반환합니다.
     """
@@ -1626,11 +1656,17 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
         for i in range(ai_count):
             if cancel_check and cancel_check():
                 raise InterruptedError("User requested cancellation")
+            refined = refine_ai_prompt(description, keyword, style, model=selected_ai_model, category=vcat, mood=scene.get('mood', ''))
+            ai_key = media_cache.make_key(selected_ai_model, refined, width, height)
+            if use_cache and not refresh:
+                hit = media_cache.get("ai", ai_key)
+                if isinstance(hit, str) and os.path.exists(hit):
+                    print(f"[AI] cache hit scene {index}")
+                    candidates['ai'].append(hit)
+                    continue
             # 파일명에 시드나 랜덤값을 추가하여 갱신 시 새로운 이미지가 보이도록 유도
             seed = random.randint(1, 1000000)
             path = os.path.join(preview_dir, f"scene_{index}_ai_{i}_{seed}.jpg")
-
-            refined = refine_ai_prompt(description, keyword, style, model=selected_ai_model, category=vcat, mood=scene.get('mood', ''))
 
             res = None
             if selected_ai_model == "pollinations":
@@ -1666,6 +1702,8 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
                 res = generate_image_pollinations(refined, path, seed=seed, width=width, height=height)
 
             if res:
+                if use_cache:
+                    media_cache.put("ai", ai_key, res)
                 candidates['ai'].append(res)
             else:
                  print(f"Failed to generate AI image for scene {index}, iteration {i} (All methods failed)")
@@ -1681,6 +1719,7 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             if kw_list:
                 raw_keyword = str(kw_list[0])
         desc = scene.get('description', '') or ''
+        desc_clean = re.sub(r'^Montage:\s*', '', desc, flags=re.I)
 
         # [수정] generic topic(기본 프로젝트명 등)은 검색어 오염원이므로 무시
         GENERIC_TOPICS = {'새 프로젝트', '프로젝트', '새프로젝트', 'new project', 'untitled', 'project', 'test', '제목 없음'}
@@ -1867,7 +1906,7 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
         print(f"[Search] Enhanced search query for scene {index}: {search_keyword} using {search_engine}")
         
         # [수정] 한국어/영어 모두 구글을 기본으로, 사용자 요청에 따라 정제된 키워드 사용
-        res_list = await search_web_images_list(search_keyword, count=search_count, engine=search_engine, cancel_check=cancel_check)
+        res_list = await search_web_images_list(search_keyword, count=search_count, engine=search_engine, cancel_check=cancel_check, use_cache=use_cache, refresh=refresh)
 
         # Download the images to local preview dir
         for idx, img_url in enumerate(res_list):
@@ -1884,14 +1923,14 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
                 elif "data:image/png" in img_url: ext = "png"
                 elif "data:image/webp" in img_url: ext = "webp"
 
-                import time
-                import uuid
-                
-                # Use timestamp and short UUID for uniqueness to avoid browser caching
-                unique_id = f"{int(time.time())}_{uuid.uuid4().hex[:4]}"
-                path = os.path.join(preview_dir, f"scene_{index}_search_{idx}_{unique_id}.{ext}")
+                # URL 해시 기반 경로: 같은 이미지는 한 번만 다운로드
+                path = media_cache.hashed_media_path(f"scene_{project_id}", img_url, ext)
 
                 print(f"[Search] Processing candidate {idx} for scene {index}: {img_url[:60]}...")
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    print(f"[Search] file cache hit scene {index}")
+                    candidates['search'].append(path)
+                    continue
                 
                 if img_url.startswith("data:image/"):
                     # Handle Base64 image

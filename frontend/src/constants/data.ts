@@ -8,13 +8,41 @@ export const customStyles = `
     50% { transform: translateX(0%); width: 60%; }
     100% { transform: translateX(100%); width: 30%; }
   }
+  @keyframes subFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes subSlideUp {
+    from { opacity: 0; transform: translateY(14px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes subTyping {
+    from { width: 0; }
+    to { width: 100%; }
+  }
+  @keyframes subPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
 `;
 
 export const subtitlePresets = {
-  youtube: { label: 'YouTube Standard', font_size: 20, color: 'white', stroke_color: 'black', stroke_width: 2.0, bg_color: 'transparent' },
-  news: { label: 'News / Documentary', font_size: 16, color: 'white', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(0,0,0,0.7)' },
-  cinematic: { label: 'Cinematic', font_size: 14, color: '#ffffaa', stroke_color: 'transparent', stroke_width: 0, bg_color: 'transparent' },
-  neon: { label: 'Neon Glow', font_size: 22, color: '#00ffff', stroke_color: '#ff00ff', stroke_width: 3.0, bg_color: 'transparent' }
+  // 상단 자막(CAPTION_PRESETS)의 '기본'과 동일한 스타일 — 하단 초기값을 상단에 맞춘다.
+  default: { label: '기본', font_size: 20, color: '#FFD76A', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(0,0,0,0.45)' },
+  youtube: { label: '유튜브', font_size: 20, color: 'white', stroke_color: 'black', stroke_width: 2.0, bg_color: 'transparent' },
+  shorts_bold: { label: '숏츠볼드', font_size: 26, color: '#FFFFFF', stroke_color: '#000000', stroke_width: 3.0, bg_color: 'transparent' },
+  impact: { label: '임팩트', font_size: 24, color: '#FDE047', stroke_color: 'black', stroke_width: 2.5, bg_color: 'transparent' },
+  news: { label: '뉴스', font_size: 16, color: 'white', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(0,0,0,0.7)' },
+  lowerthird: { label: '로워서드', font_size: 15, color: '#FFFFFF', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(0,0,0,0.65)' },
+  highlight: { label: '하이라이트', font_size: 18, color: '#111111', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(253,224,71,0.92)' },
+  paper: { label: '페이퍼', font_size: 17, color: '#18181B', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(255,255,255,0.95)' },
+  keyword: { label: '키워드', font_size: 20, color: '#FDE047', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(0,0,0,0.8)' },
+  neon: { label: '네온', font_size: 22, color: '#00FFFF', stroke_color: '#FF00FF', stroke_width: 3.0, bg_color: 'transparent' },
+  ice: { label: '아이스', font_size: 18, color: '#BAE6FD', stroke_color: '#0C4A6E', stroke_width: 1.5, bg_color: 'rgba(12,74,110,0.75)' },
+  cinematic: { label: '시네마', font_size: 15, color: '#F5F0E6', stroke_color: 'transparent', stroke_width: 0, bg_color: 'transparent', font: 'Garamond' },
+  mono: { label: '타이핑', font_size: 17, color: '#E7E5E4', stroke_color: 'transparent', stroke_width: 0, bg_color: 'rgba(0,0,0,0.55)', animation: 'typing' },
+  retro: { label: '레트로', font_size: 18, color: '#FFE8C2', stroke_color: '#7C2D12', stroke_width: 1.5, bg_color: 'transparent' },
+  minimal: { label: '미니멀', font_size: 16, color: 'white', stroke_color: 'transparent', stroke_width: 0, bg_color: 'transparent' }
 };
 
 export const bgmLibrary = [
@@ -65,6 +93,23 @@ export const voiceOptions = {
     { label: '인준 (남성 - 하이텐션, Edge)', value: 'ko-KR-InJoonNeural', lang: 'ko' },
     { label: '선히 (여성 - 차분함, Edge)', value: 'ko-KR-SunHiNeural', lang: 'ko' },
     { label: '현수 (남성 - 중후함, Edge)', value: 'ko-KR-HyunsuMultilingualNeural', lang: 'ko' },
+  ],
+  minimax: [
+    { label: '청서 (남성, MiniMax)', value: 'male-qn-qingse', lang: 'ko' },
+    { label: '소녀 (여성, MiniMax)', value: 'female-shaonv', lang: 'ko' },
+    { label: '천미 (여성, MiniMax)', value: 'female-tianmei', lang: 'ko' },
+    { label: '징서 (남성, MiniMax)', value: 'male-qn-jingse', lang: 'ko' },
+    { label: '치우린 (여성, MiniMax)', value: 'female-qn-qiulin', lang: 'ko' },
+  ],
+  elevenlabs: [
+    { label: 'Rachel (여성, ElevenLabs)', value: '21m00Tcm4TlvDq8ikWAM', lang: 'ko' },
+    { label: 'Sarah (여성, ElevenLabs)', value: 'EXAVITQu4vr4xnSDxMaL', lang: 'ko' },
+    { label: 'Adam (남성, ElevenLabs)', value: 'pNInz6obpgDQGcFmaJgB', lang: 'ko' },
+    { label: 'Antoni (남성, ElevenLabs)', value: 'ErXwobaYiN019PkySvjV', lang: 'ko' },
+    { label: 'Elli (여성, ElevenLabs)', value: 'MF3mGyEYCl7XYWbNljVVD', lang: 'ko' },
+    { label: 'Domi (여성, ElevenLabs)', value: 'AZnzlk1XvdvUeBnXmlld', lang: 'ko' },
+  ],
+  typecast: [
   ],
   qwen: [
     { label: '소희 (여성, 따뜻함 - Qwen 추천)', value: 'sohee', lang: 'ko' },

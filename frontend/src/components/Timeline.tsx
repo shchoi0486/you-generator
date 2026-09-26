@@ -44,6 +44,54 @@ interface TimelineItemProps {
   isSplitMode?: boolean;
 }
 
+/** 내레이션 오디오 파형 (WebAudio 디코딩 → 피크 막대) */
+const Waveform: React.FC<{ src?: string }> = ({ src }) => {
+  const [peaks, setPeaks] = useState<number[]>([]);
+  useEffect(() => {
+    if (!src) { setPeaks([]); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(src);
+        const buf = await res.arrayBuffer();
+        const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const ctx = new AC();
+        const audio = await ctx.decodeAudioData(buf);
+        const ch = audio.getChannelData(0);
+        const N = 160;
+        const out: number[] = [];
+        const step = Math.max(1, Math.floor(ch.length / N));
+        for (let i = 0; i < N; i++) {
+          let m = 0;
+          const s = i * step;
+          for (let j = s; j < Math.min(s + step, ch.length); j += 11) {
+            const v = Math.abs(ch[j]);
+            if (v > m) m = v;
+          }
+          out.push(m);
+        }
+        if (!cancelled) setPeaks(out);
+        void ctx.close();
+      } catch {
+        if (!cancelled) setPeaks([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [src]);
+  if (peaks.length === 0) return null;
+  return (
+    <div className="w-full h-full flex items-center gap-[1px] px-1" title="내레이션 파형">
+      {peaks.map((p, i) => (
+        <div
+          key={i}
+          className="flex-1 min-w-[1px] bg-indigo-300/80 rounded-full"
+          style={{ height: `${Math.max(8, Math.round(p * 100))}%` }}
+        />
+      ))}
+    </div>
+  );
+};
+
 const TimelineItem: React.FC<TimelineItemProps & { isSplitMode?: boolean }> = ({
   start,
   duration,
@@ -272,9 +320,10 @@ interface TimelineProps {
     sfx_list: { path: string; time: number; volume: number }[];
   }>>;
   getTimelineRange: (script: ScriptItem[] | undefined, idx: number) => { start: string; end: string; duration: string };
-  selectedItem: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' } | null;
-  setSelectedItem: (item: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' } | null) => void;
-  onDelete: (id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm') => void;
+  selectedItem: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' | 'sticker' } | null;
+  setSelectedItem: (item: { id: string | number; type: 'subtitle' | 'scene' | 'sfx' | 'bgm' | 'caption' | 'sticker' } | null) => void;
+  onDelete: (id?: string | number, type?: 'subtitle' | 'sfx' | 'bgm' | 'sticker') => void;
+  audioUrl?: string;
 }
 
 const Timeline: React.FC<TimelineProps> = ({
@@ -299,7 +348,8 @@ const Timeline: React.FC<TimelineProps> = ({
   getTimelineRange,
   selectedItem,
   setSelectedItem,
-  onDelete
+  onDelete,
+  audioUrl
 }) => {
   const [zoom, setZoom] = useState(100); // pixels per second (Increased default zoom)
   const [headerWidth, setHeaderWidth] = useState(144); // Track header width
@@ -1062,6 +1112,17 @@ const Timeline: React.FC<TimelineProps> = ({
                 top: '24px'
               }}
             />
+
+            {/* Narration Waveform */}
+            {audioUrl && (
+              <div
+                className="relative h-9 border-b border-zinc-200 bg-zinc-50/60"
+                style={{ width: `${Math.max(maxTimelineDuration * zoom, 200)}px` }}
+                title="내레이션 파형"
+              >
+                <Waveform src={audioUrl} />
+              </div>
+            )}
 
             {/* Tracks Content Area */}
             <div className="relative pt-0">

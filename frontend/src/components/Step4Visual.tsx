@@ -19,7 +19,8 @@ import {
   Edit2,
   Save,
   Upload,
-  Film
+  Film,
+  Download
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -42,12 +43,13 @@ interface Step4VisualProps {
   setVisualCandidates: React.Dispatch<React.SetStateAction<Record<number, SceneCandidates>>>;
   isGeneratingAll: boolean;
   generationProgress: { current: number; total: number };
+  activeTask: 'ai' | 'search' | 'stock' | 'all' | null;
   stopGeneration: () => void;
   selectedAiModel: string;
   setSelectedAiModel: (model: string) => void;
   fetchAllCandidates: (force?: boolean) => void;
-  fetchAllByType: (type: 'ai' | 'search' | 'stock') => void;
-  fetchCandidates: (index: number, type?: 'all' | 'ai' | 'search', model?: string, isAppend?: boolean, customKeyword?: string) => void;
+  fetchAllByType: (type: 'ai' | 'search' | 'stock', force?: boolean) => void;
+  fetchCandidates: (index: number, type?: 'all' | 'ai' | 'search', model?: string, isAppend?: boolean, customKeyword?: string, refresh?: boolean) => void;
   editingSceneIndex: number | null;
   setEditingSceneIndex: (index: number | null) => void;
   editSceneValues: { keyword: string; description: string };
@@ -58,7 +60,7 @@ interface Step4VisualProps {
   setZoomedImage: (url: string | null) => void;
   handleMoveToEdit: () => void;
   fetchingIndices: Set<string>;
-  stockFetchRef?: React.MutableRefObject<((idx: number, silent?: boolean) => Promise<void>) | null>;
+  stockFetchRef?: React.MutableRefObject<((idx: number, silent?: boolean, force?: boolean) => Promise<void>) | null>;
   onRefineApply?: (idx: number, r: { narration_ko?: string; subtitles?: Array<{ text: string; start: number; end: number }>; sfx?: string }) => void;
   getSceneDuration?: (idx: number) => number;
   clipTrims: Record<number, Record<string, { in: number; out: number | null }>>;
@@ -80,6 +82,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
   setVisualCandidates,
   isGeneratingAll,
   generationProgress,
+  activeTask,
   stopGeneration,
   selectedAiModel,
   setSelectedAiModel,
@@ -131,12 +134,16 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
   );
   const [refineOpen, setRefineOpen] = React.useState(false);
   const [refineLoading, setRefineLoading] = React.useState(false);
+  const [stockProgress, setStockProgress] = React.useState({ current: 0, total: 0 });
+  // 확대 모달의 미디어 종류 (URL 확장자 판별 대신 아이템 기준으로 판단)
+  const [zoomKind, setZoomKind] = React.useState<'video' | 'image'>('image');
+  const closeZoom = () => { setZoomedImage(null); };
   const [refineResult, setRefineResult] = React.useState<RefineResult | null>(null);
   const [refineError, setRefineError] = React.useState<string | null>(null);
 
   const fullUrl = (u: string) => assetUrl(u);
 
-  const fetchStockFor = async (idx: number, silent: boolean = false) => {
+  const fetchStockFor = async (idx: number, silent: boolean = false, force: boolean = false) => {
     const scene = content.scenes[idx];
     const base = (scene?.stock_query || scene?.keyword || '').trim();
     // stock_query가 없으면 description 첫 구절을 덧붙여 씬별 고유 쿼리로 만듦
@@ -144,10 +151,12 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
       ? scene.description.split(',')[0].slice(0, 60).trim() : '');
     const kw = `${base} ${descHead}`.trim();
     if (!kw) return;
-    if (!silent && fetchingStock) return;
+    // 이미 결과가 있으면 건너뜀 (중복 수집 방지). 강제 새로고침이 아닐 때만.
+    if (!force && (extraMedia[idx] || []).length > 0) return;
+    if (fetchingStock) return;
     if (!silent) setFetchingStock(true);
     try {
-      const data = await api.getStockVideos(kw, 4);
+      const data = await api.getStockVideos(kw, 4, force);
       const vids: StockVideo[] = (data?.videos || []).map((v: StockVideo) => ({ ...v, kind: 'video', source: 'stock' }));
       if (vids.length > 0) {
         setExtraMedia((prev) => {
@@ -174,12 +183,15 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
   const fetchStock = async () => {
     if (fetchingStock) return;
     setFetchingStock(true);
+    setStockProgress({ current: 0, total: content.scenes.length });
     try {
       for (let i = 0; i < content.scenes.length; i++) {
-        await fetchStockFor(i, true);
+        await fetchStockFor(i, true, true);
+        setStockProgress({ current: i + 1, total: content.scenes.length });
       }
     } finally {
       setFetchingStock(false);
+      setStockProgress({ current: 0, total: 0 });
     }
   };
 
@@ -249,7 +261,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
       setSelectedVisuals((prev) => {
         const cur = prev[activeSceneIndex] || [];
         if (cur.length >= 3 || cur.includes(data.url)) return prev;
-        if (!canAddClip(activeSceneIndex, cur.length)) return prev;
+        if (!canAddClip(activeSceneIndex, cur.length, minSecFor(activeSceneIndex, data.url))) return prev;
         return { ...prev, [activeSceneIndex]: [...cur, data.url] };
       });
     } catch (e) {
@@ -271,13 +283,27 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
     }
   };
 
-  const canAddClip = (idx: number, currentLen: number): boolean => {
+  // 클립당 최소 노출 시간: 이미지 2.5초 / 영상 1.5초 (시청자 인지 기준)
+  // 씬 길이는 오디오(SRT) 기준 고정이라 균등 분할한다.
+  // 기준 미달이면 막지 않고 B-roll식 빠른 전환로 쓸지 사용자에게 확인한다.
+  const canAddClip = (idx: number, currentLen: number, minSec: number = MIN_CLIP_SECONDS): boolean => {
     const dur = sceneDurationFor(idx);
-    if (dur > 0 && dur / (currentLen + 1) < MIN_CLIP_SECONDS) {
-      alert(`씬 길이(${dur.toFixed(1)}초)로는 클립당 최소 ${MIN_CLIP_SECONDS}초가 안 나옵니다.`);
-      return false;
+    if (dur > 0 && dur / (currentLen + 1) < minSec) {
+      const per = (dur / (currentLen + 1)).toFixed(1);
+      return window.confirm(
+        `씬 길이(${dur.toFixed(1)}초)에 클립을 추가하면 클립당 ${per}초로 짧아집니다.\n` +
+        `나레이션은 그대로 두고 화면만 빠르게 전환하는 B-roll 연출로 사용하시겠습니까?`
+      );
     }
     return true;
+  };
+
+  const isVideoUrl = (u: string) => /\.(mp4|webm|mov)(\?|$)/i.test(u);
+  // 씬에 영상이 하나라도 섞이면 영상 기준(1.5초), 아니면 이미지 기준(2.5초)
+  const minSecFor = (idx: number, newUrl?: string): number => {
+    const urls = [...(selectedVisuals[idx] || [])];
+    if (newUrl && !urls.includes(newUrl)) urls.push(newUrl);
+    return urls.some((u) => isVideoUrl(u)) ? 1.5 : 2.5;
   };
 
   const moveClip = (idx: number, url: string, dir: -1 | 1) => {
@@ -311,7 +337,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
               alert('한 장면당 최대 3개까지 선택할 수 있습니다.');
               return prev;
             }
-            if (!canAddClip(activeSceneIndex, current.length)) return prev;
+            if (!canAddClip(activeSceneIndex, current.length, minSecFor(activeSceneIndex, item.url))) return prev;
             return {
               ...prev,
               [activeSceneIndex]: [...current, item.url],
@@ -364,35 +390,74 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
             </button>
           </div>
         )}
+        {/* Action Buttons (이미지 검색 카드와 동일: 삭제 + 크게 보기) */}
+        <div className="absolute inset-x-2 bottom-2 flex items-center justify-between opacity-0 group-hover:opacity-100 transition-all duration-300 translate-y-1 group-hover:translate-y-0 z-20">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setExtraMedia((prev) => ({
+                ...prev,
+                [activeSceneIndex]: (prev[activeSceneIndex] || []).filter((m) => m.url !== item.url),
+              }));
+              setSelectedVisuals((prev) => ({
+                ...prev,
+                [activeSceneIndex]: (prev[activeSceneIndex] || []).filter((u) => u !== item.url),
+              }));
+            }}
+            className="p-1.5 bg-red-500/80 hover:bg-red-500 backdrop-blur-md text-white rounded-lg transition-all hover:scale-110 border border-white/10 shadow-lg"
+            title="삭제"
+          >
+            <Trash2 size={12} />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setZoomKind(item.kind === 'video' ? 'video' : 'image');
+              setZoomedImage(fullUrl(item.url));
+            }}
+            className="p-1.5 bg-black/40 hover:bg-black/60 backdrop-blur-md text-white rounded-lg transition-all hover:scale-110 border border-white/10 shadow-lg"
+            title="크게 보기"
+          >
+            <Maximize size={12} />
+          </button>
+        </div>
         {isSelected && isVideo && (
           <div
             className="absolute bottom-1.5 left-1.5 flex items-center gap-1 z-20 bg-black/60 rounded-md px-1.5 py-0.5"
             onClick={(e) => e.stopPropagation()}
-            title="영상 시작/종료 지점(초)"
+            title="원본 영상에서 사용할 구간 (시작~종료, 초)"
           >
+            <span className="text-white/60 text-[9px] font-bold">시작</span>
             <input
               type="number" min={0} step={0.5}
               value={clipTrims[activeSceneIndex]?.[item.url]?.in ?? 0}
               onChange={(e) => {
                 const v = Math.max(0, parseFloat(e.target.value) || 0);
-                setClipTrims((prev) => ({
-                  ...prev,
-                  [activeSceneIndex]: {
-                    ...(prev[activeSceneIndex] || {}),
-                    [item.url]: { in: v, out: prev[activeSceneIndex]?.[item.url]?.out ?? null },
-                  },
-                }));
+                setClipTrims((prev) => {
+                  const cur = prev[activeSceneIndex]?.[item.url];
+                  const out = cur?.out ?? null;
+                  return {
+                    ...prev,
+                    [activeSceneIndex]: {
+                      ...(prev[activeSceneIndex] || {}),
+                      // 종료점이 시작점보다 짧아지지 않게 보정
+                      [item.url]: { in: v, out: out != null && out <= v ? v + 0.5 : out },
+                    },
+                  };
+                });
               }}
               className="w-9 bg-transparent text-white text-[9px] font-bold outline-none"
             />
             <span className="text-white/60 text-[9px]">~</span>
+            <span className="text-white/60 text-[9px] font-bold">종료</span>
             <input
               type="number" min={0} step={0.5}
               value={clipTrims[activeSceneIndex]?.[item.url]?.out ?? ''}
               placeholder="끝"
               onChange={(e) => {
                 const raw = e.target.value;
-                const v = raw === '' ? null : Math.max(0, parseFloat(raw) || 0);
+                const curIn = clipTrims[activeSceneIndex]?.[item.url]?.in ?? 0;
+                const v = raw === '' ? null : Math.max(curIn + 0.5, parseFloat(raw) || 0);
                 setClipTrims((prev) => ({
                   ...prev,
                   [activeSceneIndex]: {
@@ -403,6 +468,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
               }}
               className="w-9 bg-transparent text-white text-[9px] font-bold outline-none placeholder:text-white/40"
             />
+            <span className="text-white/60 text-[9px] font-bold">초</span>
           </div>
         )}
       </div>
@@ -434,20 +500,18 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
           <div className="h-4 w-px bg-gray-200 mx-1"></div>
           
           <div className="flex items-center gap-3">
-            {isGeneratingAll ? (
-              <div className="flex items-center gap-3 bg-indigo-50 px-3 py-1.5 rounded-xl border border-indigo-100/50">
-                <div className="flex items-center gap-2">
-                  <div className="w-24 h-1.5 bg-indigo-100 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-indigo-600 transition-all duration-500"
-                      style={{ width: `${generationProgress.total > 0 ? (generationProgress.current / generationProgress.total) * 100 : 0}%` }}
-                    />
-                  </div>
-                  <span className="text-[9px] font-black text-indigo-600">
-                    {generationProgress.total > 0 ? Math.round((generationProgress.current / generationProgress.total) * 100) : 0}%
-                  </span>
+            {isGeneratingAll && (
+              <div className="flex items-center gap-2 bg-indigo-50 px-2.5 py-1.5 rounded-xl border border-indigo-100/50 shrink-0">
+                <div className="w-16 h-1.5 bg-indigo-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-600 transition-all duration-500"
+                    style={{ width: `${generationProgress.total > 0 ? (generationProgress.current / generationProgress.total) * 100 : 0}%` }}
+                  />
                 </div>
-                <button 
+                <span className="text-[9px] font-black text-indigo-600 tabular-nums">
+                  {generationProgress.total > 0 ? Math.round((generationProgress.current / generationProgress.total) * 100) : 0}%
+                </span>
+                <button
                   onClick={stopGeneration}
                   className="p-1 text-red-500 hover:bg-red-50 rounded-lg transition-all"
                   title="생성 중단"
@@ -455,9 +519,8 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                   <X size={14} />
                 </button>
               </div>
-            ) : (
-              <>
-                <div className="flex items-center gap-2 mr-2">
+            )}
+            <div className="flex items-center gap-2 mr-2">
                   <select 
                     value={selectedAiModel}
                     onChange={(e) => setSelectedAiModel(e.target.value)}
@@ -474,34 +537,42 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                   </select>
                 </div>
 
-                {/* 소스별 전체 수집 아이콘 버튼 */}
+                {/* 소스별 전체 수집 아이콘 버튼 (각 버튼에 진행률 표시, 화면 가리지 않음) */}
                 <div className="flex items-center gap-1.5">
                   <button
-                    onClick={() => fetchAllByType('ai')}
-                    title="모든 장면 AI 이미지 생성"
+                    onClick={() => fetchAllByType('ai', true)}
+                    title="모든 장면 AI 이미지 새로 생성"
                     className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-indigo-200 text-indigo-600 hover:border-indigo-300 hover:bg-indigo-50 bg-white whitespace-nowrap"
                   >
-                    <Sparkles size={14} />
-                    AI
+                    <Sparkles size={14} className={(activeTask === 'ai' || activeTask === 'all') && isGeneratingAll ? 'animate-spin' : ''} />
+                    AI {(activeTask === 'ai' || activeTask === 'all') && isGeneratingAll && generationProgress.total > 0
+                      ? `${Math.round((generationProgress.current / generationProgress.total) * 100)}%`
+                      : ''}
                   </button>
 
                   <button
-                    onClick={() => fetchAllByType('search')}
-                    title="모든 장면 웹 이미지 검색"
+                    onClick={() => fetchAllByType('search', true)}
+                    title="모든 장면 웹 이미지 새로 검색"
                     className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-sky-200 text-sky-600 hover:border-sky-300 hover:bg-sky-50 bg-white whitespace-nowrap"
                   >
-                    <Search size={14} />
-                    이미지
+                    <Search size={14} className={(activeTask === 'search' || activeTask === 'all') && isGeneratingAll ? 'animate-spin' : ''} />
+                    이미지 {(activeTask === 'search' || activeTask === 'all') && isGeneratingAll && generationProgress.total > 0
+                      ? `${Math.round((generationProgress.current / generationProgress.total) * 100)}%`
+                      : ''}
                   </button>
 
                   <button
                     onClick={fetchStock}
                     disabled={fetchingStock}
-                    title="모든 장면 키워드로 스톡 비디오 검색"
+                    title="모든 장면 스톡 비디오 새로 검색"
                     className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition-all border border-emerald-200 text-emerald-600 hover:border-emerald-300 hover:bg-emerald-50 bg-white whitespace-nowrap disabled:opacity-50"
                   >
-                    <Film size={14} className={fetchingStock ? 'animate-spin' : ''} />
-                    스톡영상
+                    <Film size={14} className={fetchingStock || ((activeTask === 'stock' || activeTask === 'all') && isGeneratingAll) ? 'animate-spin' : ''} />
+                    스톡영상 {(stockProgress.total > 0)
+                      ? `${Math.round((stockProgress.current / stockProgress.total) * 100)}%`
+                      : ((activeTask === 'stock' || activeTask === 'all') && isGeneratingAll && generationProgress.total > 0)
+                        ? `${Math.round((generationProgress.current / generationProgress.total) * 100)}%`
+                        : ''}
                   </button>
 
                   <label
@@ -518,8 +589,6 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                     />
                   </label>
                 </div>
-              </>
-            )}
           </div>
 
           <div className="h-4 w-px bg-gray-200 mx-1"></div>
@@ -530,6 +599,19 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                 선택됨: <span className="text-indigo-600">{Object.keys(selectedVisuals).length}</span>/{content.scenes.length}
               </span>
             </div>
+            {Object.keys(selectedVisuals).length > 0 && (
+              <button
+                onClick={() => {
+                  if (window.confirm('모든 장면의 선택을 해제할까요? (후보 목록은 유지됩니다)')) {
+                    setSelectedVisuals({});
+                  }
+                }}
+                title="전 장면 선택 해제 (후보 목록은 유지)"
+                className="px-2 py-2 rounded-lg text-[11px] font-bold text-gray-400 hover:text-red-500 hover:bg-red-50 border border-transparent hover:border-red-200 transition-all whitespace-nowrap"
+              >
+                선택 초기화
+              </button>
+            )}
             <button 
               onClick={handleMoveToEdit}
               disabled={Object.keys(selectedVisuals).length < content.scenes.length}
@@ -605,12 +687,12 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                   </div>
 
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <p className={`text-[11px] font-black truncate shrink-0 ${isSelected ? 'text-gray-900' : 'text-gray-500'}`}>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <p className={`text-[11px] font-black truncate min-w-0 max-w-[42%] ${isSelected ? 'text-gray-900' : 'text-gray-500'}`}>
                         {scene.keyword}
                       </p>
                       <span className="text-[10px] text-gray-300 font-light shrink-0">|</span>
-                      <p className="text-[10px] text-gray-400 truncate flex-1 font-medium">
+                      <p className="text-[10px] text-gray-400 truncate flex-1 min-w-0 font-medium">
                         {scene.description}
                       </p>
                       {hasVisual && !fetchingIndices.has(`${idx}-ai`) && !fetchingIndices.has(`${idx}-search`) && (() => {
@@ -621,12 +703,19 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                           imgCount > 0 ? `이미지 ${imgCount}` : '',
                           vidCount > 0 ? `영상 ${vidCount}` : '',
                         ].filter(Boolean).join(' · ');
+                        // 클립당 노출 시간 = 씬 길이 ÷ 클립 수 (오디오 기준 고정이라 균등 분할)
+                        const dur = sceneDurationFor(idx);
+                        const per = urls.length > 0 && dur > 0 ? dur / urls.length : 0;
+                        const minNeed = vidCount > 0 ? 1.5 : 2.5;
+                        const tooShort = urls.length > 1 && per > 0 && per < minNeed;
                         return (
-                          <span className="flex items-center gap-1 shrink-0 ml-auto">
+                          <span className="flex items-center gap-1 shrink-0 ml-auto" title={urls.length > 1 && dur > 0 ? `씬 ${dur.toFixed(1)}초 ÷ ${urls.length}개 = 클립당 ${per.toFixed(1)}초` : label}>
                             <span className="text-[9px] font-black text-indigo-600 bg-indigo-50 border border-indigo-100 rounded-md px-1 py-px whitespace-nowrap">
-                              {label}
+                              {label}{urls.length > 1 && per > 0 ? ` · 각 ${per.toFixed(1)}초` : ''}
                             </span>
-                            <CheckCircle2 size={10} className="text-green-500 shrink-0" />
+                            {tooShort
+                              ? <span className="text-[9px] font-black text-amber-600 bg-amber-50 border border-amber-200 rounded-md px-1 py-px whitespace-nowrap">짧음</span>
+                              : <CheckCircle2 size={10} className="text-green-500 shrink-0" />}
                           </span>
                         );
                       })()}
@@ -840,11 +929,11 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                 }
                               };
                             });
-                            fetchCandidates(activeSceneIndex, section.type as 'ai' | 'search', selectedAiModel);
+                            fetchCandidates(activeSceneIndex, section.type as 'ai' | 'search', selectedAiModel, false, undefined, true);
                           }}
                           disabled={fetchingIndices.has(`${activeSceneIndex}-${section.type}`)}
                           className="p-1 rounded-lg bg-white text-gray-400 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50/50 transition-all border border-gray-100 shadow-sm disabled:opacity-50 active:scale-90"
-                          title="새로고침"
+                          title="새로고침 (캐시 무시하고 새로 수집)"
                         >
                           <RefreshCw size={11} className={fetchingIndices.has(`${activeSceneIndex}-${section.type}`) ? "animate-spin" : ""} />
                         </button>
@@ -899,7 +988,7 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                         alert('한 장면당 최대 3개까지 선택할 수 있습니다.');
                                         return prev;
                                       }
-                                      if (!canAddClip(activeSceneIndex, current.length)) return prev;
+                                      if (!canAddClip(activeSceneIndex, current.length, minSecFor(activeSceneIndex, candidate.url))) return prev;
                                       return {
                                         ...prev,
                                         [activeSceneIndex]: [...current, candidate.url]
@@ -968,9 +1057,10 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
                                     <Trash2 size={12} />
                                   </button>
                                   
-                                  <button 
+                                  <button
                                     onClick={(e) => {
                                       e.stopPropagation();
+                                      setZoomKind('image');
                                       setZoomedImage(assetUrl(candidate.url));
                                     }}
                                     className="p-1.5 bg-black/40 hover:bg-black/60 backdrop-blur-md text-white rounded-lg transition-all hover:scale-110 border border-white/10 shadow-lg"
@@ -1071,9 +1161,9 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
               </span>
             </div>
             <button
-              onClick={() => fetchStockFor(activeSceneIndex)}
+              onClick={() => fetchStockFor(activeSceneIndex, false, true)}
               disabled={fetchingStock}
-              title="현재 장면만 스톡 추가 검색"
+              title="현재 장면만 스톡 추가 검색 (캐시 무시)"
               className="p-1 rounded-lg bg-white text-gray-400 hover:text-emerald-600 hover:border-emerald-200 hover:bg-emerald-50/50 transition-all border border-gray-100 shadow-sm disabled:opacity-50 active:scale-90"
             >
               <RefreshCw size={11} className={fetchingStock ? 'animate-spin' : ''} />
@@ -1268,24 +1358,50 @@ const Step4Visual: React.FC<Step4VisualProps> = ({
         </div>
       )}
 
-      {/* Image Zoom Modal */}
+      {/* Image Zoom Modal (이미지 + 스톡 비디오 공용) */}
       {zoomedImage && (
-        <div 
+        <div
           className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-xl flex items-center justify-center p-4 md:p-10 animate-in fade-in duration-300"
-          onClick={() => setZoomedImage(null)}
+          onClick={closeZoom}
         >
-          <button 
-            title="확대 이미지 닫기"
-            className="absolute top-6 right-6 w-12 h-12 bg-white/10 hover:bg-white/20 text-white rounded-full flex items-center justify-center transition-all"
-            onClick={() => setZoomedImage(null)}
-          >
-            <X size={24} />
-          </button>
-          <img 
-            src={zoomedImage} 
-            className="max-w-full max-h-full object-contain rounded-2xl shadow-2xl animate-in zoom-in-95 duration-500" 
-            alt="Zoomed" 
-          />
+          <div className="absolute top-6 right-6 flex gap-2 z-10">
+            <a
+              href={zoomedImage}
+              download
+              title="원본 다운로드"
+              onClick={(e) => e.stopPropagation()}
+              className="w-12 h-12 bg-white/10 hover:bg-white/20 text-white rounded-full flex items-center justify-center transition-all"
+            >
+              <Download size={20} />
+            </a>
+            <button
+              title="확대 이미지 닫기"
+              className="w-12 h-12 bg-white/10 hover:bg-white/20 text-white rounded-full flex items-center justify-center transition-all"
+              onClick={closeZoom}
+            >
+              <X size={24} />
+            </button>
+          </div>
+          {(zoomKind === 'video' || /\.(mp4|webm|mov)(\?|$)/i.test(zoomedImage)) ? (
+            <video
+              key={zoomedImage}
+              src={zoomedImage}
+              controls
+              autoPlay
+              loop
+              muted
+              playsInline
+              preload="auto"
+              onError={() => alert('비디오를 불러오지 못했습니다. 파일이 삭제되었을 수 있습니다. 스톡을 다시 검색해주세요.')}
+              className="max-w-full max-h-full object-contain rounded-2xl shadow-2xl animate-in zoom-in-95 duration-500"
+            />
+          ) : (
+            <img
+              src={zoomedImage}
+              className="max-w-full max-h-full object-contain rounded-2xl shadow-2xl animate-in zoom-in-95 duration-500"
+              alt="Zoomed"
+            />
+          )}
         </div>
       )}
     </div>
