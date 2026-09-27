@@ -907,6 +907,10 @@ def _llm_rows() -> List[Dict[str, Any]]:
             "cost_output_per_1m": cout,
             "cost_input_krw": round((cin or 0) * krw),
             "cost_output_krw": round((cout or 0) * krw),
+            # 공식 요금 확인 시점/근거. 화면에 '출처 충돌'도 그대로 보여야 한다.
+            "price_verified": p.get("price_verified") or "",
+            "price_note": (p.get("price_note") or "").strip(),
+
             "quality": p.get("quality"),
             "model_id": p.get("model_id"),
             "base_url": p.get("base_url"),

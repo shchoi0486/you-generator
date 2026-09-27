@@ -528,21 +528,46 @@ const ModelRow: React.FC<{
         )}
         <span className="flex-1" />
         {/* LLM 은 '편당 비용' 이 의미가 있다 (이미지=장당/영상=초당 과 다름) */}
-        {kind === 'llm' && r.script_cost && (
-          <span
-            className={`text-[9.5px] font-bold tabular-nums shrink-0 ${
-              !r.script_cost.known ? 'text-gray-400'
-                : r.rank === 1 ? 'text-violet-700' : 'text-amber-700'}`}
-            title={r.script_cost.known
-              ? `대본 1편(60초) 기준 실측 기준가 · 입력 ${r.script_cost.script_in?.toLocaleString() ?? '?'}토큰, `
-                + `출력 ${r.script_cost.script_out?.toLocaleString() ?? '?'}토큰`
-                + (r.script_cost.script_reasoning ? ` (추론 ${r.script_cost.script_reasoning.toLocaleString()})` : '')
-              : (r.script_cost.note || '아직 1편을 생성하지 않아 편당 비용을 모릅니다')}
-          >
-            {r.script_cost.known
-              ? `편당 ${r.script_cost.label_krw}`
-              : '편당 미측정'}
-          </span>
+        {kind === 'llm' && (
+          <>
+            {/* 공식 단가는 항상 보여준다. 편당 추정(미측정 가능)과 별개다. */}
+            {r.cost_input_per_1m != null && r.cost_output_per_1m != null && (
+              <span
+                className="text-[9.5px] font-bold tabular-nums shrink-0 text-gray-500 mr-1.5"
+                title={
+                  `공식 요금 1M토큰당 입 $${r.cost_input_per_1m} / 출 $${r.cost_output_per_1m}`
+                  + `\n≈ 1K토큰당 입 ${r.cost_input_krw}원 / 출 ${r.cost_output_krw}원 (환율 1380 기준)`
+                  + (r.price_verified ? `\n확인: ${r.price_verified}` : '\n확인: 미표시')
+                  + (r.price_note ? `\n${r.price_note}` : '')
+                }
+              >
+                입 ${r.cost_input_per_1m} / 출 ${r.cost_output_per_1m}
+                {r.price_verified?.includes('충돌') && (
+                  <span className="ml-1 text-amber-600" title={r.price_note}>⚠</span>
+                )}
+              </span>
+            )}
+            {r.script_cost && (
+              <span
+                className={`text-[9.5px] font-bold tabular-nums shrink-0 ${
+                  !r.script_cost.known ? 'text-gray-400'
+                    : r.rank === 1 ? 'text-violet-700' : 'text-amber-700'}`}
+                title={r.script_cost.known
+                  ? `대본 1편(60초) 기준 실측 기준가 · 입력 ${r.script_cost.script_in?.toLocaleString() ?? '?'}토큰, `
+                    + `출력 ${r.script_cost.script_out?.toLocaleString() ?? '?'}토큰`
+                    + (r.script_cost.script_reasoning ? ` (추론 ${r.script_cost.script_reasoning.toLocaleString()})` : '')
+                    + (r.script_cost.repair_optional
+                      ? '\n수치 복구 패스가 붙으면 이 값, 안 붙으면 이보다 저렴합니다.'
+                      : '')
+                    + '\n실측: 1회 실행 8.5원 / 복구 패스까지 3회 실행 14.0원 (2026-09)'
+                  : (r.script_cost.note || '아직 1편을 생성하지 않아 편당 비용을 모릅니다')}
+              >
+                {r.script_cost.known
+                  ? `편당 ${r.script_cost.label_krw}`
+                  : '편당 미측정'}
+              </span>
+            )}
+          </>
         )}
         {kind === 'llm' && (
           <span className="flex items-center shrink-0">

@@ -15,6 +15,9 @@ export interface SceneItem {
   filming_guide?: string;
   subtitle?: string;
   sfx?: string;
+  /** 백엔드가 계산한 씬 시작/끝(요청 길이에 균등 배분). 없으면 프론트가 대사 길이로 추정. */
+  time_start?: number;
+  time_end?: number;
   [key: string]: unknown;
 }
 
@@ -312,7 +315,17 @@ export interface ProviderPlanRow {
     script_out?: number;
     script_reasoning?: number;
     samples?: number;
+    /** 수치 복구 패스가 붙을 수 있으면 true. 붙으면 더 비싸진다. */
+    repair_optional?: boolean;
   };
+  /** LLM 공식 요금(1M 토큰당). 편당 비용이 미측정이어도 이건 항상 표시한다. */
+  cost_input_per_1m?: number | null;
+  cost_output_per_1m?: number | null;
+  cost_input_krw?: number | null;
+  cost_output_krw?: number | null;
+  /** 공식 요금 확인 시점·근거. '출처 충돌'이면 단가를 확정하지 않은 상태. */
+  price_verified?: string;
+  price_note?: string;
   notes: string;
   /** 켜짐 + 키 있음 + 어댑터 있음 = 실제로 써도 되는 상태 */
   ready: boolean;
@@ -722,7 +735,7 @@ export const api = {
     });
   },
 
-  createShorts: async (data: { reference: string; new_topic: string; duration?: number; category?: string; format_id?: string; style_id?: string; platform_id?: string; script_id?: string; hook_id?: string; preset_id?: string; tone_id?: string; structure_id?: string; cta_id?: string }) => {
+  createShorts: async (data: { reference: string; new_topic: string; duration?: number; category?: string; format_id?: string; style_id?: string; platform_id?: string; script_id?: string; hook_id?: string; preset_id?: string; tone_id?: string; structure_id?: string; cta_id?: string; reference_reports?: Array<Record<string, unknown>> }) => {
     return handleFetch(`${API_BASE_URL}/shorts/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -856,6 +869,25 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind, id, delta }),
+    });
+  },
+
+  /**
+   * 이미지 1장 → AI 영상 1개. 과금된다.
+   * 사용자가 명시적으로 눌렀을 때만 부른다(자동 호출 금지).
+   */
+  generateI2V: async (data: {
+    provider_id: string;
+    image_path: string;
+    prompt?: string;
+    seconds?: number;
+    aspect_ratio?: string | null;
+    output_name?: string;
+  }) => {
+    return handleFetch(`${API_BASE_URL}/video/i2v`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
     });
   },
 

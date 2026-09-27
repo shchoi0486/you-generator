@@ -182,11 +182,17 @@ def _merge_fragment_items(items):
     return merged
 
 
-def _convert_storyboard_items(items, start_idx, current_time, allow_empty_text=False, default_hold_sec=3.0, style_anchor=""):
+def _convert_storyboard_items(items, start_idx, current_time, allow_empty_text=False, default_hold_sec=3.0, style_anchor="", default_speaker="BJ 이슈왕"):
     """storyboard 아이템 리스트를 (script, scenes)로 변환. current_time부터 이어서 타이밍 계산.
     allow_empty_text=True면 빈 내레이션도 무음 홀드 장면으로 유지 (ASMR용).
     narration_ko/subtitle_ko 스키마를 text/subtitle로 정규화한다.
-    수량 파편 병합(_merge_fragment_items)을 먼저 적용한다."""
+    수량 파편 병합(_merge_fragment_items)을 먼저 적용한다.
+
+    default_speaker
+        화자가 비었을 때 채울 값. 뉴스 계열은 'BJ 이슈왕' 이 맞지만(1인 브리핑),
+        레시피/제품/여행에 그 이름이 붙으면 잘못된 화자로 보인다. 그래서 호출한 쪽이
+        카테고리에 맞는 값을 넘긴다 — 기본값은 뉴스 동작을 그대로 보존한다.
+    """
     items = _merge_fragment_items(items)
     script_list = []
     scene_guide_list = []
@@ -196,13 +202,22 @@ def _convert_storyboard_items(items, start_idx, current_time, allow_empty_text=F
             skipped += 1
             continue
         idx = start_idx + offset
-        speaker = item.get('speaker', 'BJ 이슈왕')
+        # 빈 문자열/공백뿐인 화자는 '없음' 으로 보고 기본값을 채운다.
+        speaker = (item.get('speaker') or '').strip() or default_speaker
         # 스키마 드리프트 허용: narration_ko(신규, 빈 문자열도 유효한 무음 구간) / voice_script / voice
         if item.get('narration_ko') is not None:
             text_content = item.get('narration_ko') or ''
         else:
             text_content = item.get('text') or item.get('voice_script') or item.get('voice') or ''
         subtitle_content = str(item.get('subtitle_ko') or '').strip()
+        # 상단 자막(scenes[].subtitle) = 하단 자막 + 화면 전용 독백.
+        # 원본 무니키친은 독백을 상단 밴드에만 띄운다. 예전엔 subtitle_ko 하나를
+        # 양쪽에 그대로 복사해 하단·상단에 독백이 두 번 보였다(실측).
+        aside_content = str(item.get('aside_ko') or '').strip()
+        top_subtitle_content = subtitle_content
+        if aside_content and aside_content not in subtitle_content:
+            top_subtitle_content = (subtitle_content + ' ' + aside_content).strip() \
+                if subtitle_content else aside_content
         sfx_content = str(item.get('sfx') or item.get('sound_prompt') or '').strip()
         try:
             hold_sec = float(item.get('duration_sec') or 0)
@@ -226,11 +241,13 @@ def _convert_storyboard_items(items, start_idx, current_time, allow_empty_text=F
             visual = {'description': raw_visual.strip()}
         else:
             visual = {}
-        # 스키마 드리프트 허용: 다양한 키 이름 수집
+        # 빈 문자열이 '값 없음' 이다. 예전엔 'news' 를 기본값으로 썼는데 그건
+        # 뉴스 전용 시절 잔재였다 — 레시피 대본의 keyword 자리에 'news' 가 찍혔다.
+        # 여기서 채우지 않는다. 비워 두면 호출한 쪽(shots_lab)이 장면별 복구를 한다.
         scene_keyword = (
             visual.get('keyword') or visual.get('keyword_ko') or visual.get('visual_keyword')
             or item.get('keyword') or item.get('keyword_ko') or item.get('visual_keyword')
-            or item.get('scene_keyword') or 'news'
+            or item.get('scene_keyword') or ''
         )
         scene_description = apply_style_anchor(
             visual.get('description') or visual.get('prompt') or visual.get('image_prompt')
@@ -268,7 +285,9 @@ def _convert_storyboard_items(items, start_idx, current_time, allow_empty_text=F
             print(f"[Convert] Short scene ({scene_duration}s): {(text_content or '')[:30]}")
 
         if not isinstance(scene_keyword, str) or not scene_keyword.strip():
-            scene_keyword = 'news'
+            # 빈 값은 그대로 둔다. 'news' 처럼 아무 말이나 채우면 장면마다 같은
+            # 엉뚱한 주제가 찍힌다(실측). 복구는 shorts_lab 이 장면별로 한다.
+            scene_keyword = ''
         # blank-sign 오염 가드: keyword 자리에 들어간 이미지 지시어는 무효 처리
         if scene_keyword.strip().lower() in (
             'blank sign', 'blank signs', 'blank', 'no text', 'textless',
@@ -291,17 +310,24 @@ def _convert_storyboard_items(items, start_idx, current_time, allow_empty_text=F
             "type": visual.get('type', 'ai_image'),
             "keyword": scene_keyword,
             "description": scene_description,
-            "subtitle": subtitle_content,
+            "subtitle": top_subtitle_content,
             "sfx": sfx_content,
             "stock_query": (visual.get('stock_query') or item.get('stock_query') or ''),
             "filming_guide": (visual.get('filming_guide') or item.get('filming_guide') or ''),
             "mood": str(visual.get('mood') or '').strip()[:60],
             "data": visual.get('data', {})
         }
+        # section 을.scene dict 에 담는다. 프론트(장면 카드 섹션 배지)와
+        # keyword/description 폴백(_SEC_EN)이 전부 이 값에 의존한다.
+        # 이게 없으면 모든 장면이 섹션 없는 것으로 보여 '전부 같은 프롬프트' 가 되고
+        # (실측), keyword 복구도 장면마다 다른 묘사를 못 만든다.
+        _sec = str(item.get('section') or item.get('type') or '').strip()
+        if _sec:
+            scene["section"] = _sec
         scene_guide_list.append(scene)
         current_time += (scene_duration + gap_duration)
-    if skipped:
-        print(f"[Convert] Skipped {skipped} empty/invalid scenes.")
+        if skipped:
+            print(f"[Convert] Skipped {skipped} empty/invalid scenes.")
     return script_list, scene_guide_list, current_time
 
 
@@ -565,7 +591,7 @@ async def generate_full_package(article_text, api_key=None, selected_model=None,
 
                     # 2. Extract Visual Scene
                     visual = item.get('visual', {})
-                    scene_keyword = visual.get('keyword', 'news')
+                    scene_keyword = visual.get('keyword', '') or ''
 
                     # --- Post-processing: Remove news graphics keywords ---
                     # 방송 UI 관련 키워드가 포함된 경우 템플릿에 맞는 배경으로 순화
@@ -591,10 +617,14 @@ async def generate_full_package(article_text, api_key=None, selected_model=None,
                         "mood": str(visual.get('mood') or '').strip()[:60],
                         "data": visual.get('data', {})
                     }
+                    # section 을 scene dict 에 담는다(프론트 배지 + 폴백이 사용).
+                    _sec2 = str(item.get('section') or item.get('type') or '').strip()
+                    if _sec2:
+                        scene["section"] = _sec2
                     scene_guide_list.append(scene)
                     current_time += (scene_duration + gap_duration)
-
-                result_json['script'] = script_list
+                    
+                    result_json['script'] = script_list
                 result_json['scenes'] = scene_guide_list
                 del result_json['storyboard'] # Clean up
 

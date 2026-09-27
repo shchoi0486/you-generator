@@ -87,6 +87,58 @@ def _public_image_url(ref, tmpdir: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # 어댑터
 # ─────────────────────────────────────────────────────────────
+# ── fal 모델별 스키마 차이 ───────────────────────────────────────
+# fal 은 벤더별로 같은 파라미터 이름에 다른 형식을 받는다. 전부 같은 방식으로 보내면
+# 제출이 422 로 거부된다(실측: duration "5" 는 veo3.1 이 안 받는다).
+#
+#   veo3.1    : "4s" / "6s" / "8s"  (문자열 + s)  — 5초는 존재하지 않는다
+#   sora-2    : "4" / "8" / "12" / "16" / "20"   (s 없음)
+#   그 외     : 정수
+_FAL_DURATIONS = {
+    "veo3.1": (("4s", 4), ("6s", 6), ("8s", 8)),
+    "sora-2": (("4", 4), ("8", 8), ("12", 12), ("16", 16), ("20", 20)),
+}
+
+
+def _fal_family(model: str) -> str:
+    """model_ref 에서 규칙이 같은 계열을 뽑는다 ('fal-ai/veo3.1/fast/...' -> 'veo3.1')."""
+    m = (model or "").lower()
+    for fam in _FAL_DURATIONS:
+        if f"/{fam}/" in m or m.endswith(f"/{fam}"):
+            return fam
+    return ""
+
+
+def _fal_duration(model: str, seconds) -> Any:
+    """요청 초를 그 모델이 실제로 받는 형식으로 바꾼다(가장 가까운 허용값으로)."""
+    fam = _fal_family(model)
+    if not fam:
+        try:
+            return int(round(float(seconds)))
+        except (TypeError, ValueError):
+            return 5
+    allowed = _FAL_DURATIONS[fam]
+    want = 0.0
+    try:
+        want = float(seconds)
+    except (TypeError, ValueError):
+        want = 5.0
+    best, best_gap = allowed[0][0], None
+    for token, val in allowed:
+        gap = abs(val - want)
+        if best_gap is None or gap < best_gap:
+            best, best_gap = token, gap
+    return best
+
+
+def _fal_supports(model: str, field: str) -> bool:
+    """그 모델이 이 필드를 받는지 (모르는 모델에 보내면 422 가 된다)."""
+    fam = _fal_family(model)
+    if field == "generate_audio":
+        return fam in ("veo3.1", "sora-2")
+    return False
+
+
 def _adapter_fal_i2v(p: Dict[str, Any], *, image_ref, prompt: str, seconds: int,
                      **kw) -> Optional[str]:
     """fal.ai 큐 방식.
@@ -107,12 +159,22 @@ def _adapter_fal_i2v(p: Dict[str, Any], *, image_ref, prompt: str, seconds: int,
 
     url_img = _public_image_url(image_ref, "")
     args: Dict[str, Any] = {"prompt": prompt or "", "image_url": url_img}
-    for k_src, k_dst in (("duration_seconds", "duration"), ("res", "resolution")):
-        if kw.get(k_src) is not None:
-            args[k_dst] = kw[k_src]
-    if p.get("res"):
-        args.setdefault("resolution", p["res"])
-    args.setdefault("duration", str(seconds))
+    if kw.get("res") is not None:
+        args["resolution"] = kw["res"]
+    elif p.get("res"):
+        args["resolution"] = p["res"]
+    if kw.get("duration_seconds") is not None:
+        args["duration"] = kw["duration_seconds"]
+    else:
+        args["duration"] = seconds
+    args["duration"] = _fal_duration(model, args["duration"])
+    # 세로 숏폼인데 16:9 로 떨어지면 화면 구성이 전부 잘린다.
+    ar = kw.get("aspect_ratio") or p.get("aspect_ratio")
+    if ar:
+        args["aspect_ratio"] = ar
+    # 이 모델들은 기본값이 audio=true 다. 한국어 TTS 를 덮으려면 명시적으로 꺼야 한다.
+    if _fal_supports(model, "generate_audio"):
+        args["generate_audio"] = bool(kw.get("generate_audio", p.get("generate_audio", False)))
 
     base = "https://queue.fal.run"
     hdr = {"Authorization": f"Key {key}", "Content-Type": "application/json"}

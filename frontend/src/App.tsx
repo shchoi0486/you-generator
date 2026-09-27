@@ -604,11 +604,31 @@ function App() {
   // -------------------------
 
   // 전체 대본의 시간 범위를 계산하는 함수 (간격 포함)
-  const getTimelineRange = React.useCallback((data: ScriptItem[] | undefined, currentIdx: number) => {
+  //
+  // 씬의 time_start/time_end 를 우선 신뢰한다. 그 값이 백엔드가 '요청한 길이' 에
+  // 맞춰 균등 배분한 정답이다(shots_lab.py:1399). 예전엔 이걸 무시하고 대사 글자수로
+  // 다시 계산했는데, 짧은 대사 6개면 60초 요청에 34.9초가 나오고 화면·타임라인·영상
+  // 편집이 서로 다른 시간을 보여줬다(실측).
+  // 인자로 scenes 를 받지 않고 content 를 클로저로 읽는다 — 호출처가 22곳이라
+  // 시그니처를 바꾸면 놓치는 곳이 생긴다.
+  const getTimelineRange = React.useCallback((
+    data: ScriptItem[] | undefined,
+    currentIdx: number,
+  ) => {
     if (!data || currentIdx < 0 || currentIdx >= data.length) {
       return { start: "0.0", end: "0.0", duration: "0.0" };
     }
-    
+
+    // 0) 백엔드가 계산해 준 씬 시간이 있으면 그게 정답
+    const sc = content?.scenes?.[currentIdx];
+    if (sc && typeof sc.time_start === 'number' && typeof sc.time_end === 'number') {
+      return {
+        start: sc.time_start.toFixed(2),
+        end: sc.time_end.toFixed(2),
+        duration: (sc.time_end - sc.time_start).toFixed(2),
+      };
+    }
+
     // 1. SRT 데이터가 있으면 SRT 우선 사용
     // 씬의 길이는 현재 자막 시작부터 다음 자막 시작까지 (공백 포함)로 계산해야 이미지 싱크가 맞음
     // 자막 분할로 srtData가 script보다 많을 수 있어 scene 필드 우선 매칭
@@ -672,7 +692,7 @@ function App() {
       end: (start + totalSceneDuration).toFixed(2), 
       duration: totalSceneDuration.toFixed(2) 
     };
-  }, [srtData, gapDuration]);
+  }, [srtData, gapDuration, content]);
 
   // 모든 트랙의 끝점 중 가장 큰 값을 비디오 총 길이로 설정
   useEffect(() => {

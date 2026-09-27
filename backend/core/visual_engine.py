@@ -366,6 +366,59 @@ def _is_action_driven_scene(text):
     return any(token in lower_text for token in english_tokens) or any(token in text for token in korean_tokens)
 
 
+def _build_recipe_sd_prompt(description, keyword, style, mood="", model="", category="recipe"):
+    """요리/레시피 장면용 SD 계열 프롬프트.
+
+    뉴스용 빌더와 분리한 이유
+        뉴스는 '사람 없음 + 멀리서 찍는 풍경' 이 goals 이지만, 요리는 정반대다.
+        손이 움직이고, 접시가 화면을 채우고, 클로즈업이 기본이다. 뉴스의 부정어
+        (hands/fingers/person) 를 그대로 쓰면 요리 컷에서 손이 금지된다(실측).
+
+    손은 허용하되 '잘못된 손' 만 금지한다. 6개 이하의 손가락, 뒤틀린 손가락 같은
+    AI 특유의 손 깨짐만 막는다.
+    """
+    desc = _clean_prompt_text(description)
+    kw = _clean_prompt_text(keyword)
+    if not desc:
+        desc = kw
+    if not kw:
+        kw = "Korean home cooking"
+
+    desc = re.sub(r'\s+', ' ', desc).replace(', ,', ',').strip()
+
+    # 섹션/분위기에 맞는 샷. 재료 컷과 조리 컷은 다르게 찍어야 한다.
+    low = f"{desc} {kw}".lower()
+    if any(w in low for w in ("재료", "ingredient", "손질", " chopping", "세팅", "배치")):
+        framing = ("overhead top-down close-up of ingredients arranged on a surface, "
+                   "shallow depth of field on the nearest ingredient, clean simple background")
+    elif any(w in low for w in ("완성", "플레이팅", "plating", "접시", "세팅 완료")):
+        framing = ("close-up hero shot of the finished dish, glossy surface, steam rising, "
+                   "appetizing shallow depth of field, warm appetizing light")
+    else:
+        framing = ("close-up of hands cooking in a home kitchen, mid-action, "
+                   "shallow depth of field on the food, natural window light")
+
+    style_prefix = f"({style}), " if style else ""
+    mood_suffix = f", {mood}" if mood and mood.lower() not in f"{desc} {kw}".lower() else ""
+    positive = (f"{style_prefix}{desc}, subject or location: {kw}, {framing}"
+                f"{mood_suffix}, photorealistic food photography, realistic texture, "
+                f"high detail, natural color")
+
+    # 손은 허용. 형태가 깨진 손과 텍스트만 금지한다.
+    negative = (
+        "text, words, letters, numbers, watermark, logo, signage, caption, subtitle, "
+        "chinese characters, japanese characters, kanji, hanzi, foreign text, "
+        "western people, caucasian features, blonde hair, blue eyes, human face, "
+        "six fingers, extra fingers, fused fingers, mutated fingers, "
+        "malformed hands, deformed hands, extra hands, extra limbs, "
+        "missing arms, missing legs, extra arms, multiple arms, bad anatomy, "
+        "chinese architecture, japanese architecture, pagoda, torii gate, "
+        "cartoon, illustration, drawing, painting, anime, sketch, "
+        "blurry, distorted, low quality, worst quality, oversaturated"
+    )
+    return f"{positive} --no {negative}"
+
+
 def _build_news_broll_scene(description, keyword):
     normalized_description = _clean_prompt_text(description)
     normalized_keyword = _clean_prompt_text(keyword)
@@ -714,6 +767,19 @@ def refine_ai_prompt(description, keyword="", style="", model="", category="news
         return _build_flux_prose_prompt(description, keyword, style, family=family, category=category, mood=mood)
     if family == "gemini":
         return _build_gemini_prompt(description, keyword, style, category=category, mood=mood)
+
+    # ── 레시피/요리 전용 경로 ───────────────────────────────────
+    # 아래는 전부 뉴스 브리핑용으로 작성된 코드라 요리에 그대로 쓰면 말이 안 된다
+    # (실측):
+    #   1) 'hands/fingers/arms' 를 설명에서 지운다 → 요리 장면의 핵심 피사체가 사라진다
+    #   2) 네거티브에 (hands:1.8) (person:1.3) → 손이 얼굴보다 큰 요리 컷을 금지한다
+    #   3) 'extreme long shot, pure landscape, vast environment' 를 강제
+    #      → 재료 클로즈업과 정반대
+    #   4) flux 분기에 'South Korean flag, Seoul city background' → 부엌에 기가 게 건다
+    if category == "recipe":
+        return _build_recipe_sd_prompt(description, keyword, style, mood=mood_text,
+                                       model=model, category=category)
+
 
     # [수정] 뉴스룸 억제 구문도 부정어 대신 긍정어(풍경/사물 집중)로 변경 
     if not any(word in description.lower() for word in ["nature", "landscape", "abstract"]): 
@@ -1609,8 +1675,10 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
     img_conf = config.get('image_gen', {})
     
     # [수정] 장면 번호나 불필요한 수식어 제거
-    keyword = clean_keyword(scene.get('keyword', 'news'))
-    description = clean_keyword(scene.get('description', keyword))
+    # 기본값을 'news' 로 두면 없는 자리에 뉴스 주제가 들어간다. 빈 값으로 시작하고
+    # 아래 폴백 체인이 '값 없음'을 대신 채우게 한다.
+    keyword = clean_keyword(scene.get('keyword') or '')
+    description = clean_keyword(scene.get('description') or keyword)
     
     # [추가] 주제어(topic)와 비주얼 가이드(visual_guide) 정제
     clean_topic = clean_keyword(topic) if topic else ""
@@ -1650,8 +1718,8 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             print(f"Graph gen error: {e}")
 
     # [수정] 장면 번호나 불필요한 수식어 제거 (AI 프롬프트용)
-    keyword = clean_keyword(scene.get('keyword', 'news'))
-    description = clean_keyword(scene.get('description', keyword))
+    keyword = clean_keyword(scene.get('keyword') or '')
+    description = clean_keyword(scene.get('description') or keyword)
 
     # 1. AI Image Candidates
     if generate_ai:
@@ -1847,8 +1915,11 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
                 clean_text = re.sub(r'\b(Montage|Scene|Shot)\b', '', clean_text, flags=re.I).strip()
                 search_base = " ".join(clean_text.split()[:6])
 
-        if not search_base or search_base.lower() in ['news', 'none']:
-            search_base = "Korean office worker tired"
+        # 값이 없으면 검색어를 만들지 않는다. 예전엔 'news' 면 여기에
+        # "Korean office worker tired" 를 지어넣었는데, 그 결과 레시피 컷 옆에
+        # 뉴스용 사진(지친 직장인)이 섞여 들어갔다. 지어내지 않는 편이 낫다.
+        if not search_base or search_base.lower() in ('news', 'none', 'blank'):
+            search_base = ''
         
         # [수정] 너무 짧으면 추가 보강
         if len(search_base.split()) < 3:
@@ -1878,13 +1949,16 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
                 search_base_words.append(w)
         search_base = " ".join(search_base_words)
         
+        # 'news' 는 더 이상 '값 없음' 표시가 아니다(generator.py 에서 제거됨).
+        # 그래도 옛 출력이 남아 있을 수 있어 방어적으로 계속 걸러낸다.
         if not search_base or search_base.lower() == 'news':
-            # description에서 최소한의 키워드만 추출 시도 (뉴스 대신 더 구체적인 키워드)
-            desc = scene.get('description', 'news')
-            search_base = clean_keyword(desc)
+            # description에서 최소한의 키워드만 추출 시도
+            desc = scene.get('description', '') or ''
+            search_base = clean_keyword(desc) if desc else ''
             if not search_base or search_base.lower() == 'news':
-                # 여전히 news면 description의 첫 3개 단어라도 사용
-                search_base = " ".join(desc.split()[:3])
+                # 그래도 없으면 검색을 시도하지 않는다. 예전엔 여기서
+                # "Korean office worker tired" 를 넣어相关新闻 stok이 요리 컷에 섞였다.
+                search_base = ''
 
         # Determine language
         is_korean = bool(re.search(r'[ㄱ-ㅎㅏ-ㅣ가-힣]', search_base))
@@ -1980,7 +2054,7 @@ def get_visual_source(scene_or_keyword):
     # Backward compatibility
     if isinstance(scene_or_keyword, dict):
         scene = scene_or_keyword
-        keyword = scene.get('keyword', 'news')
+        keyword = scene.get('keyword') or ''
     else:
         keyword = scene_or_keyword
         scene = {'type': 'ai_image', 'keyword': keyword}

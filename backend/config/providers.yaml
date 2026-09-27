@@ -311,7 +311,7 @@ video:
     label: "Veo 3.1 Lite"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/veo-3.1-lite/image-to-video"
+    model_ref: "fal-ai/veo3.1/lite/image-to-video"
     cost_per_sec: 0.05
     res: "720p"
     max_sec: 8
@@ -349,7 +349,7 @@ video:
     label: "Veo 3.1 Fast 720p"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/veo-3.1-fast/image-to-video"
+    model_ref: "fal-ai/veo3.1/fast/image-to-video"
     cost_per_sec: 0.10
     res: "720p"
     max_sec: 8
@@ -365,7 +365,7 @@ video:
     label: "Veo 3.1 Fast 1080p"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/veo-3.1-fast/image-to-video"
+    model_ref: "fal-ai/veo3.1/fast/image-to-video"
     cost_per_sec: 0.12
     res: "1080p"
     max_sec: 8
@@ -381,7 +381,7 @@ video:
     label: "Veo 3.1 Standard"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/veo-3.1/image-to-video"
+    model_ref: "fal-ai/veo3.1/image-to-video"
     cost_per_sec: 0.40
     res: "720/1080p"
     max_sec: 8
@@ -458,7 +458,7 @@ video:
     label: "Sora 2 Pro 720p"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/sora-2-pro/image-to-video"
+    model_ref: "fal-ai/sora-2/image-to-video/pro"
     cost_per_sec: 0.30
     res: "720p"
     max_sec: 12
@@ -474,7 +474,7 @@ video:
     label: "Sora 2 Pro 1024p"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/sora-2-pro/image-to-video"
+    model_ref: "fal-ai/sora-2/image-to-video/pro"
     cost_per_sec: 0.50
     res: "1024p"
     max_sec: 12
@@ -490,7 +490,7 @@ video:
     label: "Sora 2 Pro 1080p"
     adapter: fal_i2v
     modes: [i2v]
-    model_ref: "fal-ai/sora-2-pro/image-to-video"
+    model_ref: "fal-ai/sora-2/image-to-video/pro"
     cost_per_sec: 0.70
     res: "1080p"
     max_sec: 12
@@ -716,6 +716,8 @@ llm:
     cost_input_per_1m: 0.30
     cost_output_per_1m: 2.50
     key_env: gemini_api_key
+    price_verified: "2026-09 (ai.google.dev 확인)"
+    price_note: "공식 요금과 일치. $0.30/$2.50."
     modes: [text]
     quality: 74
     enabled: true
@@ -729,6 +731,8 @@ llm:
     cost_input_per_1m: 0.15
     cost_output_per_1m: 1.25
     key_env: gemini_api_key
+    price_verified: "2026-09 (출처 충돌)"
+    price_note: "cloudprice는 $0.15/$1.25, nocode.mba는 $0.25/$1.50으로 엇갈린다. 공식 ai.google.dev 확인 못 함. 단가 미확정."
     modes: [text]
     quality: 72
     enabled: true
@@ -737,14 +741,22 @@ llm:
   gemini_3_6_flash:
     label: "Gemini 3.6 Flash (품질)"
     adapter: gemini
-    model_id: "gemini-3.6-flash"
-    cost_input_per_1m: 1.50
-    cost_output_per_1m: 7.50
+    model_id: gemini-3.6-flash
+    # 2026-09 웹 확인: Google이 3.6 Flash에 3.7 Flash와 같은 도입 파격가를 적용했다.
+    # $0.75 / 1M input, $3.75 / 1M output — 2026-12-31까지만.
+    # 2027-01-01부터 $1.50 / $7.50 으로 오른다. (출처: ai.google.dev gemini latest-model 문서,
+    # 2026-09 확인. 아래 price_note에 근거를 남긴다)
+    cost_input_per_1m: 0.75
+    cost_output_per_1m: 3.75
+    price_verified: "2026-09 (ai.google.dev)"
+    price_note: "도입 파격가. 2027-01-01부터 1.50/7.50으로 인상 예정."
     key_env: gemini_api_key
-    modes: [text]
+    modes:
+      - text
     quality: 86
     enabled: true
-    notes: "실측 200, 1739ms. 품질이 필요할 때만 쓴다."
+    notes: "실측 200, 1739ms. 3.7 Flash와 같은 파격가라 단가만 보면 동급이다(품질은 더 높음)."
+
 
   gemini_3_7_flash:
     label: "Gemini 3.7 Flash"
@@ -753,6 +765,8 @@ llm:
     cost_input_per_1m: 0.75
     cost_output_per_1m: 3.75
     key_env: gemini_api_key
+    price_verified: "2026-09 (ai.google.dev 확인)"
+    price_note: "도입 파격가 $0.75/$3.75, 2026-12-31까지."
     modes: [text]
     quality: 78
     enabled: true
@@ -765,6 +779,8 @@ llm:
     cost_input_per_1m: 0.75
     cost_output_per_1m: 3.75
     key_env: gemini_api_key
+    price_verified: "2026-09 (getdeploying/Google Cloud 확인)"
+    price_note: "$0.75/$3.75."
     modes: [text]
     quality: 80
     enabled: true
@@ -777,6 +793,8 @@ llm:
     cost_input_per_1m: 1.50
     cost_output_per_1m: 9.00
     key_env: gemini_api_key
+    price_verified: "2026-09 (ai.google.dev 확인)"
+    price_note: "$1.50/$9.00. $2.70/$16.20은 오류."
     modes: [text]
     quality: 84
     enabled: true

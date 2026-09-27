@@ -5,7 +5,6 @@ import {
   Square,
   Clock,
   Scissors,
-  FileText,
   Mic,
   Gauge,
   Image as ImageIcon,
@@ -190,6 +189,11 @@ interface VideoPresetPanelProps {
   setDuration: (v: number) => void;
   cutSpeed: CutSpeed;
   setCutSpeed: (v: CutSpeed) => void;
+  /**
+   * 아래 둘은 이제 이 패널에서 쓰지 않는다. script_id(대본 포맷)는 화면에서
+   * 고르지 않고 기본값만 쓴다 — App 이 생성 요청에 직접 넣으므로 패널엔 필요 없다.
+   * props 에는 남겨 둔다(템플릿이 포맷을 강제해야 할 때 쓰게 된다).
+   */
   scriptOptions: ScriptFormatOption[];
   scriptId: string;
   onScriptChange: (id: string) => void;
@@ -385,9 +389,6 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
   setDuration,
   cutSpeed,
   setCutSpeed,
-  scriptOptions,
-  scriptId,
-  onScriptChange,
   selectedEngine,
   setSelectedEngine,
   voiceRate,
@@ -433,6 +434,30 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
     return hit?.id ?? CAPTION_PRESETS[0].id;
   });
   const [recipeOptions, setRecipeOptions] = React.useState<RecipeOptions | null>(null);
+
+  // 영상 생성은 과금된다. 자동 실행 금지 — 사용자가 명시적으로 누를 때만.
+  const [testImage, setTestImage] = React.useState('');
+  const [testResult, setTestResult] = React.useState<{ ok: boolean; text: string } | null>(null);
+  const [i2vBusy, setI2vBusy] = React.useState(false);
+
+  const runI2VTest = async () => {
+    if (!videoModel || !testImage) return;
+    setI2vBusy(true);
+    setTestResult(null);
+    try {
+      const r = await api.generateI2V({
+        provider_id: videoModel,
+        image_path: testImage,
+        prompt: '부드러운 카메라 이동, 자연스러운 움직임',
+        seconds: 4,
+        aspect_ratio: aspectRatio.startsWith('9:16') ? '9:16'
+          : aspectRatio.startsWith('1:1') ? '1:1' : '16:9',
+      });
+      setTestResult({ ok: true, text: `완료: ${r.path}` });
+    } catch (e) {
+      setTestResult({ ok: false, text: (e as Error).message });
+    } finally { setI2vBusy(false); }
+  };
   React.useEffect(() => {
     let alive = true;
     fetchRecipeOptions().then((o) => {
@@ -453,7 +478,6 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
   const activePresetName = currentPresetId === 'random'
     ? '매번 변경'
     : (opts.presets.find((p) => p.id === currentPresetId)?.name ?? '매번 변경');
-  const currentScript = scriptOptions.find((f) => f.id === scriptId) ?? scriptOptions.find((f) => f.recommended) ?? scriptOptions[0];
   const engineName = ENGINE_OPTIONS.find((e) => e.id === selectedEngine)?.label ?? selectedEngine;
   const sizeName = SUBTITLE_SIZES.find((s) => s.id === subtitleSize)?.label ?? '';
 
@@ -605,34 +629,19 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         <Hint>{cutSpeed === 'fast' ? '~5초마다 컷 전환 (씬을 잘게)' : '~10초마다 컷 전환 (씬을 여유 있게)'}</Hint>
       </RailSection>
 
-      <RailSection order={4} icon={<FileText size={13} />} title="대본 포맷" summary={currentScript?.name ?? ''}>
-        <p className="text-[10px] text-gray-400 leading-snug">
-          영상의 <b className="text-gray-600">뼈대</b>입니다. 아래 '대본 다양화'에서 말투를 고르면
-          여기에 자동 맞춰집니다.
-        </p>
-        <select
-          value={currentScript?.id ?? ''}
-          onChange={(e) => onScriptChange(e.target.value)}
-          title="대본 포맷 선택"
-          className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 outline-none focus:border-indigo-500 cursor-pointer"
-        >
-          {scriptOptions.map((f) => (
-            <option key={f.id} value={f.id}>
-              {f.recommended ? `★ 추천 · ${f.name}` : f.name}
-            </option>
-          ))}
-        </select>
-        <Hint>{currentScript?.flow}</Hint>
-        {/* 예전엔 드롭다운 아래에 '다른 포맷' 칩을 또 그렸다. 같은 목록을 두 번
-            보여주므로 칩을 눌러도 드롭다운 값만 바뀌고 헤이더 설명은 안 따라왔다.
-            한 곳만 둔다. */}
-      </RailSection>
+      {/* '대본 포맷'(script_id) 은 화면에서 고르지 않는다. 구분을 고르지 않으면
+          기본값이 '레시피 튜토리얼형'(분량·조리조건 반드시 전달) 이라서 안전하고,
+          다른 3종은 대체로 위험했다 — '초간단/자취형' 은 "재료 4개 이하" 라서
+          사용자가 넣은 레시피를 고쳐 쓰게 하고, 'ASMR 조리형' 은 검증 안 된
+          sound_prompt 를 켜며 나레이션을 비워 TTS 가 읽을 구간이 사라진다.
+          script_id 는 그대로 전송되므로 생성에는 영향이 없다. */}
 
-      <RailSection order={5} icon={<Clapperboard size={13} />} title="대본 다양화" summary={activePresetName}>
+      <RailSection order={4} icon={<Clapperboard size={13} />} title="대본 프리셋" summary={activePresetName}>
         {recipePreset && setRecipePreset ? (
           <div className="space-y-3">
             <p className="text-[10px] text-gray-400 leading-snug">
-              <b className="text-gray-600">어떻게 말할지</b>를 고르세요. 전개 순서는 아래에서 바꿉니다.
+              대본의 <b className="text-gray-600">말투 · 순서 · 오프닝 · 마무리</b>를 한 세트로
+              정합니다. 카드 하나 = 4개 축이 다 들어 있는 완전한 세트입니다.
             </p>
             {/* ── 톤 6장 ── */}
             <div className="grid grid-cols-2 gap-1.5">
@@ -726,105 +735,35 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
                 만들 때마다 12가지 중 하나가 자동으로 골라집니다
               </p>
             </button>
-            <div className="grid grid-cols-2 gap-1.5">
-              <div>
-                <p className="text-[10px] font-bold text-gray-500 mb-1">스타일</p>
-                <select
-                  value={recipePreset.style}
-                  onChange={(e) => setRecipePreset({ ...recipePreset, style: e.target.value })}
-                  className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-bold text-gray-700 outline-none focus:border-indigo-500"
-                >
-                  {opts.styles.map((s) => (
-                    <option key={s.id} value={s.id}>{s.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <p className="text-[10px] font-bold text-gray-500 mb-1">플랫폼</p>
-                <select
-                  value={recipePreset.platform}
-                  onChange={(e) => setRecipePreset({ ...recipePreset, platform: e.target.value })}
-                  className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-bold text-gray-700 outline-none focus:border-indigo-500"
-                >
-                  {opts.platforms.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <details className="rounded-lg border border-gray-200 bg-white overflow-hidden">
-              <summary className="px-3 py-2 text-[11px] font-bold text-gray-500 cursor-pointer hover:text-indigo-600">
-                개별 조정 (톤·구조·훅·CTA)
-              </summary>
-              <div className="px-3 py-2.5 space-y-2.5 border-t border-gray-100">
-                {/* 프리셋 축은 state에 저장하지 않는다(빈 값=오버라이드 없음).
-                    그래서 '실제로 무엇이 적용되는지'는 여기서 계산해서 보여줘야 한다. */}
+            {/* 스타일/플랫폼은 여기 있지 않다. 아래 '이미지 · 올림' 섹션으로 옮겼다. */}
+            {/* ── 프리셋의 나머지 2축(오프닝 훅 · 마무리 CTA) ──
+                예전엔 <details> 로 접어두었다. 그러면 '프리셋이 이미 정해놨는데
+                뭘 더 고르지' 하고 아예 안 열어봤다. 이 2축도 프리셋의 일부이므로
+                카드/칩과 같은 자리에 펼쳐 둔다. */}
+            <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
+              <div className="flex items-center justify-between gap-2 px-3 py-2 bg-gray-50/60">
+                <p className="text-[10px] font-bold text-gray-500">
+                  프리셋에서 바꾸기 · <span className="text-gray-400 font-normal">말투와 순서는 위에서 고른 대로</span>
+                </p>
                 {(() => {
                   const _p = opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as
-                    { tone?: string; structure?: string; hook?: string; cta?: string } | undefined;
-                  const _eff = {
-                    tone: recipePreset.tone || _p?.tone || '',
-                    structure: recipePreset.structure || _p?.structure || '',
-                    hook: recipePreset.hook || _p?.hook || '',
-                    cta: recipePreset.cta || _p?.cta || '',
-                  };
-                  const _dirty = Object.keys(_eff).some((k) => recipePreset[k as keyof typeof _eff]);
+                    { hook?: string; cta?: string } | undefined;
+                  const _dirty = !!(recipePreset.hook || recipePreset.cta);
                   if (!_p) return null;
-                  return (
-                    <div className="flex items-center justify-between gap-2 rounded-lg bg-gray-50 px-2.5 py-1.5">
-                      <p className="text-[10px] font-bold text-gray-500">
-                        적용 중: {opts.tones.find((t) => t.id === _eff.tone)?.name || '프리셋 지정'}
-                      </p>
-                      {_dirty ? (
-                        <button
-                          onClick={() => setRecipePreset({ ...recipePreset, hook: '', tone: '', structure: '', cta: '' })}
-                          className="text-[10px] font-bold text-indigo-600 hover:underline"
-                          title="개별 조정을 지우고 프리셋에 정해진 조합을 그대로 쓴다"
-                        >
-                          프리셋값으로 되돌리기
-                        </button>
-                      ) : (
-                        <span className="text-[10px] font-bold text-gray-400">프리셋 값 그대로</span>
-                      )}
-                    </div>
+                  return _dirty ? (
+                    <button
+                      onClick={() => setRecipePreset({ ...recipePreset, hook: '', tone: '', structure: '', cta: '' })}
+                      className="text-[10px] font-bold text-indigo-600 hover:underline"
+                      title="바꾼 훅·CTA 를 지우고 프리셋에 정해진 값으로 되돌린다"
+                    >
+                      프리셋값으로 되돌리기
+                    </button>
+                  ) : (
+                    <span className="text-[10px] font-bold text-gray-400">프리셋 값 그대로</span>
                   );
                 })()}
-                <div>
-                  <p className="text-[10px] font-bold text-gray-500 mb-1">내레이션 톤</p>
-                  <div className="flex flex-wrap gap-1">
-                    {opts.tones.map((t) => {
-                      const _on = (recipePreset.tone || (opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as { tone?: string } | undefined)?.tone) === t.id;
-                      return (
-                        <button
-                          key={t.id}
-                          onClick={() => setRecipePreset({ ...recipePreset, tone: t.id })}
-                          title={t.desc}
-                          className={`px-2 py-1 rounded-md text-[10px] font-bold border transition-all ${_on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'}`}
-                        >
-                          {t.name}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-                <div>
-                  <p className="text-[10px] font-bold text-gray-500 mb-1">대본 구조</p>
-                  <div className="flex flex-wrap gap-1">
-                    {opts.structures.map((s) => {
-                      const _on = (recipePreset.structure || (opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as { structure?: string } | undefined)?.structure) === s.id;
-                      return (
-                        <button
-                          key={s.id}
-                          onClick={() => setRecipePreset({ ...recipePreset, structure: s.id })}
-                          title={s.desc}
-                          className={`px-2 py-1 rounded-md text-[10px] font-bold border transition-all ${_on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'}`}
-                        >
-                          {s.name}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
+              </div>
+              <div className="px-3 py-2.5 space-y-2.5 border-t border-gray-100">
                 <div>
                   <p className="text-[10px] font-bold text-gray-500 mb-1">오프닝 훅</p>
                   <div className="flex flex-wrap gap-1">
@@ -862,11 +801,62 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
                   </div>
                 </div>
               </div>
-            </details>
+            </div>
           </div>
         ) : (
           <Hint>요리/레시피 카테고리에서만 표시됩니다</Hint>
         )}
+      </RailSection>
+
+      {/* 스타일/플랫폼을 대본 프리셋에서 꺼냈다.
+          프롬프트를 실제로 만들어 비교해 보니(2026-09-27) 둘 다 나레이션을
+          건드리지 않는다:
+            style_id    → STYLE_VISUAL_BASE 만 바뀐다(장면 이미지 프롬프트)
+            platform_id → 제목/설명/해시태그 규칙 + 씬 전환 간격
+          대본 섹션에 두면 '대본을 바꾸려는데' 클릭하게 되어 헷갈린다. */}
+      <RailSection order={5} icon={<ImageIcon size={13} />} title="이미지 · 올림"
+        summary={`${opts.styles.find((s) => s.id === recipePreset?.style)?.name ?? ''} · ${opts.platforms.find((p) => p.id === recipePreset?.platform)?.name ?? ''}`}>
+        <p className="text-[10px] text-gray-400 leading-snug">
+          대본은 그대로 두고 <b className="text-gray-600">그림과 업로드 결과</b>만 바꿉니다.
+        </p>
+        <div className="grid grid-cols-2 gap-1.5">
+          <div>
+            <p className="text-[10px] font-bold text-gray-500 mb-1">
+              이미지 스타일
+              <span className="font-normal text-gray-400"> · 대본 무관</span>
+            </p>
+            <select
+              value={recipePreset?.style ?? 'realistic'}
+              onChange={(e) => recipePreset && setRecipePreset?.({ ...recipePreset, style: e.target.value })}
+              className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-bold text-gray-700 outline-none focus:border-indigo-500"
+            >
+              {opts.styles.map((s) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+            <p className="text-[9.5px] text-gray-400 mt-0.5 leading-snug">
+              {opts.styles.find((s) => s.id === (recipePreset?.style ?? 'realistic'))?.desc}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold text-gray-500 mb-1">
+              올릴 곳
+              <span className="font-normal text-gray-400"> · 해시태그 규칙</span>
+            </p>
+            <select
+              value={recipePreset?.platform ?? 'youtube'}
+              onChange={(e) => recipePreset && setRecipePreset?.({ ...recipePreset, platform: e.target.value })}
+              className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-bold text-gray-700 outline-none focus:border-indigo-500"
+            >
+              {opts.platforms.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+            <p className="text-[9.5px] text-gray-400 mt-0.5 leading-snug">
+              {opts.platforms.find((p) => p.id === (recipePreset?.platform ?? 'youtube'))?.desc}
+            </p>
+          </div>
+        </div>
       </RailSection>
 
       <RailSection order={6} icon={<Mic size={13} />} title="기본 음성 엔진" summary={engineName}>
@@ -959,7 +949,35 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
               </div>
             );
           }
-          return <Hint>백엔드 영상 파이프라인 연결 후 이 모델로 생성됩니다</Hint>;
+          return (
+            <div className="space-y-1.5">
+              <p className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 leading-snug">
+                영상 생성은 <b>과금</b>됩니다. 아래는 <b>개별 테스트 1회</b>이고,
+                전체 파이프라인에 자동으로 돌려 넣지는 않습니다.
+              </p>
+              <input
+                type="text"
+                value={testImage}
+                onChange={(e) => setTestImage(e.target.value)}
+                placeholder="테스트할 이미지 경로 (예: data/scene1.png)"
+                title="이미지 1장 → 영상 1개"
+                className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-mono text-gray-700 outline-none focus:border-indigo-500"
+              />
+              <button
+                onClick={runI2VTest}
+                disabled={i2vBusy || !testImage || !videoModel}
+                className="w-full px-3 py-2 bg-indigo-600 text-white rounded-xl text-xs font-bold hover:bg-indigo-700 disabled:opacity-40 transition-all"
+              >
+                {i2vBusy ? '생성 중… (약 1~2분)' : '이 이미지로 영상 1회 생성'}
+              </button>
+              {testResult && (
+                <p className={`text-[10.5px] font-bold break-all ${testResult.ok ? 'text-emerald-700' : 'text-red-600'}`}>
+                  {testResult.text}
+                </p>
+              )}
+              <Hint>이미지 1장 → 4초 영상 1개 (가장 저렴)</Hint>
+            </div>
+          );
         })()}
       </RailSection>
 

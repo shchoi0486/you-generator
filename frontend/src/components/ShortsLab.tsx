@@ -69,6 +69,9 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
   const [file, setFile] = useState<File | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [creating, setCreating] = useState(false);
+  // 여러 레퍼런스 누적. 예전엔 setReport(data)로 덮어써서 마지막 1개만 전달됐다.
+  // 밀도 중앙값을 쓰려면 링크를 여러 개 모아야 해서 별도 배열로 둔다.
+  const [reports, setReports] = useState<ShortsReport[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [patternName, setPatternName] = useState('');
   const [, setLibRefresh] = useState(0);
@@ -264,6 +267,14 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
         data = await api.analyzeShortsUrl(ytUrl.trim());
       }
       setReport(data);
+      // 같은 링크를 두 번 넣지 않는다(중복 분석 방지).
+      setReports((prev) => {
+        const key = (r: ShortsReport) =>
+          (r as any).video_id || (r as any).source_type || JSON.stringify(r.hook_summary || '');
+        const k = key(data as ShortsReport);
+        const rest = prev.filter((r) => key(r) !== k);
+        return [...rest, data as ShortsReport];
+      });
     } catch (e) {
       setError((e as Error).message || '분석 중 오류가 발생했습니다.');
     } finally {
@@ -278,6 +289,8 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
     try {
       const content = await api.createShorts({
         reference: JSON.stringify(report),
+        // 밀도 중앙값 계산용. 레퍼런스가 1개면 이건 쓰이지 않는다(참고용).
+        ...(reports.length > 1 ? { reference_reports: reports } : {}),
         new_topic: topic.trim(),
         duration,
         category,
@@ -523,13 +536,13 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
       {/* Mode Tabs */}
       <div className="flex bg-gray-100 p-1 rounded-lg w-fit">
         <button
-          onClick={() => { setMode('file'); setReport(null); }}
+          onClick={() => { setMode('file'); setReport(null); setReports([]); }}
           className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all flex items-center gap-1.5 ${mode === 'file' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
         >
           <Upload size={14} /> 파일 업로드
         </button>
         <button
-          onClick={() => { setMode('youtube'); setReport(null); }}
+          onClick={() => { setMode('youtube'); setReport(null); setReports([]); }}
           className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all flex items-center gap-1.5 ${mode === 'youtube' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
         >
           <Link2 size={14} /> 유튜브 링크
@@ -587,6 +600,20 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
       {/* Report */}
       {report && (
         <div className="space-y-4 bg-gray-50 rounded-2xl p-5 border border-gray-100">
+          {reports.length > 1 && (
+            <div className="flex items-center gap-2 rounded-lg bg-indigo-50 px-3 py-2">
+              <Link2 size={12} className="text-indigo-600 shrink-0" />
+              <p className="text-[11px] text-indigo-700 font-bold">
+                레퍼런스 {reports.length}개 누적됨 — 말하기 밀도는 중앙값으로 계산한다
+              </p>
+              <button
+                onClick={() => setReports([])}
+                className="ml-auto text-[10px] font-bold text-gray-500 hover:text-gray-800 shrink-0"
+              >
+                비우기
+              </button>
+            </div>
+          )}
           <div>
             <p className="text-[11px] font-black text-gray-400 uppercase tracking-widest mb-1">Hook Summary</p>
             <p className="text-sm font-bold text-gray-800">{report.hook_summary || '-'}</p>
@@ -734,15 +761,16 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
                   <div className="rounded-xl border border-indigo-100 bg-indigo-50/50 px-4 py-3">
                     <p className="text-xs font-bold text-indigo-800 mb-1.5">현재 대본 설정</p>
                     <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-indigo-900">
-                      <span>프리셋: <b>{activePresetName}</b></span>
+                      {/* '프리셋' 줄을 뺀다. activePresetName 이 이제 '톤 · 순서' 라서
+                          아래 톤/순서 줄과 같은 말을 두 번 쓰게 된다. */}
                       <span>톤: <b>{activeToneName}</b></span>
-                      <span>구조: <b>{activeStructureName}</b></span>
-                      <span>훅: <b>{activeHookName}</b></span>
+                      <span>순서: <b>{activeStructureName}</b></span>
+                      <span>오프닝 훅: <b>{activeHookName}</b></span>
+                      <span>마무리 CTA: <b>{activeCtaName}</b></span>
                       <span>스타일: <b>{(recipeOptions || FALLBACK_RECIPE_OPTIONS).styles.find((s) => s.id === presetDraft.style)?.name || presetDraft.style}</b></span>
                       <span>플랫폼: <b>{(recipeOptions || FALLBACK_RECIPE_OPTIONS).platforms.find((p) => p.id === presetDraft.platform)?.name || presetDraft.platform}</b></span>
-                      <span className="col-span-2">CTA: <b>{activeCtaName}</b></span>
                     </div>
-                    <p className="text-[10px] text-indigo-400 mt-1.5">프리셋·스타일·톤·구조·훅·CTA 변경은 제작 설정 레일의 「대본 다양화」에서 하세요</p>
+                    <p className="text-[10px] text-indigo-400 mt-1.5">대본은 「대본 프리셋」에서, 그림·해시태그는 「이미지 · 올림」에서 바꾸세요</p>
                   </div>
                   <details className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
                     <summary className="px-4 py-2.5 text-xs font-bold text-gray-500 cursor-pointer hover:text-indigo-600">

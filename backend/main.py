@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Union, Tuple, Any
 import os
 import re
+import time
 import yaml
 import asyncio
 import httpx
@@ -621,8 +622,15 @@ class ShortsUrlRequest(BaseModel):
 
 
 class ShortsCreateRequest(BaseModel):
-    reference: str  # 분석 리포트 JSON 문자열 또는 요약 텍스트
+    reference: str  # 분석 리포트 JSON 문자열 (레퍼런스 1개)
+    # 여러 링크를 분석했다면 전체를 담아준다. 말하기 밀도 중앙값 계산에 쓴다(선택).
+    # 비면 reference 하나만으로 계산한다.
+    reference_reports: Optional[List[dict]] = None
+    # 대사가 장면 길이보다 짧아 무음이 생기면 LLM을 한 번 더 불러 늘린다(과금).
+    # False면 진단만 하고 원본 유지.
+    expand_thin_scenes: Optional[bool] = True
     new_topic: str
+
     duration: Optional[int] = 40
     category: Optional[str] = "recipe_short"
     format_id: Optional[str] = None  # 모듈형 포맷 (short_30/short_60/long_5, recipe 전용)
@@ -711,7 +719,9 @@ async def shorts_create(request: ShortsCreateRequest):
                                    format_id=request.format_id, style_id=request.style_id, platform_id=request.platform_id,
                                    script_id=request.script_id, hook_id=request.hook_id,
                                    preset_id=request.preset_id, tone_id=request.tone_id,
-                                   structure_id=request.structure_id, cta_id=request.cta_id)
+                                   structure_id=request.structure_id, cta_id=request.cta_id,
+                                   reference_reports=request.reference_reports,
+                                   expand_thin_scenes=request.expand_thin_scenes)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1094,6 +1104,55 @@ async def render_video(request: RenderRequest):
         return {"status": "success", "message": "Rendering started"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class I2VRequest(BaseModel):
+    provider_id: str
+    image_path: str
+    prompt: str = ""
+    seconds: int = 5
+    aspect_ratio: Optional[str] = None
+    output_name: Optional[str] = None
+
+
+@app.post("/video/i2v")
+async def video_i2v(request: I2VRequest):
+    """이미지 1장 -> AI 영상 1개.
+
+    예전엔 어댑터(13종)와 providers.yaml 항목만 있고 이 엔드포인트가 없었다.
+    그래서 '영상 생성 모델' 선택지가 화면에만 있고 아무것도 실행되지 않았다
+    (실측: generate_i2v 호출 지점 0개). 실제 영상은 Ken Burns 뿐이었다.
+
+    과금된다. 프론트는 사용자가 명시적으로 누를 때만 호출해야 한다.
+    """
+    from core.i2v_router import generate_i2v, I2VError
+    try:
+        if not os.path.exists(request.image_path):
+            raise HTTPException(status_code=400,
+                                detail=f"이미지를 찾을 수 없습니다: {request.image_path}")
+        name = request.output_name or f"i2v_{int(time.time())}"
+        output_path = os.path.join(get_export_dir(), f"{name}.mp4")
+
+        def _run():
+            return generate_i2v(
+                request.image_path, output_path,
+                provider_id=request.provider_id,
+                prompt=request.prompt,
+                seconds=request.seconds,
+                aspect_ratio=request.aspect_ratio,
+            )
+
+        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        return {"ok": True, "path": result, "provider_id": request.provider_id}
+    except HTTPException:
+        raise                      # 이미 올바른 코드다. 500으로 덮지 않는다
+    except I2VError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"파일 없음: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"{type(e).__name__}: {str(e)[:200]}")
 
 def _ensure_port_free(port, host="127.0.0.1"):
     """포트가 사용 중이면 점유 프로세스를 종료하고 재시도한다.

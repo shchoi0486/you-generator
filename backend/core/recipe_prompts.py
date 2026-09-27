@@ -473,18 +473,31 @@ def _axis_name(axis, value):
     return m["name"] if m else value
 
 
-def resolve_recipe_axes(preset_id="random", hook_id=None, tone_id=None,
-                        cta_id=None, structure_id=None):
-    """프리셋 + 개별 축 오버라이드 → 확정된 훅/톤/구조/CTA 4종.
+AXIS_KEYS = ("hook", "tone", "structure", "cta")
+
+
+def resolve_recipe_axes(preset_id="random", **overrides):
+    """프리셋 + 축 오버라이드 → 확정된 훅/톤/구조/CTA 4종.
 
     프리셋은 한 세트이므로 '아무 축이나 섞지 말고 이 조합의 일관된 흐름을 유지'
     지시를 함께 넣는다. 명시적 오버라이드가 프리셋 값을 이긴다.
+
+    오버라이드는 슬롯 이름(hook/tone/structure/cta)으로만 받는다.
+    예전엔 위치 인자 (preset, hook, tone, cta, structure) 였는데, cta 와
+    structure 가 서로 자리를 바꿔도 '조용히 무시되고 안 바뀌는' 버그가 났다.
+    '값이 안 바뀌는' 이 '먹지 않는' 과 구분되지 않아 찾느라 오래 걸렸다(실측).
+    모르는 슬롯을 넘기면 즉시 TypeError 를 낸다 — 조용히 버리지 않는다.
     """
+    bad = sorted(set(overrides) - set(AXIS_KEYS))
+    if bad:
+        raise TypeError(
+            f"resolve_recipe_axes: 모르는 축 {bad}. "
+            f"허용되는 슬롯은 {list(AXIS_KEYS)} 입니다.")
     p = dict(_PRESET_MAP[preset_id]) if preset_id in _PRESET_MAP else dict(_random.choice(RECIPE_PRESETS))
-    for axis, override in (("hook", hook_id), ("tone", tone_id),
-                           ("structure", structure_id), ("cta", cta_id)):
-        if _axis_valid(axis, override):
-            p[axis] = override
+    for axis in AXIS_KEYS:
+        v = overrides.get(axis)
+        if _axis_valid(axis, v):
+            p[axis] = v
     return p
 
 
@@ -675,9 +688,10 @@ CORE_RECIPE_PROMPT = """
 재료 분량·조리 시간·온도·불기는 절대 생략하지 않고, 과장한 조리법을 만들지 않는다.
 
 [계량 규칙]
-- 모든 식재료·조미료는 정확한 분량을 사용한다. 단위는 g, ml, 스푼, 컵, 초, 분, 도, 약불, 중불, 강불만 쓴다. 1컵=200ml, 1스푼=15ml.
+- 모든 식재료·조미료는 정확한 분량을 사용한다. 단위는 g, ml, 큰술, 작은술, 컵, 초, 분, 도, 약불, 중불, 강불만 쓴다. 1컵=200ml, 1큰술=15ml, 1작은술=5ml.
+- 'T', 'S', 'Tbsp', 'tbsp', 'tbs' 같은 영문/약자로 쓰지 말고 반드시 '큰술'/'작은술'로 쓴다. T 는 1톤으로 읽힐 수 있어 위험하다.
 - '적당히·적절히·알아서·약간·조금·한 줌·취향껏·넉넉히·대충·살짝'처럼 분량을 대신하는 표현은 금지.
-- 실제 계량이 어려운 재료도 가능하면 g/ml/스푼/컵으로 환산한다. 억지로 세분화해 부자연스러운 숫자를 만들지 않는다.
+- 실제 계량이 어려운 재료도 가능하면 g/ml/큰술/작은술/컵으로 환산한다. 억지로 세분화해 부자연스러운 숫자를 만들지 않는다.
 
 [영상 대본 원칙]
 - 나레이션은 화면에서 실제로 일어나는 행동과 일치해야 한다. 화면에 없는 행동을 설명하지 않고, 중요한 조리 행동은 반드시 둘 다로 전달한다.
@@ -687,6 +701,14 @@ CORE_RECIPE_PROMPT = """
 
 [나레이션]
 - 실제 사람이 말하듯 자연스럽게. 과장된 광어체는 피하되 '바삭하게·노릇하게·감칠맛이 확 올라옵니다' 같은 생생한 표현은 허용한다.
+- [대본 밀도 — 무음 금지] 장면 길이만큼 말이 꽉 차야 한다.
+  - **기준은 프롬프트에 들어온 [말하기 밀도 기준]의 자/초 값이다. 그 숫자가 최우선이며,
+    아래 기본 범위와 충돌하면 [말하기 밀도 기준]을 따른다.** (레퍼런스 실측값이 있을 때)
+  - [말하기 밀도 기준]이 없으면 기본값: 1초당 공백 제외 4~5자.
+    11.5초 장면이면 공백 제외 50자 안팎, 15초 장면이면 65~70자 안팎이 기준이다.
+  - 한 문장짜리 대사로 끝내지 말고 2~3문장으로 이어 쓴다. "많이 먹어. 어때?" 같은 10자 내외 단문은 금지.
+  - 이 기준보다 짧게 쓰면 그 장면 길이만큼 무음이 생겨 영상이 끊겨 보인다. 절대 짧게 쓰지 않는다.
+- [초과 금지] 반대로 1초당 공백 제외 7자를 넘기지 않는다. 읽는 데 시간이 더 걸리면 자막이 다음 장면과 겹친다.
 """.strip()
 
 FORMATS = {
@@ -712,7 +734,7 @@ FORMATS = {
 [구성] HOOK(0~4초) → INGREDIENTS → PREP → CORE → PLATING → CTA(마지막 3초).
 - 모든 단계를 별도 장면으로 만들 필요는 없다. 재료 소개는 조리 장면과 결합할 수 있다. "INGREDIENTS 정보가 반드시 전달"되도록 한다.
 - HOOK: 완성 음식 클로즈업으로 시작. 첫 문장에서 메뉴명 명확히. 인사·자기소개 금지. 가격/속도/비주얼 중 하나만 선택해 나레이션과 자막에 일치시킨다.
-- 재료는 길게 읽지 않고 핵심만 빠르게. 세부 g/ml 분량은 화면 자막과 조리 장면에서 전달한다.
+- 재료는 핵심만 빠르게 읽되 **각 재료의 분량은 반드시 말한다**. "김치 1컵, 돼지고기 200g, 마늘 1큰술입니다."처럼 이름과 분량을 함께. 두루뭉술하게("많이 넣습니다") 넘기지 않는다.
 - 조리는 가장 중요한 과정에 시간을 집중. 반복 손질·단순 대기는 점프컷으로 처리.
 - CTA는 마지막 2~3초 이내 짧고 자연스럽게. 구독·좋아요 과도 반복 금지.
 - 무음 장면(narration_ko 빈 문자열)은 최대 2개까지.
@@ -738,7 +760,7 @@ FORMATS = {
 
 [영상 포맷: 60초 숏폼] 세로형. 목표 60초 (합계 57~63초). 장면 6~8개. 설명은 30초보다 조금 더 자세히.
 - HOOK: 완성 음식 클로즈업으로 시작. 첫 문장에서 메뉴명 명확히. 인사·자기소개 금지. 가격/속도/비주얼 중 하나만 선택해 나레이션과 자막에 일치시킨다.
-- INGREDIENTS: 재료명을 빠르게. "탕수육, 신김치, 케첩, 모짜렐라 치즈를 준비합니다." 같은 자연스러운 나레이션. 세부 g/ml은 화면 자막과 조리 장면에서 전달.
+- INGREDIENTS: 이 장면에서 **전체 재료와 정확한 분량을 모두** 말한다. 위 ingredients 배열의 모든 항목을 "재료명 + 분량"으로 나열한다. 예: "돼지고기 200g, 김치 1컵, 마늘 1큰술, 생마요리 1큰술입니다." 하나만 말하고 나머지 재료를 빼면 안 된다. 두루뭉술한 표현("많이 넣습니다", "적당히")은 금지.
 - PREP/HEAT: 손질과 조리도구(팬·냄비·오븐·에어프라이어)를 명시. 온도·불세기·시간 중 필요한 조건 표시.
 - CORE: 핵심이 만들어지는 장면을 가장 중요하게. 식감 변화와 조리 포인트 보여준다. 고기·계란 등은 안전한 조리조건 명시.
 - SEASONING: 양념 분량 정확히. '적당히·조금·약간' 금지. 넣는 순서와 필요 시간 명확히.
@@ -963,7 +985,7 @@ OUTPUT_PROMPT = """
   "storyboard": [
     {
       "section": "HOOK",
-      "speaker": "BJ 이슈왕",
+      "speaker": "나레이터",
       "narration_ko": "",
       "subtitle_ko": "",
       "sfx": "",
@@ -982,7 +1004,7 @@ OUTPUT_PROMPT = """
 
 [section] HOOK, INGREDIENTS, PREP, HEAT, CORE, SEASONING, PLATING, TASTE, CTA 중 선택. 포맷에 맞지 않는 건 생략.
 [duration_sec] 정수만. 전체 합계는 목표 영상 길이를 따른다.
-[narration_ko] TTS가 읽을 문장만. '무음' 같은 설명 금지, 무음 장면은 빈 문자열 "". 쉼표로 문장을 나누지 않는다. '명사+수량'(감자 2개)은 같은 문장에 둔다. 한 장면은 완결된 문장으로만.
+[narration_ko] TTS가 읽을 문장만. '무음' 같은 설명 금지, 무음 장면은 빈 문자열 "". 쉼표로 문장을 나누지 않는다. '명사+수량'(감자 2개)은 같은 문장에 둔다. 한 장면은 완결된 문장으로만. **길이는 duration_sec에 맞춰라 — 공백 제외 1초당 4~5자(단, [말하기 밀도 기준]이 있으면 그 값 우선). 11초 장면이면 45~55자. 이보다 짧으면 그 구간만큼 무음이 된다.** 마지막 점검: 모든 장면의 narration_ko 글자수가 [말하기 밀도 기준]의 초당 글자수 × duration_sec 이상인지 확인하고 미달이면 문장을 추가한다.
 [subtitle_ko] 실제 자막만. narration_ko와 완전히 동일한 긴 문장 반복 금지.
 [visual] 객체로. keyword는 한국어 구체적 명사구, description은 영어 프롬프트(화면 글자 생성 금지). stock_query는 영문 키워드 2~3개. filming_guide는 한글 1줄. 모든 장면에 같은 값 복사 금지 — 장면 내용이 드러나야 한다.
 [sound_prompt] 실제 음식 소리 또는 최소 효과음.
@@ -1131,7 +1153,8 @@ def compose_recipe_prompt(format_id=DEFAULT_FORMAT, style_id=DEFAULT_STYLE,
     spec = FORMAT_SPECS.get(fmt["id"], FORMAT_SPECS[DEFAULT_FORMAT])
     visual_base = STYLE_VISUAL_BASE.get(style["id"], STYLE_VISUAL_BASE[DEFAULT_STYLE])
     plat_rule = PLATFORM_RULES.get(plat["id"], PLATFORM_RULES[DEFAULT_PLATFORM])
-    axes = resolve_recipe_axes(preset_id, hook_id, tone_id, cta_id, structure_id)
+    axes = resolve_recipe_axes(preset_id, hook=hook_id, tone=tone_id,
+                               structure=structure_id, cta=cta_id)
     preset_block = preset_axes_block(axes, overridden=axes_overridden)
     try:
         tgt = int(target_sec)

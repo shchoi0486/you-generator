@@ -52,6 +52,9 @@ MAIN_CALLS_PER_SCRIPT = 1
 
 # 근거 추출 보조 호출(선택 발생). 본문 생성에 더해진다.
 EXTRA_FACT_CALL = {"in": 600, "out": 400, "reasoning": 0}
+# 수치 복구 패스 1회분 (실측 2026-09, 60초 레시피 1편: in 831 / out 905).
+# 장면에 분량이 없으면 붙는다. 안 붙으면 이 값만큼 덜 든다.
+EXTRA_REPAIR_CALL = {"in": 831, "out": 905, "reasoning": 0}
 
 # 실측 실패 = 숫자를 지어내지 않는다. UI 는 '측정 실패/미측정' 을 보여준다.
 UNMEASURED_NOTE = {
@@ -120,9 +123,12 @@ def estimate_usd(provider: Dict[str, Any]) -> Dict[str, Any]:
     cin = float(cin or 0.0)
     cout = float(cout or 0.0)
     # 근거 추출이 붙는 편이 더 잦아서 항상 더해 준다(보수적 상한).
+    # 수치 복구 패스도 붙는다. 실측 2026-09: 60초 1편이 3회 호출
+    # (본문 7450/1726 + 팩트 423/372 + 복구 831/905) = 14.0원.
+    # 예전엔 이걸 빼서 6.9원으로 표시했는데 실제로는 2배 넘게 썼다.
     n = MAIN_CALLS_PER_SCRIPT
-    in_tok = p["in"] * n + EXTRA_FACT_CALL["in"]
-    out_tok = p["out"] * n + EXTRA_FACT_CALL["out"]
+    in_tok = p["in"] * n + EXTRA_FACT_CALL["in"] + EXTRA_REPAIR_CALL["in"]
+    out_tok = p["out"] * n + EXTRA_FACT_CALL["out"] + EXTRA_REPAIR_CALL["out"]
     reas_tok = p["reasoning"] * n
     usd = (in_tok * cin + (out_tok + reas_tok) * cout) / 1_000_000.0
     return {
@@ -131,6 +137,8 @@ def estimate_usd(provider: Dict[str, Any]) -> Dict[str, Any]:
         "known": True, "estimated": False,
         "script_in": in_tok, "script_out": out_tok,
         "script_reasoning": reas_tok,
+        # 복구 패스가 실제로 붙으면 이 값이 된다. 안 붙으면 이보다 싸다.
+        "repair_optional": True,
         **p,
     }
 
