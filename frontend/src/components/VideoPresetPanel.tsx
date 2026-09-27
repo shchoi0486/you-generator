@@ -22,7 +22,7 @@ import {
   DURATION_PRESETS,
   type RecipePresetState,
 } from '../constants/recipeOptions';
-import type { CaptionStyle } from '../services/api';
+import type { CaptionStyle, RecipeOptions } from '../services/api';
 import { api } from '../services/api';
 
 // 대본 다양화 선택지는 백엔드 /shorts/recipe-options 를 단일 출처로 삼는다.
@@ -30,7 +30,7 @@ import { api } from '../services/api';
 // 목록은 ../constants/recipeOptions 에서 공유한다 — 여기와 ShortsLab에 복붙돼
 // 있어 한쪽만 고쳐 4개 프리셋의 훅이 UI에 안 뜨는 버그가 났다.
 // 프리셋에 길이가 없는 게 설계다. 길이는 DURATION_PRESETS로 따로 고른다.
-const FALLBACK_OPTIONS = FALLBACK_RECIPE_OPTIONS as unknown as typeof FALLBACK_RECIPE_OPTIONS;
+const FALLBACK_OPTIONS = FALLBACK_RECIPE_OPTIONS as unknown as RecipeOptions;
 
 async function fetchRecipeOptions() {
   // 로컬호스트를 직접 박으면 패키징(Tauri) 빌드에서 백엔드 주소가 꼬인다.
@@ -66,6 +66,41 @@ export interface ScriptFormatOption {
   flow: string;
   desc: string;
   recommended: boolean;
+}
+
+/**
+ * 대본 다양화 화면의 카드 1장 = 나레이터 톤.
+ * variants 2개는 '정보를 어떤 순서로 말하는가' 이다(같은 톤, 다른 전개).
+ * 예시 첫마디를 반드시 함께 보여준다 — 이름만으로 고르면 대부분 틀린다.
+ */
+export interface RecipeFamily {
+  id: string;
+  name: string;
+  desc: string;
+  example: string[];
+  variants: Array<{ preset: string; name: string; desc: string; example: string[] }>;
+}
+
+/**
+ * 백엔드가 families 를 주지 않는 구버전 대비. 프리셋 목록의 tone 을 묶어
+ * '톤 1개짜리 family' 로 조립한다. 화면이 비지 않도록 하는 목적이고,
+ * id 는 프리셋 id 를 그대로 쓰므로 저장은 깨지지 않는다.
+ */
+export function deriveFamiliesFromPresets(presets: Array<{
+  id: string; name: string; desc: string; tone?: string;
+}>): RecipeFamily[] {
+  const out: RecipeFamily[] = [];
+  for (const p of presets) {
+    if (p.id === 'random') continue;
+    const key = p.tone || 'unknown';
+    let f = out.find((x) => x.id === key);
+    if (!f) {
+      f = { id: key, name: p.name, desc: p.desc, example: [], variants: [] };
+      out.push(f);
+    }
+    f.variants.push({ preset: p.id, name: p.name, desc: p.desc, example: [] });
+  }
+  return out;
 }
 
 /** 템플릿 ID → 대본 포맷 그룹. 매칭 없으면 cooking(기본). */
@@ -397,7 +432,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
     );
     return hit?.id ?? CAPTION_PRESETS[0].id;
   });
-  const [recipeOptions, setRecipeOptions] = React.useState<typeof FALLBACK_OPTIONS | null>(null);
+  const [recipeOptions, setRecipeOptions] = React.useState<RecipeOptions | null>(null);
   React.useEffect(() => {
     let alive = true;
     fetchRecipeOptions().then((o) => {
@@ -406,7 +441,18 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
     return () => { alive = false; };
   }, []);
   const opts = recipeOptions || FALLBACK_OPTIONS;
-  const activePresetName = opts.presets.find((p) => p.id === (recipePreset?.preset || 'random'))?.name || '매번 변경';
+  const currentPresetId = recipePreset?.preset || 'random';
+  // families 를 '톤 6 × 변형 2' 로 본다. 백엔드가 families 를 안 주는 구버전이면
+  // 프리셋 목록을 톤 1개짜리 family 로 조립해서 화면이 비지 않게 한다.
+  const families: RecipeFamily[] = (opts as { families?: RecipeFamily[] }).families?.length
+    ? (opts as { families: RecipeFamily[] }).families
+    : deriveFamiliesFromPresets(opts.presets);
+  // 현재 선택된 프리셋이 어느 family 의 몇 번째 변형인지 역으로 찾는다.
+  const activeFamily = families.find((f) => f.variants.some((v) => v.preset === currentPresetId))
+    ?? families[0];
+  const activePresetName = currentPresetId === 'random'
+    ? '매번 변경'
+    : (opts.presets.find((p) => p.id === currentPresetId)?.name ?? '매번 변경');
   const currentScript = scriptOptions.find((f) => f.id === scriptId) ?? scriptOptions.find((f) => f.recommended) ?? scriptOptions[0];
   const engineName = ENGINE_OPTIONS.find((e) => e.id === selectedEngine)?.label ?? selectedEngine;
   const sizeName = SUBTITLE_SIZES.find((s) => s.id === subtitleSize)?.label ?? '';
@@ -560,6 +606,10 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
       </RailSection>
 
       <RailSection order={4} icon={<FileText size={13} />} title="대본 포맷" summary={currentScript?.name ?? ''}>
+        <p className="text-[10px] text-gray-400 leading-snug">
+          영상의 <b className="text-gray-600">뼈대</b>입니다. 아래 '대본 다양화'에서 말투를 고르면
+          여기에 자동 맞춰집니다.
+        </p>
         <select
           value={currentScript?.id ?? ''}
           onChange={(e) => onScriptChange(e.target.value)}
@@ -573,55 +623,109 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
           ))}
         </select>
         <Hint>{currentScript?.flow}</Hint>
-        {scriptOptions.length > 1 && (
-          <div className="space-y-1.5">
-            <p className="text-[10px] font-bold text-gray-400">다른 포맷</p>
-            <div className="flex flex-wrap gap-1.5">
-              {scriptOptions.filter((f) => f.id !== currentScript?.id).map((f) => (
-                <button
-                  key={f.id}
-                  onClick={() => onScriptChange(f.id)}
-                  title={f.flow}
-                  className="px-2.5 py-1 rounded-lg text-[11px] font-bold border border-gray-200 bg-white text-gray-500 hover:border-indigo-300 hover:text-indigo-600 transition-all"
-                >
-                  {f.recommended ? `★ ${f.name}` : f.name}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* 예전엔 드롭다운 아래에 '다른 포맷' 칩을 또 그렸다. 같은 목록을 두 번
+            보여주므로 칩을 눌러도 드롭다운 값만 바뀌고 헤이더 설명은 안 따라왔다.
+            한 곳만 둔다. */}
       </RailSection>
 
       <RailSection order={5} icon={<Clapperboard size={13} />} title="대본 다양화" summary={activePresetName}>
         {recipePreset && setRecipePreset ? (
           <div className="space-y-3">
+            <p className="text-[10px] text-gray-400 leading-snug">
+              <b className="text-gray-600">어떻게 말할지</b>를 고르세요. 전개 순서는 아래에서 바꿉니다.
+            </p>
+            {/* ── 톤 6장 ── */}
             <div className="grid grid-cols-2 gap-1.5">
-              {opts.presets.map((p) => {
-                const on = (recipePreset.preset || 'random') === p.id;
+              {families.map((f) => {
+                const on = currentPresetId !== 'random' && f.id === activeFamily.id;
                 return (
                   <button
-                    key={p.id}
+                    key={f.id}
                     onClick={() => {
                       // 프리셋의 축을 state에 굳히지 않는다. 굳히면 그 스냅샷이
                       // 명시 파라미터로 계속 전송되어, 나중에 서버가 프리셋 톤을
                       // 바꿔도 브라우저가 옛 값을 덮어써 영영 못 본다(실측 구조).
                       // 빈 문자열 = '오버라이드 없음'으로 두고 서버가 프리셋 값으로
                       // 채우게 한다(백엔드 우선순위: 파라미터 > 프리셋 > 저장값).
+                      // 이 톴을 이미 골랐다면 그 안에서 고른 변형을 유지한다.
+                      const keep = f.variants.findIndex((v) => v.preset === currentPresetId);
+                      const idx = keep >= 0 ? keep : 0;
                       setRecipePreset({
                         ...recipePreset,
-                        preset: p.id,
+                        preset: f.variants[idx]?.preset ?? f.variants[0].preset,
                         hook: '', tone: '', structure: '', cta: '',
                       });
                     }}
-                    title={p.desc}
-                    className={`text-left px-3 py-2 rounded-lg border transition-all ${on ? 'border-indigo-500 bg-indigo-50 ring-1 ring-indigo-200' : 'border-gray-200 bg-white hover:border-indigo-300'}`}
+                    className={`text-left px-2.5 py-1.5 rounded-lg border transition-all ${
+                      on ? 'border-indigo-500 bg-indigo-50 ring-1 ring-indigo-200'
+                        : 'border-gray-200 bg-white hover:border-indigo-300'}`}
                   >
-                    <p className={`text-xs font-bold ${on ? 'text-indigo-700' : 'text-gray-700'}`}>{p.name}</p>
-                    <p className="text-[10px] text-gray-400 leading-snug mt-0.5">{p.desc}</p>
+                    <p className={`text-[11.5px] font-bold ${on ? 'text-indigo-700' : 'text-gray-700'}`}>
+                      {f.name}
+                    </p>
+                    <p className="text-[9.5px] text-gray-400 leading-snug mt-0.5 line-clamp-2">{f.desc}</p>
+                    {f.example[0] && (
+                      <p className="text-[9.5px] text-indigo-500 leading-snug mt-1 line-clamp-2">
+                        “{f.example[0]}”
+                      </p>
+                    )}
                   </button>
                 );
               })}
             </div>
+
+            {/* ── 전개 순서 2칩 ── */}
+            <div>
+              <p className="text-[10px] font-bold text-gray-500 mb-1">
+                말하는 순서 · <span className="text-indigo-600">{activeFamily.name}</span> 기준
+              </p>
+              <div className="grid grid-cols-2 gap-1.5">
+                {activeFamily.variants.map((v) => {
+                  const on = currentPresetId === v.preset;
+                  return (
+                    <button
+                      key={v.preset}
+                      onClick={() => setRecipePreset({
+                        ...recipePreset, preset: v.preset,
+                        hook: '', tone: '', structure: '', cta: '',
+                      })}
+                      className={`text-left px-2.5 py-1.5 rounded-lg border transition-all ${
+                        on ? 'border-violet-400 bg-violet-50 ring-1 ring-violet-200'
+                          : 'border-gray-200 bg-white hover:border-violet-300'}`}
+                    >
+                      <p className={`text-[11px] font-bold ${on ? 'text-violet-700' : 'text-gray-600'}`}>
+                        {v.name}
+                      </p>
+                      <p className="text-[9.5px] text-gray-400 leading-snug mt-0.5">{v.desc}</p>
+                      {v.example[0] && (
+                        <p className="text-[9.5px] text-violet-500 leading-snug mt-1 line-clamp-2">
+                          “{v.example[0]}”
+                        </p>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* ── 무작위 ── */}
+            <button
+              onClick={() => setRecipePreset({
+                ...recipePreset, preset: 'random',
+                hook: '', tone: '', structure: '', cta: '',
+              })}
+              className={`w-full text-left px-2.5 py-1.5 rounded-lg border transition-all ${
+                currentPresetId === 'random'
+                  ? 'border-gray-400 bg-gray-100'
+                  : 'border-dashed border-gray-300 bg-white hover:border-gray-400'}`}
+            >
+              <p className="text-[11px] font-bold text-gray-700">
+                매번 다르게 <span className="text-gray-400 font-normal">(매번 랜덤)</span>
+              </p>
+              <p className="text-[9.5px] text-gray-400 leading-snug mt-0.5">
+                만들 때마다 12가지 중 하나가 자동으로 골라집니다
+              </p>
+            </button>
             <div className="grid grid-cols-2 gap-1.5">
               <div>
                 <p className="text-[10px] font-bold text-gray-500 mb-1">스타일</p>

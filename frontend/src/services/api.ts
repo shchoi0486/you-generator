@@ -121,6 +121,17 @@ export interface RecipeOptions {
     id: string; name: string; desc: string;
     hook?: string; tone?: string; structure?: string; cta?: string;
   }>;
+  /**
+   * 화면용 묶음. 프리셋 12장을 '톤 6 × 변형 2' 로 접은 것이다.
+   * 이름만 보고 고르면 거의 틀리므로 각 항목에 첫마디 예시를 둔다.
+   * variant.preset 은 위 presets 의 id 와 같아(그래서 저장은 그대로 두어도 된다).
+   */
+  families?: Array<{
+    id: string; name: string; desc: string; example: string[];
+    variants: Array<{
+      preset: string; name: string; desc: string; example: string[];
+    }>;
+  }>;
   tones: Array<{ id: string; name: string; desc: string }>;
   structures: Array<{ id: string; name: string; desc: string }>;
   ctas: Array<{ id: string; name: string; desc: string }>;

@@ -331,6 +331,120 @@ RECIPE_PRESETS = [
      "hook": "empathy", "tone": "self_deprecating", "structure": "fail_try", "cta": "emotion"},
 ]
 
+# ── 화면용: 톤 6 × 변형 2 ───────────────────────────────────────
+# 왜 이게 있나
+#     RECIPE_PRESETS 12개는 '톤 × 정보순서' 를 미리 엮은 것이다. 그런데 카드로
+#     펼쳐서 보여주면 이름에 톤/구조/CTA 가 섞여서 뜻이 안 읽힌다
+#     ('브금 개그 리듬' 과 '브금 개그 결론 먼저' 는 나레이터가 똑같고 순서만 다르다).
+#     12장을 6장 + 칩 2개로 줄이고, 각 카드에 '첫마디 예시' 를 넣는다.
+#     이름을 보고 고르면 거의 틀리지만, 첫마디를 읽으면 바로 안다.
+#     preset id 는 그대로라 저장된 설정과 생성 경로는 손댈 필요가 없다.
+PRESET_FAMILIES = [
+    {
+        "id": "casual_first",
+        "name": "담백 낭독",
+        "desc": "조리 과정을 빠짐없이 읽어주듯. 조용하고 편안하게.",
+        "example": ["아, 이거 왜 이제야.", "근데 진짜 10분이면 돼."],
+        "variants": [
+            {"preset": "read_aloud", "name": "그냥 진행",
+             "desc": "재료 → 손질 → 조리 → 완성",
+             "example": ["아, 이거 왜 이제야.", "닭갈비 하나 하면 저녁 끝."]},
+            {"preset": "read_aloud_problem", "name": "왜 안 되지?",
+             "desc": "안 되는 증상 → 원인 → 해결",
+             "example": ["닭이 질겨? 그건 양념이 먼저야.",
+                         "꿀 먼저 넣고, 그 다음에 간장."]},
+        ],
+    },
+    {
+        "id": "warm_recall",
+        "name": "옛날 기억",
+        "desc": "다 먹어본 그 맛으로. 따뜻하고 천천히.",
+        "example": ["옛날에 아빠가 하던 그거, 기억나?", "그때는 이거 안 사도 돼."],
+        "variants": [
+            {"preset": "childhood_noodle", "name": "그냥 진행",
+             "desc": "재료 → 조리 → 완성",
+             "example": ["옛날에 아빠가 하던 그거, 기억나?",
+                         "면은 두 손으로 쳐넣었지."]},
+            {"preset": "childhood_question", "name": "왜 그 맛?",
+             "desc": "물음으로 열고 → 추억으로 답",
+             "example": ["왜 그때는 이 맛이었을까?",
+                         "장 오래 끓였기 때문이야."]},
+        ],
+    },
+    {
+        "id": "instruction_mix",
+        "name": "따라만 하기",
+        "desc": "단계 안내형. 뭐를 해야 하는지 또렷하게.",
+        "example": ["오늘 저녁은 이거면 끝.", "근육 먼저 넣고, 그 다음 양념."],
+        "variants": [
+            {"preset": "chef_manuals", "name": "순서대로",
+             "desc": "손질부터 불 세기까지 순서대로",
+             "example": ["오늘 저녁은 이거면 끝.", "근육 먼저 넣고, 그 다음 양념."]},
+            {"preset": "chef_manuals_provoke", "name": "결과부터",
+             "desc": "완성물 보여준 뒤 → 레시피로",
+             "example": ["이거 사먹지 마세요.", "10분이면 됩니다."]},
+        ],
+    },
+    {
+        "id": "bracket_quirk",
+        "name": "브금 개그",
+        "desc": "재미 먼저. 조리 사이사이에 한마디씩 툭.",
+        "example": ["[자막] 근데 이거 왜 이렇게 맛있지?"],
+        "variants": [
+            {"preset": "moony_bracket", "name": "순서대로",
+             "desc": "인사 → 조리 → 자막 툭툭",
+             "example": ["안녕하세요, 오늘의 요리는.",
+                         "[자막] 근데 이거 왜 이렇게 맛있지?"]},
+            {"preset": "moony_bracket_provoke", "name": "결과부터",
+             "desc": "완성부터 보여주고 → 만드는 법",
+             "example": ["[자막] 이거 완성물입니다.",
+                         "[자막] 만드는 건 10분."]},
+        ],
+    },
+    {
+        "id": "mz_blunt",
+        "name": "한 입 대본",
+        "desc": "사다 쓰듯. 짧고 강한 단문.",
+        "example": ["면 넣었다. 끓었다. 끝."],
+        "variants": [
+            {"preset": "shinzo_blunt", "name": "순서대로",
+             "desc": "동작만 나열, 설명 없음",
+             "example": ["닭 넣었다.", "양념 넣었다.", "끓었다. 끝."]},
+            {"preset": "shinzo_blunt_provoke", "name": "반박",
+             "desc": "'그게 틀렸다' 는 반박부터",
+             "example": ["닭갈비가 어렵다고?", "양념이 먼저야. 그게 다야."]},
+        ],
+    },
+    {
+        "id": "self_deprecating",
+        "name": "친근하게 툭",
+        "desc": "아저씨 반말. 조리 사이에 툭 던지는 말.",
+        "example": ["최소는 형이 먹으세요."],
+        "variants": [
+            {"preset": "ttukddik_banter", "name": "순서대로",
+             "desc": "반말 한마디씩, 조리 사이사이에",
+             "example": ["최소는 형이 먹으세요.", "근데 이건 진짜 쉬워."]},
+            {"preset": "ttukddik_banter_provoke", "name": "실패담",
+             "desc": "망한 이야기 먼저 → 해결로",
+             "example": ["내가 맨날 망쳤거든.", "근데 이건 되더라."]},
+        ],
+    },
+]
+
+_FAMILY_BY_PRESET = {}
+for _fam in PRESET_FAMILIES:
+    for _i, _var in enumerate(_fam["variants"]):
+        _FAMILY_BY_PRESET[_var["preset"]] = {
+            "family_id": _fam["id"],
+            "variant": _i,
+        }
+
+
+def family_of(preset_id: str):
+    """프리셋 id → 어느 family's 몇 번째 변형인지. 없으면 None."""
+    return _FAMILY_BY_PRESET.get(preset_id)
+
+
 _HOOK_BLOCKS = {vid: vblock for vid, vblock in HOOK_VARIANTS}
 _AXIS_LISTS = {
     "tone": TONE_VARIANTS,
@@ -1138,6 +1252,7 @@ def list_recipe_options():
             for p in PLATFORMS.values()
         ],
         "hooks": HOOK_META,
+        "families": [dict(f) for f in PRESET_FAMILIES],
         "presets": [
             {"id": "random", "name": "매번 변경",
              "desc": f"생성할 때마다 {len(RECIPE_PRESETS)}종 중 무작위 세트"}

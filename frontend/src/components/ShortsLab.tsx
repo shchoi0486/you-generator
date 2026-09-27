@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Upload, Link2, Zap, Hash, Clock, Loader2, X, Settings2, Check, FileText, ExternalLink, Sparkles } from 'lucide-react';
-import { api, type ShortsReport, type AppContent, type Article } from '../services/api';
+import { api, type ShortsReport, type AppContent, type Article, type RecipeOptions } from '../services/api';
 import {
   FALLBACK_RECIPE_OPTIONS as RECIPE_FALLBACK,
   EMPTY_RECIPE_PRESET,
@@ -17,7 +17,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 // 백엔드 /shorts/recipe-options 실패 시 폴백.
 // 목록은 ../constants/recipeOptions 에서 공유한다 — 이 컴포넌트와
 // VideoPresetPanel에 복붙돼 있어 한쪽만 고쳐 훅 2종이 누락된 버그가 났다.
-const FALLBACK_RECIPE_OPTIONS = RECIPE_FALLBACK as unknown as typeof RECIPE_FALLBACK;
+const FALLBACK_RECIPE_OPTIONS = RECIPE_FALLBACK as unknown as RecipeOptions;
 
 type RecipePresetOption = { id: string; name: string; desc: string };
 
@@ -366,9 +366,18 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
     (RecipePresetOption & { tone?: string; structure?: string; hook?: string; cta?: string }) | undefined;
   const _isRandomPreset = !_preset || !_preset.tone;
   const _fallback = (label: string) => (_isRandomPreset ? '생성 시 무작위' : label);
-  const activePresetName = _opts.presets.find((p) => p.id === (_src.preset || 'random'))?.name || '매번 변경';
-  const activeToneName = _nameOf(_opts.tones, _src.tone || _preset?.tone) || _fallback('프리셋 지정대로');
-  const activeStructureName = _nameOf(_opts.structures, _src.structure || _preset?.structure) || _fallback('프리셋 지정대로');
+  // 요약에는 옛 프리셋 이름(읽어주기 낭독 등) 대신 '톤 + 전개' 로 보여준다.
+  // 12장 카드가 6톤 + 2칩으로 접혔으므로, 이름만 보면 무엇을 고른 건지 안 보인다.
+  const _fam = _opts.families?.find((f) => f.variants.some((v) => v.preset === _src.preset));
+  const _var = _fam?.variants.find((v) => v.preset === _src.preset);
+  const activePresetName = (_src.preset || 'random') === 'random'
+    ? '매번 다르게'
+    : (_fam ? `${_fam.name} · ${_var?.name ?? ''}`.trim() : '매번 변경');
+  const activeToneName = _fam?.name || _nameOf(_opts.tones, _src.tone || _preset?.tone)
+    || _fallback('프리셋 지정대로');
+  const activeStructureName = _var?.name
+    || _nameOf(_opts.structures, _src.structure || _preset?.structure)
+    || _fallback('프리셋 지정대로');
   const activeHookName = _nameOf(_opts.hooks, _src.hook || _preset?.hook) || _fallback('프리셋 지정대로');
   const activeCtaName = _nameOf(_opts.ctas, _src.cta || _preset?.cta) || _fallback('프리셋 지정대로');
 

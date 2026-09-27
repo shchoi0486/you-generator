@@ -20,8 +20,24 @@ export type FallbackPresetOption = {
   cta?: string;
 };
 
+export type FallbackFamilyVariant = {
+  preset: string;
+  name: string;
+  desc: string;
+  example: string[];
+};
+
+export type FallbackFamily = {
+  id: string;
+  name: string;
+  desc: string;
+  example: string[];
+  variants: FallbackFamilyVariant[];
+};
+
 export type FallbackRecipeOptions = {
   presets: FallbackPresetOption[];
+  families: FallbackFamily[];
   styles: { id: string; name: string; desc: string }[];
   platforms: { id: string; name: string; desc: string }[];
   hooks: { id: string; name: string; desc: string }[];
@@ -66,6 +82,65 @@ export const FALLBACK_RECIPE_OPTIONS: FallbackRecipeOptions = {
     { id: 'shinzo_blunt_provoke', name: '한 입 대본 반박형', desc: "한 입 대본의 속도를 유지한 채, '이거 틀렸어요' 질문으로 반박부터 시작", hook: 'question', tone: 'mz_blunt', structure: 'problem_cause_fix', cta: 'ask_viewer' },
     { id: 'ttukddik_banter', name: '친근하게 툭', desc: "'최소는 형이 먹으세요' 같은 한마디를 조리 사이에 툭 던지는 반말", hook: 'provoke', tone: 'self_deprecating', structure: 'silent_list', cta: 'emotion' },
     { id: 'ttukddik_banter_provoke', name: '친근하게 툭 실패론', desc: '친근한 반말로 먼저 망한 이야기를 꺼내고, 그다음 해결로 넘어감', hook: 'empathy', tone: 'self_deprecating', structure: 'fail_try', cta: 'emotion' },
+  ],
+  // 위 presets 13장을 '톤 6 × 변형 2' 로 접은 화면용 묶음.
+  // 1:1 로 맞추야 한다 — id 와 variant.preset 이 어긋나면 사용자가 고른 톤과
+  // 실제 생성되는 프리셋이 달라진다(백엔드 recipe_prompts.PRESET_FAMILIES 참조).
+  families: [
+    {
+      id: 'casual_first', name: '담백 낭독',
+      desc: '조리 과정을 빠짐없이 읽어주듯. 조용하고 편안하게.',
+      example: ['아, 이거 왜 이제야.', '근데 진짜 10분이면 돼.'],
+      variants: [
+        { preset: 'read_aloud', name: '그냥 진행', desc: '재료 → 손질 → 조리 → 완성', example: ['아, 이거 왜 이제야.', '닭갈비 하나 하면 저녁 끝.'] },
+        { preset: 'read_aloud_problem', name: '왜 안 되지?', desc: '안 되는 증상 → 원인 → 해결', example: ['닭이 질겨? 그건 양념이 먼저야.', '꿀 먼저 넣고, 그 다음에 간장.'] },
+      ],
+    },
+    {
+      id: 'warm_recall', name: '옛날 기억',
+      desc: '다 먹어본 그 맛으로. 따뜻하고 천천히.',
+      example: ['옛날에 아빠가 하던 그거, 기억나?', '그때는 이거 안 사도 돼.'],
+      variants: [
+        { preset: 'childhood_noodle', name: '그냥 진행', desc: '재료 → 조리 → 완성', example: ['옛날에 아빠가 하던 그거, 기억나?', '면은 두 손으로 쳐넣었지.'] },
+        { preset: 'childhood_question', name: '왜 그 맛?', desc: '물음으로 열고 → 추억으로 답', example: ['왜 그때는 이 맛이었을까?', '장 오래 끓였기 때문이야.'] },
+      ],
+    },
+    {
+      id: 'instruction_mix', name: '따라만 하기',
+      desc: '단계 안내형. 뭐를 해야 하는지 또렷하게.',
+      example: ['오늘 저녁은 이거면 끝.', '근육 먼저 넣고, 그 다음 양념.'],
+      variants: [
+        { preset: 'chef_manuals', name: '순서대로', desc: '손질부터 불 세기까지 순서대로', example: ['오늘 저녁은 이거면 끝.', '근육 먼저 넣고, 그 다음 양념.'] },
+        { preset: 'chef_manuals_provoke', name: '결과부터', desc: '완성물 보여준 뒤 → 레시피로', example: ['이거 사먹지 마세요.', '10분이면 됩니다.'] },
+      ],
+    },
+    {
+      id: 'bracket_quirk', name: '브금 개그',
+      desc: '재미 먼저. 조리 사이사이에 한마디씩 툭.',
+      example: ['[자막] 근데 이거 왜 이렇게 맛있지?'],
+      variants: [
+        { preset: 'moony_bracket', name: '순서대로', desc: '인사 → 조리 → 자막 툭툭', example: ['안녕하세요, 오늘의 요리는.', '[자막] 근데 이거 왜 이렇게 맛있지?'] },
+        { preset: 'moony_bracket_provoke', name: '결과부터', desc: '완성부터 보여주고 → 만드는 법', example: ['[자막] 이거 완성물입니다.', '[자막] 만드는 건 10분.'] },
+      ],
+    },
+    {
+      id: 'mz_blunt', name: '한 입 대본',
+      desc: '사다 쓰듯. 짧고 강한 단문.',
+      example: ['면 넣었다. 끓었다. 끝.'],
+      variants: [
+        { preset: 'shinzo_blunt', name: '순서대로', desc: '동작만 나열, 설명 없음', example: ['닭 넣었다.', '양념 넣었다.', '끓었다. 끝.'] },
+        { preset: 'shinzo_blunt_provoke', name: '반박', desc: "'그게 틀렸다' 는 반박부터", example: ['닭갈비가 어렵다고?', '양념이 먼저야. 그게 다야.'] },
+      ],
+    },
+    {
+      id: 'self_deprecating', name: '친근하게 툭',
+      desc: '아저씨 반말. 조리 사이에 툭 던지는 말.',
+      example: ['최소는 형이 먹으세요.'],
+      variants: [
+        { preset: 'ttukddik_banter', name: '순서대로', desc: '반말 한마디씩, 조리 사이사이에', example: ['최소는 형이 먹으세요.', '근데 이건 진짜 쉬워.'] },
+        { preset: 'ttukddik_banter_provoke', name: '실패담', desc: '망한 이야기 먼저 → 해결로', example: ['내가 맨날 망쳤거든.', '근데 이건 되더라.'] },
+      ],
+    },
   ],
   tones: [
     { id: 'casual_first', name: '담백 1인칭', desc: '반말체, 담담한 1인칭' },
