@@ -2,6 +2,7 @@ import React from 'react';
 import { Edit2, FileText, ExternalLink, Sparkles, Users, Clapperboard, ChefHat, ShoppingBag, Lightbulb, Plane, ArrowLeft, ArrowRight, Zap } from 'lucide-react';
 import ShortsLab from './ShortsLab';
 import type { AppContent, Article, ShortsReport } from '../services/api';
+import type { RecipePresetState } from '../constants/recipeOptions';
 
 const NEWS_SUBMODES = [
   { id: 'news_duo', name: '2인 대화', desc: 'BJ 이슈왕 vs 박 앵커' },
@@ -45,8 +46,8 @@ interface Step1InputProps {
   handleScrape: () => void;
   loading: boolean;
   onAutoMake: (source: 'news' | 'shorts') => void;
-  recipePreset: { format: string; style: string; platform: string; hook?: string };
-  setRecipePreset: (p: { format: string; style: string; platform: string }) => void;
+  recipePreset: RecipePresetState;
+  setRecipePreset: (p: RecipePresetState) => void;
   phase: 'pick' | 'input';
   setPhase: (p: 'pick' | 'input') => void;
   onCategoryPick?: (tplId: string) => void;
@@ -65,7 +66,6 @@ const Step1Input: React.FC<Step1InputProps> = ({
   directText,
   setDirectText,
   duration,
-  setDuration,
   templateId,
   setTemplateId,
   shortsMode,
@@ -235,9 +235,7 @@ const Step1Input: React.FC<Step1InputProps> = ({
             topic={shortsTopic}
             setTopic={setShortsTopic}
             duration={duration}
-            setDuration={setDuration}
             category={shortsCategory}
-            setCategory={setShortsCategory}
             onDirectCreate={onShortsDirectCreate}
             onAutoMake={() => onAutoMake('shorts')}
             recipePreset={recipePreset}

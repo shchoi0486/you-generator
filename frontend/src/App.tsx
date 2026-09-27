@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+﻿import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -23,6 +23,8 @@ import {
   type StickerItem,
   type StockVideo,
   type CaptionStyle,
+  type ProviderKeyList,
+  type ProviderPlan,
   API_BASE_URL,
   assetUrl
 } from './services/api';
@@ -55,6 +57,7 @@ import {
   languages, 
   steps 
 } from './constants/data';
+import { EMPTY_RECIPE_PRESET, type RecipePresetState } from './constants/recipeOptions';
 
 
 interface SrtItem { id: number; start: number; end: number; text: string; scene?: number }
@@ -281,6 +284,14 @@ function App() {
   } | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
+  // 프로바이더 키 목록 (암호화 저장소 기준). 설정 화면과 가격 팝업이 공유한다.
+  const [providerKeys, setProviderKeys] = useState<ProviderKeyList | null>(null);
+  const [, setLoadingProviderKeys] = useState(false);
+  // 모델 선택 계획 (1순위 + 편당 비용)
+  const [plan, setPlan] = useState<ProviderPlan | null>(null);
+  const [loadingPlan, setLoadingPlan] = useState(false);
+    const [planScenes, setPlanScenes] = useState(4);
+  const [planI2v, setPlanI2v] = useState(0);
   const [voiceMap, setVoiceMap] = useState<Record<string, string>>({
     "BJ 이슈왕": "ko-KR-InJoonNeural",
     "박 앵커": "ko-KR-SunHiNeural"
@@ -305,6 +316,39 @@ function App() {
   useEffect(() => {
     selectedAiModelRef.current = selectedAiModel;
   }, [selectedAiModel]);
+
+  // ── 프로바이더 키 목록 (암호화 저장소) ──────────────────────
+  // 키를 등록/삭제하면 즉시 다시 읽어야 배지·모델 수가 갱신된다.
+  const refreshProviderKeys = useCallback(async () => {
+    setLoadingProviderKeys(true);
+    try {
+      setProviderKeys(await api.getProviderKeys());
+    } catch (e) {
+      console.error('[providers] 목록 조회 실패', e);
+    } finally {
+      setLoadingProviderKeys(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshProviderKeys();
+  }, [refreshProviderKeys, activeMenu]);
+
+  const refreshPlan = useCallback(async () => {
+    setLoadingPlan(true);
+    try {
+      setPlan(await api.getProviderPlan({
+        scenes: planScenes, i2v_scenes: planI2v, i2v_sec: 5,
+      }));
+    } catch (e) {
+      console.error('[plan] 조회 실패', e);
+    } finally {
+      setLoadingPlan(false);
+    }
+  }, [planScenes, planI2v]);
+
+  useEffect(() => { void refreshPlan(); }, [refreshPlan, activeMenu]);
+
   const [voiceSettings, setVoiceSettings] = useState<Record<string, { rate: string, pitch: string }>>({});
   const [gapDuration, setGapDuration] = useState<number>(0.5);
   const [playingSegmentIndex, setPlayingSegmentIndex] = useState<number | null>(null);
@@ -412,7 +456,7 @@ function App() {
   const [voiceRate, setVoiceRate] = useState<string>('+0%');
   const [subtitleSize, setSubtitleSize] = useState<'small' | 'medium' | 'large'>('medium');
   // 모듈형 레시피 프롬프트 프리셋 (포맷/스타일/플랫폼/훅) — 전역 설정, 로컬+백엔드 config에 저장
-  const [recipePreset, setRecipePreset] = useState<{ format: string; style: string; platform: string; hook?: string; preset?: string; tone?: string; structure?: string; cta?: string }>(() => {
+  const [recipePreset, setRecipePreset] = useState<RecipePresetState>(() => {
     try {
       const raw = localStorage.getItem('recipe-prompt-preset');
       if (raw) {
@@ -786,6 +830,11 @@ function App() {
       bgColor,
       sceneFits,
       zoomPct,
+      // 프로젝트마다 달라야 하는 제작 설정. 빠져서 다른 프로젝트를 열면
+      // 이전 프로젝트의 대본 프리셋/자막 스타일이 딸려 온다(실측).
+      subtitleStyle,
+      showSceneCaptions,
+      recipePreset,
       lastModified: new Date().toISOString()
     };
     
@@ -823,6 +872,7 @@ function App() {
     inputType, article, content, audio, visualCandidates, 
     selectedVisuals, clipTrims, sceneLayouts, showSceneCaptions, extraMedia, voiceMap, selectedEngine, selectedLanguage, 
     voiceSettings, gapDuration, cutSpeed, scriptId, voiceRate, subtitleSize, srtData, captionStyle,
+    subtitleStyle, recipePreset,
     transition, videoFilter, sceneFilters, stickers, mediaFit, bgStyle, bgColor, sceneFits
   ]);
 
@@ -871,7 +921,9 @@ function App() {
       setSubtitleStyle({
         preset: 'default',
         font: 'Noto Sans KR',
-        font_size: 70,
+        // 70은 실수로 들어간 값이었다. 초기 상태(App.tsx:344)와 subtitlePresets.default
+        // 의 font_size이 20이라 리셋하면 "기본/보통"을 고른 화면에 70px로 그려졌다.
+        font_size: subtitlePresets.default?.font_size ?? 20,
         color: '#FFD76A',
         stroke_color: 'transparent',
         stroke_width: 0,
@@ -955,6 +1007,11 @@ function App() {
         if (mergedData.subtitleSize) setSubtitleSize(mergedData.subtitleSize);
         if (mergedData.subtitleStyle) setSubtitleStyle(mergedData.subtitleStyle);
         if (mergedData.captionStyle) setCaptionStyle((prev) => ({ ...prev, ...mergedData.captionStyle }));
+        // 대본 프리셋을 안 복원하면 다른 프로젝트를 열 때 이전 프로젝트의
+        // 톤/구조/CTA가 딸려온다(저장 시 빠졌으므로 로드 시도 없었음).
+        if (mergedData.recipePreset) {
+          setRecipePreset({ ...EMPTY_RECIPE_PRESET, ...mergedData.recipePreset });
+        }
         if (mergedData.transition) setTransition(mergedData.transition);
         if (mergedData.videoFilter) setVideoFilter(mergedData.videoFilter);
         if (mergedData.mediaFit) setMediaFit(mergedData.mediaFit);
@@ -2455,6 +2512,8 @@ function App() {
             setVideoModel={setVideoModel}
             hasMinimaxKey={!!(config?.minimax_api_key as string)}
             hasFalKey={!!(config?.fal_key as string)}
+            recipePreset={recipePreset}
+            setRecipePreset={setRecipePreset}
             mediaFit={mediaFit}
             setMediaFit={setMediaFit}
             bgStyle={bgStyle}
@@ -2472,12 +2531,19 @@ function App() {
             })}
             subtitleSize={subtitleSize}
             onSubtitleSizeChange={(s) => {
-              setSubtitleSize(s);
+              const prevFactor = SUBTITLE_SIZES.find((x) => x.id === subtitleSize)?.factor ?? 1;
               const factor = SUBTITLE_SIZES.find((x) => x.id === s)?.factor ?? 1;
+              setSubtitleSize(s);
               setSubtitleStyle((prev) => {
                 const base = (subtitlePresets as Record<string, { font_size: number }>)[prev.preset]?.font_size ?? 20;
                 return { ...prev, font_size: Math.round(base * factor) };
               });
+              // '자막 크기'라 적혀 있는데 상단 자막만 그대로면 절반만 바뀌어
+              // 패널이 거짓말을 한다. 이전 배율 대비 비율을 상단에도 그대로 적용한다.
+              setCaptionStyle((prev) => ({
+                ...prev,
+                font_size: Math.max(8, Math.round((prev.font_size || 13) * (factor / prevFactor))),
+              }));
             }}
             showSubtitles={subtitleStyle.show_subtitles}
             onToggleSubtitles={(v) => setSubtitleStyle((prev) => ({ ...prev, show_subtitles: v }))}
@@ -2900,8 +2966,16 @@ function App() {
               setVisibleKeys={setVisibleKeys}
               fetchCloudflareUsage={fetchCloudflareUsage}
               isFetchingUsage={isFetchingUsage}
-              cfUsage={cfUsage}
-            />
+                cfUsage={cfUsage}
+                providerKeys={providerKeys}
+                plan={plan}
+                loadingPlan={loadingPlan}
+                refreshPlan={refreshPlan}
+                planScenes={planScenes}
+                setPlanScenes={setPlanScenes}
+                planI2v={planI2v}
+                setPlanI2v={setPlanI2v}
+              />
           ) : activeMenu === 'Marketing' ? (
             <MarketingHub />
           ) : activeMenu === 'Posting' ? (

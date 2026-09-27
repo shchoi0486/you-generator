@@ -32,13 +32,30 @@ except Exception as e:
 
 block_cipher = None
 
+# 키가 제거된 설정 템플릿을 만든다(원본 settings.yaml 은 건드리지 않는다).
+# 2026-09-27: 이 spec 이 config/settings.yaml 을 그대로 번들해 개발자의
+# gemini/pexels/cloudflare 키가 배포물에 박히는 사고가 있었다.
+_SCRUB_FN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'you-backend-onefile.spec')
+with open(_SCRUB_FN, 'r', encoding='utf-8') as _f:
+    _spec_src = _f.read()
+_ns: dict = {}
+exec(compile(_spec_src.split("try:\n    from PyInstaller.utils.hooks")[0],
+             _SCRUB_FN, 'exec'), _ns)
+_SRC_SETTINGS = os.path.join(os.path.abspath('config'), 'settings.yaml')
+if not os.path.exists(_SRC_SETTINGS):
+    _SRC_SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'config', 'settings.yaml')
+_CLEAN_SETTINGS = _ns['_build_settings_template'](_SRC_SETTINGS)
+
 a = Analysis(
     ['main.py'],
     pathex=[os.path.abspath('.')],
     binaries=azure_binaries,
     datas=[
-        # default settings template (user copy lives in %LOCALAPPDATA%/YouGenerator)
-        ('config/settings.yaml', 'config'),
+        # 키가 제거된 템플릿. 사용자 키는 %LOCALAPPDATA% 에 암호화 저장된다.
+        (_CLEAN_SETTINGS, 'config'),
+        ('config/providers.yaml', 'config'),
     ] + extra_datas,
     hiddenimports=[
         'moviepy',

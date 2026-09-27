@@ -71,11 +71,299 @@ export interface ImageGenConfig {
   [key: string]: unknown;
 }
 
+// 프리셋/축 ID. 12종 프리셋으로 교체하며 사라진 옛 ID(jachae_real 등)는 없다.
+// 유니온으로 박아두면 프리셋을 추가/삭제할 때 여기서 컴파일 에러가 난다.
+export type RecipePresetId =
+  | 'random'
+  | 'read_aloud' | 'read_aloud_problem'
+  | 'childhood_noodle' | 'childhood_question'
+  | 'chef_manuals' | 'chef_manuals_provoke'
+  | 'moony_bracket' | 'moony_bracket_provoke'
+  | 'shinzo_blunt' | 'shinzo_blunt_provoke'
+  | 'ttukddik_banter' | 'ttukddik_banter_provoke';
+
+export type RecipeToneId =
+  | 'casual_first' | 'mz_blunt' | 'sensory' | 'retro' | 'authority'
+  | 'self_deprecating' | 'polite_guide' | 'warm_recall'
+  | 'instruction_mix' | 'bracket_quirk';
+
+export type RecipeHookId =
+  | 'random' | 'question' | 'provoke' | 'empathy' | 'number' | 'twist'
+  | 'regret' | 'greeting';
+
+export type RecipeStructureId =
+  | 'fail_try' | 'conclusion_first' | 'silent_list' | 'problem_cause_fix';
+
+export type RecipeCtaId =
+  | 'save' | 'comment' | 'subscribe' | 'follow' | 'emotion' | 'ask_viewer';
+
+// 백엔드 settings.yaml 의 recipe_prompt_preset 구조.
+// 전부 선택 사항이다 — shorts_lab.py 가 없는 필드를preset 기본값으로 채운다.
+// 특히 format은 'auto'가 정답이고, 누락돼도 'realistic'/'youtube'로 떨어진다.
 export interface RecipePromptPreset {
-  format: string;
-  style: string;
-  platform: string;
-  hook?: string;
+  format?: string;
+  style?: string;
+  platform?: string;
+  preset?: RecipePresetId | string;
+  hook?: RecipeHookId | string;
+  tone?: RecipeToneId | string;
+  structure?: RecipeStructureId | string;
+  cta?: RecipeCtaId | string;
+}
+
+/** /shorts/recipe-options 응답. 프론트 폴백(constants/recipeOptions)과 항목이 1:1이다. */
+export interface RecipeOptions {
+  formats?: Array<{ id: string; name: string; desc: string; target_sec?: number }>;
+  styles: Array<{ id: string; name: string; desc: string }>;
+  platforms: Array<{ id: string; name: string; desc: string }>;
+  hooks: Array<{ id: string; name: string; desc: string }>;
+  presets: Array<{
+    id: string; name: string; desc: string;
+    hook?: string; tone?: string; structure?: string; cta?: string;
+  }>;
+  tones: Array<{ id: string; name: string; desc: string }>;
+  structures: Array<{ id: string; name: string; desc: string }>;
+  ctas: Array<{ id: string; name: string; desc: string }>;
+  defaults?: {
+    format: string; style: string; platform: string;
+    hook: string; preset: string;
+    duration_presets?: number[];
+  };
+}
+
+/** /providers/pricing 응답의 한 행. providers.yaml 이 단일 출처다. */
+export interface ProviderRow {
+  id: string;
+  label: string;
+  adapter: string | null;
+  unit: string;
+  usd: number | null;
+  krw: string;
+  quality: number | null;
+  speed: string | null;
+  modes: string[];
+  max_refs: number;
+  /** 실제로 참조 이미지를 반영함이 눈으로 확인된 경로인지. */
+  i2i_verified: boolean;
+  res?: string | null;
+  max_sec?: number | null;
+  enabled: boolean;
+  byok: boolean;
+  needs_key: boolean;
+  key_env: string | null;
+  /** byok | settings | env | none */
+  key_source: string;
+  has_key: boolean;
+  /** enabled 이고 키도 있다 = 지금 바로 쓸 수 있다 */
+  ready: boolean;
+  adapter_implemented: boolean;
+  signup: string | null;
+  notes: string;
+}
+
+export interface ProviderPricing {
+  usd_krw: number;
+  image: ProviderRow[];
+  video: ProviderRow[];
+  tts: ProviderRow[];
+  llm: ProviderRow[];
+  tiers: Record<string, {
+    label: string;
+    desc: string;
+    i2i_allowed: boolean;
+    images: string[];
+    videos: string[];
+  }>;
+  security: { encrypted: boolean; method: string; warning: string | null; store_path: string; count: number };
+}
+
+export interface ProviderKeyRow {
+  id: string;
+  label: string;
+  uses: string;
+  signup: string | null;
+  required: boolean;
+  tier_hint: string;
+  /** secret = 마스킹 필요, url = 비밀값 아님, plain = 공개 값 */
+  kind: 'secret' | 'url' | 'plain';
+  has_key: boolean;
+  /** 앞 4 / 끝 2 만 남긴 값. 평문 키는 절대 오지 않는다. */
+  masked: string | null;
+  source: string;
+  /** 이 키를 쓰는 항목 전체 */
+  enables: string[];
+  /** 어댑터가 있고 켜져 있어서 '지금 바로' 쓸 수 있는 항목 */
+  usable_now: string[];
+  usable_count: number;
+  enables_count: number;
+}
+
+export interface ProviderKeyList {
+  keys: ProviderKeyRow[];
+  security: ProviderPricing['security'];
+  overrides: ProviderOverrides;
+  i2i: {
+    capable: string[];
+    verified: string[];
+    ready: string[];
+    available: boolean;
+    reason: string;
+  };
+  i2v?: ProviderCapability['i2v'];
+  tts: ProviderCapability['tts'];
+}
+
+export interface ProviderCapability {
+  i2i: ProviderKeyList['i2i'];
+  i2v: {
+    providers: {
+      id: string;
+      label: string;
+      adapter: string | null;
+      adapter_ok: boolean;
+      enabled: boolean;
+      has_key: boolean;
+      needs_key: boolean;
+      key_env: string | null;
+      cost_per_sec: number | null;
+      res: string | null;
+      max_sec: number | null;
+    }[];
+    ready: string[];
+    need_key: string[];
+    missing_adapter: string[];
+    note: string;
+  };
+  modes: Record<string, Record<string, string[]>>;
+  tts: {
+    providers: {
+      id: string;
+      label: string;
+      adapter: string | null;
+      adapter_ok: boolean;
+      enabled: boolean;
+      has_key: boolean;
+      needs_key: boolean;
+      key_env: string | null;
+      cost_per_1m_chars: number | null;
+      free: boolean;
+    }[];
+    ready: string[];
+    free_ready: string[];
+    need_key: string[];
+    missing_adapter: string[];
+  };
+}
+
+export interface ProviderOverrides {
+  path: string;
+  enabled: Record<string, boolean>;
+  pinned: Record<string, boolean>;
+}
+
+export interface ProviderPlanRow {
+  id: string;
+  label: string;
+  adapter: string | null;
+  /**
+   * yes = 실제 코드가 있음
+   * stub = 껍데기
+   * missing = 어댑터 없음
+   * config = 어댑터가 아니라 설정(config)으로 관리되는 경로(대본)
+   */
+  adapter_state: 'yes' | 'stub' | 'missing' | 'config';
+  enabled: boolean;
+  enabled_by_user: boolean;
+  needs_key: boolean;
+  has_key: boolean;
+  key_env: string | null;
+  modes: string[];
+  i2i_verified?: boolean;
+  cost_usd: number | null;
+  unit: string;
+  /** null 이면 장당 비용이 아니라 '별도 과금' (토큰 등) */
+  cost_krw: number | null;
+  quality?: number;
+  res?: string;
+  tier_ranked: boolean;
+  /** 사용자가 '1순위로 지정' 한 항목 */
+  pinned: boolean;
+  notes: string;
+  /** 켜져 있고 + 키 있고 + 어댑터 있음 = 실제로 사용 가능 */
+  ready: boolean;
+}
+
+export interface ProviderPlan {
+  usd_krw: number;
+  /** 표시 순서: 대본 → 이미지 → 영상 → 음성 */
+  kind_order: string[];
+  kinds: Record<string, {
+    label: string;
+    rows: ProviderPlanRow[];
+    /** 전체 모델 수 (펼침 여부와 무관) */
+    model_count: number;
+    model_on: number;
+    model_ready: number;
+    /** 키 없이 바로 쓸 수 있는 무료 모델 수 */
+    free_count: number;
+    paid_count: number;
+    key_count: number;
+    /** 이 종류에 쓰이는 키. 그 키가 여는 모델이 models 에 들어 있다. */
+    key_groups: Array<{
+      key_env: string | null;
+      label: string;
+      uses: string;
+      signup: string | null;
+      required: boolean;
+      tier_hint: string;
+      kind: 'secret' | 'url' | 'plain' | 'none';
+      has_key: boolean;
+      masked: string | null;
+      models: ProviderPlanRow[];
+    }>;
+    /** 키를 넣어야 열리는 그룹 (접혀 있음) */
+    key_groups_rest: Array<{
+      key_env: string | null;
+      label: string;
+      uses: string;
+      signup: string | null;
+      required: boolean;
+      tier_hint: string;
+      kind: 'secret' | 'url' | 'plain' | 'none';
+      has_key: boolean;
+      masked: string | null;
+      models: ProviderPlanRow[];
+    }>;
+  }>;
+  totals: Record<string, {
+    usd: number;
+    krw: number;
+    /** fixed = 편당 고정액 / separate = 사용량 비례 별도 과금 / none = 사용 안 함 */
+    billed: 'fixed' | 'separate' | 'none';
+    first: string | null;
+    first_label: string;
+    unit: string;
+    note: string;
+  }>;
+  /** 장당 환산이 가능한 항목(이미지·영상·음성)의 합계 */
+  fixed_krw: number;
+  total_krw: number;
+  total_usd: number;
+  /** 대본이 토큰 과금이라 합계에 포함되지 않음 */
+  llm_separate: boolean;
+  has_cost: boolean;
+  cost_warning: string;
+}
+
+export interface ToggleResult {
+  ok: boolean;
+  kind: string;
+  id: string;
+  enabled: boolean;
+  has_key: boolean;
+  adapter: string | null;
+  warnings: string[];
+  note: string;
 }
 
 export interface AppConfig {
@@ -317,7 +605,17 @@ const handleFetch = async (url: string, options: RequestInit) => {
       } else {
         errorMessage = `Status ${response.status}: ${response.statusText}`;
       }
-      
+
+      // 402/401은 대본 문제가 아니라 결제·키 문제다. 사용자가 원인을 알 수 있게
+      // 앞에 한 줄 붙인다(실측: 429가 '모델 응답 파싱 실패'로만 떠서 막막했다).
+      if (response.status === 402) {
+        errorMessage = `AI 한도 초과 · ${errorMessage}`;
+      } else if (response.status === 401) {
+        errorMessage = `인증 실패 · ${errorMessage}`;
+      } else if (response.status === 429) {
+        errorMessage = `요청이 너무 많습니다 · ${errorMessage}`;
+      }
+
       throw Object.assign(new Error(errorMessage), { status: response.status });
     }
     return response.json();
@@ -407,7 +705,7 @@ export const api = {
     });
   },
 
-  getRecipeOptions: async () => {
+  getRecipeOptions: async (): Promise<RecipeOptions> => {
     return handleFetch(`${API_BASE_URL}/shorts/recipe-options`, {});
   },
 
@@ -473,6 +771,131 @@ export const api = {
 
   getTypecastActors: async (): Promise<{ actors: Array<{ actor_id: string; label: string }> }> => {
     return handleFetch(`${API_BASE_URL}/tts/typecast-actors`, {});
+  },
+
+  // ── 프로바이더 가격/키 (BYOK) ─────────────────────────────
+  // 가격표는 providers.yaml 이 단일 출처다. 프론트에 하드코딩하지 않는다.
+  getProviderPricing: async (): Promise<ProviderPricing> => {
+    return handleFetch(`${API_BASE_URL}/providers/pricing`, {});
+  },
+
+  getProviderKeys: async (): Promise<ProviderKeyList> => {
+    return handleFetch(`${API_BASE_URL}/providers/keys`, {});
+  },
+
+  /** 키 저장. value 를 빈 문자열로 보내면 삭제된다. */
+  saveProviderKey: async (keyId: string, value: string): Promise<{
+    ok: boolean;
+    key_id: string;
+    deleted: boolean;
+    masked: string | null;
+    enabled_now: string[];
+    /** 차단되진 않지만 '보통과 다른 형식' 이라는 안내 */
+    format_note?: string | null;
+    message: string;
+    note: string;
+  }> => {
+    return handleFetch(`${API_BASE_URL}/providers/keys`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key_id: keyId, value }),
+    });
+  },
+
+  /** 형식 + 실제 API 호출 검증. 과금 없이 가능한 범위에서만 호출한다. */
+  validateProviderKey: async (keyId: string, value: string): Promise<{
+    ok: boolean;
+    stage: string;
+    message: string;
+    format_note?: string | null;
+  }> => {
+    return handleFetch(`${API_BASE_URL}/providers/keys/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key_id: keyId, value }),
+    });
+  },
+
+  /** 프로바이더 1개로 실제 생성 1회(과금됨). 어댑터 동작 확인용. */
+  testProvider: async (kind: string, providerId: string, prompt?: string) => {
+    return handleFetch(`${API_BASE_URL}/providers/keys/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, provider_id: providerId, prompt }),
+    });
+  },
+
+  getProviderCapability: async (): Promise<ProviderCapability> => {
+    return handleFetch(`${API_BASE_URL}/providers/keys/capability`, {});
+  },
+
+  /** 이 PC 에 저장된 활성 오버라이드. */
+  getProviderOverrides: async (): Promise<ProviderOverrides> => {
+    return handleFetch(`${API_BASE_URL}/providers/overrides`, {});
+  },
+
+  /** TTS 1회 생성 + 미리듣기. 과금된다(짧은 문장). */
+  testTTS: async (body: { provider_id?: string; text?: string; voice?: string }): Promise<{
+    ok: boolean;
+    message: string;
+    bytes: number;
+    audio_url?: string | null;
+    diagnostic?: Record<string, unknown>;
+  }> => {
+    return handleFetch(`${API_BASE_URL}/providers/tts/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** 모델 선택 계획: 1순위가 무엇이고 얼마가 듣는지. */
+  getProviderPlan: async (opts: {
+    scenes?: number; i2v_scenes?: number; i2v_sec?: number;
+  } = {}): Promise<ProviderPlan> => {
+    const q = new URLSearchParams({
+      scenes: String(opts.scenes ?? 4),
+      i2v_scenes: String(opts.i2v_scenes ?? 0),
+      i2v_sec: String(opts.i2v_sec ?? 5),
+    });
+    return handleFetch(`${API_BASE_URL}/providers/plan?${q.toString()}`, {});
+  },
+
+  /** 모델 켜기/끄기. providers.yaml 은 건드리지 않는다. */
+  toggleProvider: async (
+    kind: string,
+    id: string,
+    enabled: boolean,
+    pinned = false
+  ): Promise<ToggleResult> => {
+    return handleFetch(`${API_BASE_URL}/providers/toggle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, id, enabled, pinned }),
+    });
+  },
+
+  /** 폴백 체인에서 이 모델을 맨 앞에 고정/해제 */
+  pinProvider: async (kind: string, id: string, pinned: boolean) => {
+    return handleFetch(`${API_BASE_URL}/providers/pin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, id, pinned }),
+    });
+  },
+
+  /** 이 키를 쓰는 모델을 한 번에 켠다. */
+  autoEnableProviders: async (keyId: string) => {
+    return handleFetch(`${API_BASE_URL}/providers/auto-enable`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key_id: keyId }),
+    });
+  },
+
+  /** 오버라이드 전부 해제 → providers.yaml 기본값으로 복귀 */
+  resetProviderOverrides: async () => {
+    return handleFetch(`${API_BASE_URL}/providers/reset`, { method: 'POST' });
   },
 
   // Project Management API

@@ -8,6 +8,8 @@ import time
 import asyncio
 import re
 import uuid
+
+from . import key_store
 try:
     from . import assets_downloader
     from .assets_downloader import clean_keyword
@@ -1521,7 +1523,7 @@ def search_pexels_videos(keyword, count=4, use_cache=True, refresh=False):
     캐시: (쿼리, 개수) 키로 결과 재사용. 파일명은 URL 해시라 중복 다운로드 없음."""
     config = load_config()
     img_conf = config.get("image_gen", {})
-    api_key = img_conf.get("pexels_api_key")
+    api_key = key_store.resolve_key("pexels_api_key", config, env="PEXELS_API_KEY")
     if not api_key:
         raise ValueError("Pexels API 키가 없습니다. 설정 화면에서 입력하세요 (pexels.com 무료 발급).")
 
@@ -1686,7 +1688,8 @@ async def generate_scene_candidates(scene, index, project_id="default", ai_count
             elif selected_ai_model == "gemini":
                 res = generate_image_gemini(
                     refined, path,
-                    config.get('gemini_api_key'),
+                    key_store.resolve_key("gemini_api_key", config,
+                                         env="GEMINI_API_KEY"),
                     model=img_conf.get('gemini_image_model'),
                     width=width, height=height,
                 )

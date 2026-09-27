@@ -326,19 +326,48 @@ async def qwen_tts_worker(text, voice, output_path, config):
         # Qwen3-TTS 모델 설정 (기본값: qwen3-tts-flash)
         model = config.get('qwen_model', 'qwen3-tts-flash')
 
-        # DashScope v2 SDK에서는 synthesizer 생성 시점에 voice를 지정하거나,
-        # call() 시점에 voice를 지정할 수 있습니다.
-        # 여기서는 synthesizer 생성 시점에 기본값을 설정합니다.
-        synthesizer = SpeechSynthesizer(model=model, voice=voice)
+        # dashscope SDK 버전에 따라 시그니처가 다르다.
+        #   1.27.x : SpeechSynthesizer(model, voice, format=..., instruction=...)
+        #            .call(text, timeout_millis=None)      ← voice 를 call 에 못 넘긴다
+        #   구버전 : .call(text, voice=..., parameters=...)
+        # 예전 코드는 .call(text, voice=voice) 로 호출해서
+        # TypeError 로 항상 실패했다(설치된 1.27.6 기준).
+        import inspect as _inspect
+        # 인스턴스를 만들기 전에 클래스 메서드의 시그니처를 본다.
+        try:
+            call_sig = _inspect.signature(SpeechSynthesizer.call)
+            call_accepts_voice = 'voice' in call_sig.parameters
+        except (TypeError, ValueError):
+            call_accepts_voice = False
+
+        init_kwargs = {'model': model, 'voice': voice}
+        if instruct:
+            # 1.27.x 는 instruction 을 생성자에 받는다
+            try:
+                init_params = _inspect.signature(SpeechSynthesizer.__init__).parameters
+                if 'instruction' in init_params:
+                    init_kwargs['instruction'] = instruct
+            except (TypeError, ValueError):
+                pass
+        try:
+            synthesizer = SpeechSynthesizer(**init_kwargs)
+        except TypeError:
+            # 구버전은 생성자 인자가 다를 수 있으므로 최소 인자로 되돌린다
+            synthesizer = SpeechSynthesizer(model=model, voice=voice)
 
         # 오디오 파일로 저장
         def run_call():
             print(f"DEBUG: DashScope Call - Voice: {voice}, Instruct: {instruct}")
-            # v2 SDK의 call 메서드 파라미터 확인: text 외에 voice를 명시적으로 전달
-            # instruct는 parameters={'instruct': instruct} 형태로 전달 시도
+            if call_accepts_voice:
+                if instruct:
+                    return synthesizer.call(text, voice=voice,
+                                            parameters={'instruct': instruct})
+                return synthesizer.call(text, voice=voice)
+            if instruct and 'instruction' in init_kwargs:
+                return synthesizer.call(text)
             if instruct:
-                return synthesizer.call(text, voice=voice, parameters={'instruct': instruct})
-            return synthesizer.call(text, voice=voice)
+                return synthesizer.call(text, parameters={'instruct': instruct})
+            return synthesizer.call(text)
 
         audio = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -626,14 +655,31 @@ async def edge_tts_worker(text, voice, output_path, rate="+0%", pitch="+0Hz"):
         return False
 
 
-async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=None, engine=None, rate="+0%", pitch="+0Hz", progress_callback=None, gap_duration=0.5):
-    """전체 스크립트를 음성 파일로 만들고 SRT 자막 생성. gap_duration은 문장 간 무음 간격(초)"""
+async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=None, engine=None, rate="+0%", pitch="+0Hz", progress_callback=None, gap_duration=0.5, tts_provider=None, tts_tier="free"):
+    """전체 스크립트를 음성 파일로 만들고 SRT 자막 생성. gap_duration은 문장 간 무음 간격(초)
+
+    tts_provider
+        providers.yaml 의 TTS id 를 주면 core/tts_router.py 가 그 프로바이더로
+        생성한다(키는 암호화 저장소에서, 음성 이름은 프로바이더 규약으로 자동 변환).
+        주지 않으면 아래의 기존 폴백 체인(edge → azure → qwen ...)을 그대로 쓴다.
+    """
     import hashlib
     import shutil
     import io
     from pydub import AudioSegment
 
     config = load_config()
+
+    # tts_provider 가 지정되면 라우터가 워커를 직접 고른다.
+    router_mode = bool(tts_provider)
+    router = None
+    if router_mode:
+        try:
+            from . import tts_router
+            router = tts_router
+        except ImportError:
+            from core import tts_router as router
+
     use_azure = (config.get('use_azure_tts', False) and config.get('azure_speech_key')) or \
                 (config.get('use_cloudflare_tts_proxy', False) and config.get('cloudflare_worker_url'))
 
@@ -714,11 +760,14 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
                 current_pitch = speaker_settings.get('pitch', pitch)
 
             # 캐시 키 생성 (텍스트, 목소리, 엔진, 속도, 피치 조합)
-            cache_key = hashlib.md5(f"{text_to_speak}_{voice}_{engine}_{current_rate}_{current_pitch}".encode()).hexdigest()
+            # tts_provider 도 캐시 키에 넣어야 한다. 같은 문장을 Edge 와 Qwen 으로
+            # 각각 생성하면 캐시가 서로 덮어써서 "무료로 Qwen 음성" 이 나온다.
+            _eng_key = tts_provider or engine
+            cache_key = hashlib.md5(f"{text_to_speak}_{voice}_{_eng_key}_{current_rate}_{current_pitch}".encode()).hexdigest()
             cache_path = os.path.join(cache_dir, f"{cache_key}.mp3")
 
             # 베이스 캐시 키 (속도/피치 제외 - 로컬 처리용)
-            base_cache_key = hashlib.md5(f"{text_to_speak}_{voice}_{engine}_+0%_+0Hz".encode()).hexdigest()
+            base_cache_key = hashlib.md5(f"{text_to_speak}_{voice}_{_eng_key}_+0%_+0Hz".encode()).hexdigest()
             base_cache_path = os.path.join(cache_dir, f"{base_cache_key}.mp3")
 
             temp_segment_path = os.path.join(audio_dir, f"temp_{idx}.mp3")
@@ -745,8 +794,31 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
 
             # 3. 캐시가 없으면 생성 (최초 1회만 토큰 소모)
             if not success:
-                # 3.0 Edge TTS (무료 - 직접 생성하여 최상의 품질 유지)
-                if is_edge:
+                # 3.0 라우터 모드 (providers.yaml 이 워커를 고른다)
+                if router_mode:
+                    try:
+                        print(f"DEBUG: tts_router -> {tts_provider} idx={idx} voice={voice}")
+                        ok, detail = await router.synthesize(
+                            text_to_speak, base_cache_path,
+                            provider_id=tts_provider,
+                            voice=voice, rate=current_rate, pitch=current_pitch,
+                            tier=tts_tier,
+                        )
+                        if ok:
+                            # rate/pitch 가 기본값이면 cache_key == base_cache_key 다.
+                            # 이때 shutil.copy 는 "같은 파일" 이라고 예외를 낸다.
+                            if os.path.abspath(base_cache_path) != os.path.abspath(cache_path):
+                                shutil.copy(base_cache_path, cache_path)
+                            success = True
+                            print(f"DEBUG: tts_router OK: {detail}")
+                        else:
+                            print(f"DEBUG: tts_router FAIL: {detail}")
+                    except Exception as e:
+                        print(f"DEBUG: tts_router exception idx={idx}: {e}")
+                        success = False
+
+                # 3.0b Edge TTS (무료 - 직접 생성하여 최상의 품질 유지)
+                if not success and not router_mode:
                     try:
                         print(f"DEBUG: Edge TTS Direct Generation via worker - Index: {idx}, Voice: {voice}, Rate: {current_rate}, Pitch: {current_pitch}")
 
@@ -764,7 +836,8 @@ async def create_audio_and_srt(script_data, voice_map, output_name, output_dir=N
                         success = False
 
                 # 3.1 유료 엔진용 베이스 버전 생성 (토큰 1회만 소모)
-                if not success:
+                # 라우터 모드에서는 이미 처리했으므로 건너뛴다(중복 과금 방지).
+                if not success and not router_mode:
                         print(f"DEBUG: Generating base audio (1 Token) to allow free future adjustments: {base_cache_key}")
                         base_success = False
 

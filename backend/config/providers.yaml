@@ -1,0 +1,794 @@
+# AI 프로바이더 레지스트리
+#
+# 왜 이 파일이 있는가
+#   모델을 코드에 하드코딩하면 새 모델 추가마다 Python 함수를 만들고 if/elif를 추가하고
+#   settings.yaml 키를 늘려야 했다. visual_engine.py 가 정확히 그렇게 1,990줄이 됐다.
+#   이 파일이 그 단일 출처(single source of truth)다.
+#
+# 원칙
+#   1. enabled: false 인 항목은 코드가 존재해도 절대 호출하지 않는다. (키 없음/미검증)
+#   2. key_env 는 '키가 저장되는 settings.yaml 항목 이름'이다. 평문 키를 여기에 쓰지 않는다.
+#   3. caps 는 '실측/문서로 확인된 한계'만 적는다. 추정은 적지 않는다.
+#   4. status 는 코드 밖의 현실 상태다. healthcheck 로 자동 갱신된다.
+#
+# 2026-09-27 실측 상태
+#   - cloudflare_api_token : "Invalid access token" (4100) → 전 계정 접근 불가
+#   - gemini_api_key       : 정상
+#   - pexels_api_key       : 정상
+#   - pollinations         : 무키 정상
+#   즉 현재 '참조 이미지(i2i)를 무키로 쓸 수 있는 경로'는 하나도 없다.
+
+version: 1
+
+# 가격 표기용 환율. USD 단가를 한국어로 보여줄 때만 쓴다(청구 근거가 아님).
+pricing:
+  usd_krw: 1370
+  note: "표기용 환율. 실제 청구 금액은 각 provider 공식가 기준."
+
+# ─────────────────────────────────────────────────────────────
+# 이미지 생성
+# ─────────────────────────────────────────────────────────────
+image:
+  # ── 무키 / 무료 ──────────────────────────────────────────
+  pollinations_flux:
+    label: "Pollinations FLUX"
+    adapter: pollinations
+    modes: [t2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: null
+    quality: 62
+    speed: slow
+    enabled: true
+    notes: >
+      키가 필요 없다. 느리고 가끔 429/대체이미지를 돌려주지만 무료 티어가 유일하게
+      '계정 없이도 도는' 경로다. 이 프로젝트의 무료 경로 1순위.
+
+  pollinations_turbo:
+    label: "Pollinations Turbo"
+    adapter: pollinations
+    modes: [t2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: null
+    quality: 55
+    speed: fast
+    enabled: true
+    notes: "flux 보다 빠르다. 품질이 낮아 폴백 2순위로 둔다."
+
+  pexels_stock:
+    label: "Pexels (실사 사진)"
+    adapter: pexels
+    modes: [search]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: pexels_api_key
+    quality: 88          # 실제 사진이라 '생성물'보다 제품 광고에 낫다
+    speed: fast
+    enabled: true
+    notes: >
+      AI 생성이 아니라 실제 사진이다. 제품/상가 이미지는 생성보다 이쪽이 신뢰도가
+      높고 싸다. 제품 광고 1순위로 쓸 가치가 있다.
+
+  # ── 유료 / 키 필요 ───────────────────────────────────────
+  # ── 2026-09-27 실측 결과: i2i 전부 불가 ────────────────────
+  # 아래 pollinations_edit 경로는 HTTP 200 을 반환하지만 **참조 이미지를 무시한다**.
+  #   실측: 입력=빨간 텀블러 / 출력=완전히 다른 물건(사람 사진).
+  #        model 인자(kontext/nanobanana/flux)를 줘도 3개가 바이트까지 동일(76,643B)
+  #        = model 이 무시되고 t2i 로 랜덤 생성되고 있다는 증거.
+  #   즉 200 OK 는 '성공'이 아니라 'i2i 미지원'의 신호다.
+  #   잘못 켜면 '제품이 매 컷 다른 물건' 상태가 되므로 enabled:false 를 유지한다.
+  #   어댑터는 _adapter_pollinations_edit 에 남아 있으나 reguard 로 막아뒀다.
+  pollinations_kontext:
+    label: "Pollinations Kontext (참조 이미지) — 실측 무효"
+    adapter: pollinations_edit
+    modes: [i2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: pollinations_api_key
+    model_id: kontext
+    quality: 0
+    speed: medium
+    enabled: false
+    notes: >
+      200 응답이으나 참조 이미지를 반영하지 않는다(실측: 텀블러 입력 -> 사람 사진 출력).
+      model 인자도 무시된다. i2i 로 쓸 수 없다.
+
+  pollinations_nanobanana:
+    label: "Pollinations Nano Banana — 실측 무효"
+    adapter: pollinations_edit
+    modes: [i2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: pollinations_api_key
+    model_id: nanobanana
+    quality: 0
+    speed: slow
+    enabled: false
+    notes: "kontext 와 동일하게 model 인자가 무시된다(실측 바이트 동일). i2i 불가."
+
+  # ── BYOK 유료 (사용자 키 등록 → 실제 사용 가능) ──────────
+  # 단가는 2026-09 기준 각 서비스 공식 가격표. frontend ModelPricingModal 의
+  # IMAGE_ROWS/VIDEO_ROWS 값을 여기로 옮겨 단일 출처로 만들었다.
+  minimax_image_01:
+    label: "MiniMax image-01"
+    adapter: minimax_image
+    modes: [t2i]
+    cost_usd: 0.0035
+    max_refs: 0
+    key_env: minimax_api_key
+    base_url_key: minimax_base_url
+    quality: 70
+    speed: fast
+    enabled: false           # 키 등록 후 true
+    byok: true
+    notes: >
+      최저가(장당 약 5원). 단 i2i 는 지원하지 않는다(실측 전 · 미검증).
+      So '참조 이미지 유지' 를 표기해선 안 된다 — Pollinations 이 그렇게 당했었다.
+
+  nano_banana_2_1k:
+    label: "Nano Banana 2 1K (권장)"
+    adapter: gemini_image
+    modes: [t2i, i2i]
+    cost_usd: 0.067
+    max_refs: 14
+    key_env: gemini_api_key
+    model_id: gemini-3.1-flash-image
+    quality: 88
+    speed: medium
+    enabled: false
+    byok: false              # 이미 키 보유
+    i2i_verified: false
+    recommended: true
+    notes: "제품 일관성의 유일한 유력 후보. 429 로 미검증 — 눈으로 확인 후 i2i_verified."
+
+  nano_banana_2_2k:
+    label: "Nano Banana 2 2K"
+    adapter: gemini_image
+    modes: [t2i, i2i]
+    cost_usd: 0.101
+    max_refs: 14
+    key_env: gemini_api_key
+    model_id: gemini-3.1-flash-image
+    quality: 90
+    speed: slow
+    enabled: false
+    recommended: false
+    notes: "고해상도. 해상도 파라미터를 어댑터가 받아야 한다."
+
+  nano_banana_2_4k:
+    label: "Nano Banana 2 4K"
+    adapter: gemini_image
+    modes: [t2i, i2i]
+    cost_usd: 0.151
+    max_refs: 14
+    key_env: gemini_api_key
+    model_id: gemini-3.1-flash-image
+    quality: 92
+    speed: slow
+    enabled: false
+    notes: "고해상도. 어댑터 해상도 지원 필요."
+
+  nano_banana_pro:
+    label: "Nano Banana Pro 1K/2K"
+    adapter: gemini_image
+    modes: [t2i, i2i]
+    cost_usd: 0.134
+    max_refs: 14
+    key_env: gemini_api_key
+    model_id: gemini-3-pro-image
+    quality: 94
+    speed: slow
+    enabled: false
+    notes: "고품질. 복잡한 구도/지문 렌더링 우위."
+
+  openai_gpt_image:
+    label: "GPT Image 계열 (토큰 과금)"
+    adapter: openai_image
+    modes: [t2i, i2i]
+    cost_usd: 0.0            # 토큰 기반이라 장당 고정가 없다
+    cost_note: "토큰 기반 · 이미지 크기/품질에 따라 상이"
+    max_refs: 10
+    key_env: openai_api_key
+    quality: 92
+    speed: medium
+    enabled: false
+    byok: true
+    notes: "지문 렌더링 최강. 단가 고정 아니라 사용량 따라 변한다."
+
+  gemini_nano_banana_lite:
+    label: "Nano Banana 2 Lite"
+    adapter: gemini_image
+    modes: [t2i]
+    cost_usd: 0.02
+    max_refs: 0              # Lite 는 참조이미지 미지원(Google 문서)
+    key_env: gemini_api_key
+    model_id: gemini-3.1-flash-lite-image
+    quality: 70
+    speed: fast
+    enabled: true
+    notes: "Google 문서상 '가장 빠르고 저렴한 Gemini 이미지 모델'. 참조이미지는 지원하지 않는다."
+
+  gemini_nano_banana_2:
+    label: "Nano Banana 2 (내부)"
+    adapter: gemini_image
+    modes: [t2i, i2i]
+    cost_usd: 0.08
+    max_refs: 14
+    key_env: gemini_api_key
+    model_id: gemini-3.1-flash-image
+    quality: 88
+    speed: medium
+    enabled: false
+    i2i_verified: false
+    hidden: true             # 사용자 노출 안 함 (nano_banana_2_1k 가 대표)
+    notes: "구 항목. nano_banana_2_1k 로 대체했다(가격 $0.08 -> $0.067)."
+
+  seedream_5:
+    label: "Seedream 5.0"
+    adapter: seedream
+    modes: [t2i, i2i]
+    cost_usd: 0.068
+    max_refs: 14
+    key_env: null             # 미등록. 고객 BYOK 전제.
+    quality: 93
+    speed: medium
+    enabled: false
+    i2i_verified: false
+    notes: "어댑터 미구현 + 키 미등록. 등록·구현 후 눈으로 검증하고 i2i_verified 를 켠다."
+
+  cloudflare_flux:
+    label: "Cloudflare FLUX.1 Schnell"
+    adapter: cloudflare
+    modes: [t2i]
+    cost_usd: 0.003
+    max_refs: 0
+    key_env: cloudflare_api_token
+    model_id: "@cf/black-forest-labs/flux-1-schnell"
+    quality: 76
+    speed: fast
+    enabled: false           # ← 2026-09-27 실측: 키가 Invalid access token
+    notes: >
+      t2i 전용이다. prompt 외 속성을 보내면 400이므로 i2i 를 지원하지 않는다.
+      이전 계획의 'i2i 최저가 입구'였으나 키가 죽어 재검토 필요.
+
+  zimage_turbo:
+    label: "Z-Image Turbo"
+    adapter: zimage
+    modes: [t2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: null
+    model_id: "Tongyi-MAI/Z-Image-Turbo"
+    quality: 60
+    speed: fast
+    enabled: true
+    notes: "4~9 steps. 매우 빠르다. quality_boost 를 켜면 느려지고 좋아진다."
+
+  ai_horde:
+    label: "AI Horde (무료 · 느림)"
+    adapter: horde
+    modes: [t2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: null
+    quality: 50
+    speed: slow
+    enabled: false           # visual_engine 에 어댑터가 있으나 속도가 매우 느려 기본 OFF
+    notes: "키 불필요. 분산 크레딧. 대기시간이 분 단위라 실사용 부적합."
+
+  local_sd:
+    label: "Local SD (로컬 서버 필요)"
+    adapter: local_sd
+    modes: [t2i]
+    cost_usd: 0.0
+    max_refs: 0
+    key_env: null
+    quality: 58
+    speed: medium
+    enabled: false
+    notes: "settings.yaml 의 local_sd_url (Comfy/A1111) 이 있어야 동작."
+
+# ─────────────────────────────────────────────────────────────
+# 영상 생성 (i2v: 이미지 → 동영상)
+# 아직 어댑터가 없다. 비용 폭발을 막기 위해 전부 disabled.
+# ─────────────────────────────────────────────────────────────
+video:
+  kenburns:
+    label: "Ken Burns (로컬 합성)"
+    adapter: kenburns
+    modes: [static, pan]
+    cost_per_sec: 0.0
+    key_env: null
+    quality: 55
+    enabled: true
+    notes: "ffmpeg 확대/이동. 화질은 낮지만 무료고 자막 동기화가 정확하다."
+
+  # ── BYOK i2v (사용자 키 등록 → 실제 사용 가능) ──────────
+  # adapter 가 있으면 i2v_router.I2V_ADAPTERS 로 실제 호출된다.
+  # model_ref(중개) 또는 submit_url(직접) 만 채우면 코드를 안 고쳐도 새 제공자가 붙는다.
+  veo_3_1_lite:
+    label: "Veo 3.1 Lite"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/veo-3.1-lite/image-to-video"
+    cost_per_sec: 0.05
+    res: "720p"
+    max_sec: 8
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 78
+    speed: medium
+    enabled: false
+    byok: true
+    recommended: true
+    notes: >
+      i2v 최저가. 8초 제한. fal 경유 시 이미지 URL 이 공개 접근 가능해야 한다.
+      로컬 이미지면 data URI 를 쓴다(일부 모델 미지원 → 실패하면 직접 경로 사용).
+
+  veo_3_1_lite_direct:
+    label: "Veo 3.1 Lite (직접)"
+    adapter: veo_google_i2v
+    modes: [i2v]
+    model_ref: "veo-3.1-generate-001"
+    cost_per_sec: 0.05
+    res: "720p"
+    max_sec: 8
+    key_env: gemini_api_key
+    key_hint: "https://aistudio.google.com/apikey"
+    quality: 78
+    speed: medium
+    enabled: false
+    byok: false
+    hidden: false
+    notes: >
+      fal 과 같은 단가($0.05/초)인데 중개 수수료가 없다. 이미 가진 Google 키로
+      동작하므로 '영상까지 하고 싶은데 새 키는 만들고 싶지 않다'면 이쪽.
+
+  veo_3_1_fast_720p:
+    label: "Veo 3.1 Fast 720p"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/veo-3.1-fast/image-to-video"
+    cost_per_sec: 0.10
+    res: "720p"
+    max_sec: 8
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 84
+    speed: medium
+    enabled: false
+    byok: true
+    notes: "Lite 의 2배가 아니라 2배 가격. 화질 차이를 보고 결정."
+
+  veo_3_1_fast_1080p:
+    label: "Veo 3.1 Fast 1080p"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/veo-3.1-fast/image-to-video"
+    cost_per_sec: 0.12
+    res: "1080p"
+    max_sec: 8
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 88
+    speed: slow
+    enabled: false
+    byok: true
+    notes: "1080p. 어댑터가 해상도 파라미터를 전달한다."
+
+  veo_3_1_standard:
+    label: "Veo 3.1 Standard"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/veo-3.1/image-to-video"
+    cost_per_sec: 0.40
+    res: "720/1080p"
+    max_sec: 8
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 93
+    speed: slow
+    enabled: false
+    byok: true
+    notes: "프리미엄. 비용 8배 — 전체 장면 적용은 마진 파괴."
+
+  minimax_h3_768p:
+    label: "MiniMax H3 768p"
+    adapter: direct_i2v
+    modes: [i2v]
+    # 직접 REST. 아래 4줄이면 코드를 안 바꿔도 동작한다.
+    submit_url: "https://api.minimax.io/v1/video_generation"
+    status_url_template: "https://api.minimax.io/v1/query/video_generation?task_id={task_id}"
+    auth_header: "Authorization"
+    auth_prefix: "Bearer "
+    image_field: "first_frame_image"   # base64 data URI
+    prompt_field: "prompt"
+    cost_per_sec: 0.08
+    res: "768p"
+    max_sec: 6
+    key_env: minimax_api_key
+    key_hint: "https://platform.minimax.io/user-center/basic-information/interface-key"
+    quality: 80
+    speed: medium
+    enabled: false
+    byok: true
+    notes: >
+      Veo Lite 보다 비싸고 화질은 동급. 직접 API 라 새 키만 있으면 된다.
+      썸네일이 이미지에 base64 가 필요할 수 있어 직접 경로가 확실하다.
+
+  minimax_h3_2k:
+    label: "MiniMax H3 2K"
+    adapter: direct_i2v
+    modes: [i2v]
+    submit_url: "https://api.minimax.io/v1/video_generation"
+    status_url_template: "https://api.minimax.io/v1/query/video_generation?task_id={task_id}"
+    auth_header: "Authorization"
+    auth_prefix: "Bearer "
+    image_field: "first_frame_image"
+    prompt_field: "prompt"
+    cost_per_sec: 0.13
+    res: "2K"
+    max_sec: 6
+    key_env: minimax_api_key
+    key_hint: "https://platform.minimax.io/user-center/basic-information/interface-key"
+    quality: 88
+    speed: slow
+    enabled: false
+    byok: true
+    notes: "2K. 768p 대비 1.6배 가격."
+
+  sora_2_720p:
+    label: "Sora 2 720p"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/sora-2/image-to-video"
+    cost_per_sec: 0.10
+    res: "720p"
+    max_sec: 12
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 84
+    speed: medium
+    enabled: false
+    byok: true
+    notes: "12초까지 가능(후보 중 가장 김). fal 모델 ID 는 시점에 따라 바뀐다."
+
+  sora_2_pro_720p:
+    label: "Sora 2 Pro 720p"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/sora-2-pro/image-to-video"
+    cost_per_sec: 0.30
+    res: "720p"
+    max_sec: 12
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 92
+    speed: slow
+    enabled: false
+    byok: true
+    notes: "Pro 는 3배 가격."
+
+  sora_2_pro_1024p:
+    label: "Sora 2 Pro 1024p"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/sora-2-pro/image-to-video"
+    cost_per_sec: 0.50
+    res: "1024p"
+    max_sec: 12
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 95
+    speed: slow
+    enabled: false
+    byok: true
+    notes: "고해상도 Pro."
+
+  sora_2_pro_1080p:
+    label: "Sora 2 Pro 1080p"
+    adapter: fal_i2v
+    modes: [i2v]
+    model_ref: "fal-ai/sora-2-pro/image-to-video"
+    cost_per_sec: 0.70
+    res: "1080p"
+    max_sec: 12
+    key_env: fal_api_key
+    key_hint: "https://fal.ai/dashboard/keys"
+    quality: 97
+    speed: slow
+    enabled: false
+    byok: true
+    notes: "최고 화질. 60초 전체를 이걸로 돌리면 약 5.7만원 — 절대 금지."
+
+  kling_2_5_turbo_i2v:
+    label: "Kling 2.5 Turbo"
+    adapter: direct_i2v
+    modes: [i2v]
+    submit_url: "https://api.klingai.com/v1/videos/image2video"
+    status_url_template: "https://api.klingai.com/v1/videos/image2video/{task_id}"
+    auth_header: "Authorization"
+    auth_prefix: "Bearer "
+    image_field: "image"
+    prompt_field: "prompt"
+    cost_per_sec: 0.091
+    res: "720p"
+    max_sec: 10
+    key_env: kling_api_key
+    key_hint: "https://klingai.com/global/dev"
+    quality: 85
+    speed: medium
+    enabled: false
+    byok: true
+    notes: "10초까지. submit/status URL 은 실제 문서에서 확인 필요(베타라 바뀔 수 있다)."
+
+# ─────────────────────────────────────────────────────────────
+# 음성 (TTS)
+# ─────────────────────────────────────────────────────────────
+tts:
+  # ── 무료 · 키 불필요 ──────────────────────────────────────────
+  # 실제로 동작하는 기본 엔진. 대본 생성만 하면 이것으로 충분하다.
+  # 유료 TTS 는 이걸 대체한다(발음 자연스러움이 좋아진다).
+  edge_tts:
+    label: "Edge TTS (무료 · 키 불필요)"
+    adapter: edge_tts
+    enabled: true
+    key_env: null
+    cost_per_1m_chars: 0
+    tier_hint: "대본 생성만 하면 이것으로 충분합니다"
+    voice_hint: "ko-KR-*Neural 5종 (앱 기본 음성 그대로 사용)"
+    notes: >-
+      실측 2026-09-27: 단일 호출은 성공(11376B). 그러나 연속 호출하면
+      Microsoft 쪽 속도 제한에 걸려 "No audio was received" 로 실패한다.
+      재시도 2회(3초 간격) 후에도 실패. 20장면 대본은 중간에 끊길 수 있다.
+      tts_cache 가 있어 재실행은 0 토큰이지만 '첫 실행'은 취약하다.
+
+  # ── 유료 ──────────────────────────────────────────────────────
+  # Cloudflare Workers → Azure TTS.
+  # 2026-09-27 실측: 워커가 HTTP 401 을 반환한다(인증 요구). 죽은 경로이므로
+  # 기본 비활성. 워커를 고치거나 auth 토큰을 등록해야 살아난다.
+  cloudflare_azure_proxy:
+    label: "Cloudflare Workers → Azure TTS (현재 401 로 동작 안 함)"
+    adapter: cloudflare_azure_proxy
+    enabled: false
+    cost_per_1m_chars: 16.0
+    key_env: cloudflare_worker_url
+    signup: "https://workers.cloudflare.com/"
+    notes: "실측 2026-09-27: Cloudflare Proxy Error (401). 비활성 상태."
+    voice_hint: "ko-KR-*Neural (Worker 안에서 Azure로 생성)"
+    worker_url_key: cloudflare_worker_url
+    quality: 80
+
+  qwen3_tts_flash:
+    label: "Qwen3-TTS-Flash"
+    adapter: qwen_tts
+    cost_per_1m_chars: 5.0
+    key_env: qwen_api_key
+    model: qwen3-tts-flash
+    voice_hint: "cherry/sohee/sunny(여성) aiden/ryan(남성) — 자동 변환"
+    quality: 82
+    enabled: false           # 어댑터 통합이 아직 안 돼 있다. 현재는 use_qwen_tts 플래그로 분기.
+
+  minimax_tts_turbo:
+    label: "MiniMax Turbo"
+    adapter: minimax_tts
+    cost_per_1m_chars: 60.0
+    key_env: minimax_api_key
+    model: speech-2.5-turbo
+    voice_hint: "female-shaonv / male-qn-qingse — 자동 변환"
+    key_hint: "https://platform.minimax.io/user-center/basic-information/interface-key"
+    quality: 78
+    speed: fast
+    enabled: false
+    byok: true
+    notes: "저렴 TTS. 중국어 발음이 가장 자연스럽다."
+
+  minimax_tts_hd:
+    label: "MiniMax HD"
+    adapter: minimax_tts
+    cost_per_1m_chars: 100.0
+    key_env: minimax_api_key
+    model: speech-2.5-hd
+    voice_hint: "female-shaonv / male-qn-qingse — 자동 변환"
+    key_hint: "https://platform.minimax.io/user-center/basic-information/interface-key"
+    quality: 84
+    speed: medium
+    enabled: false
+    byok: true
+    notes: "고품질. Turbo 의 1.7배."
+
+  elevenlabs_flash:
+    label: "ElevenLabs Flash/Turbo"
+    adapter: elevenlabs_tts
+    cost_per_1m_chars: 50.0
+    key_env: elevenlabs_api_key
+    model: eleven_flash_v2_5
+    voice_hint: "계정별 voice ID 필요 (설정 화면에서 선택)"
+    key_hint: "https://elevenlabs.io/app/settings/api-keys"
+    quality: 93
+    speed: fast
+    enabled: false
+    byok: true
+    notes: "한국어는 중간. 가격은 MiniMax TTS 의 10배."
+
+  elevenlabs_v2_v3:
+    label: "ElevenLabs v2/v3"
+    adapter: elevenlabs_tts
+    cost_per_1m_chars: 100.0
+    key_env: elevenlabs_api_key
+    model: eleven_multilingual_v2
+    voice_hint: "계정별 voice ID 필요 (설정 화면에서 선택)"
+    key_hint: "https://elevenlabs.io/app/settings/api-keys"
+    quality: 96
+    speed: medium
+    enabled: false
+    byok: true
+    notes: "최고 품질. 60초 영상 기준 약 7,000원 — 대부분 과금."
+
+  azure_direct:
+    label: "Azure Neural TTS (직접)"
+    adapter: azure_tts
+    cost_per_1m_chars: 16.0
+    key_env: azure_speech_key
+    model: azure-neural
+    voice_hint: "ko-KR-*Neural 5종"
+    region_key: azure_speech_region
+    quality: 80
+    enabled: false           # azure_speech_key 가 비어 있다.
+
+# ─────────────────────────────────────────────────────────────
+# 대본 (LLM)
+# ─────────────────────────────────────────────────────────────
+llm:
+  gemini_flash_lite:
+    label: "Gemini 3.x Flash-Lite"
+    adapter: gemini
+    cost_input_per_1m: 0.15
+    cost_output_per_1m: 1.25
+    key_env: gemini_api_key
+    quality: 72
+    enabled: true
+
+  deepseek_v4_flash:
+    label: "DeepSeek V4 Flash"
+    adapter: openai_compatible
+    cost_input_per_1m: 0.14
+    cost_output_per_1m: 0.28
+    key_env: deepseek_api_key
+    base_url: "https://api.deepseek.com/v1"
+    quality: 74
+    enabled: false           # 키 미등록. 429 대비 대체 경로로 권장.
+
+# ─────────────────────────────────────────────────────────────
+# BYOK: 사용자가 직접 키를 등록하는 곳.
+# 프론트 '키 등록' 화면이 이 목록을 읽어 입력 폼을 자동 생성한다.
+# 절대로 여기에 실제 키를 넣지 않는다. key_env 는 settings.yaml 의 항목 이름이다.
+# ─────────────────────────────────────────────────────────────
+api_keys:
+  - id: gemini_api_key
+    label: "Google Gemini"
+    uses: "대본 · 이미지(Nano Banana)"
+    signup: "https://aistudio.google.com/apikey"
+    required: true
+    tier_hint: "대본 생성의 기본 경로"
+  - id: pollinations_api_key
+    label: "Pollinations"
+    uses: "이미지(t2i) · 워터마크 제거"
+    signup: "https://enter.pollinations.ai/keys"
+    required: false
+    tier_hint: "무료로 시작하려면 이것"
+  - id: pexels_api_key
+    label: "Pexels"
+    uses: "실사 사진 검색"
+    signup: "https://www.pexels.com/api/"
+    required: false
+    tier_hint: "제품/상고 이미지의 신뢰도"
+  - id: minimax_api_key
+    label: "MiniMax"
+    uses: "이미지(image-01) · 영상(H3) · TTS"
+    signup: "https://platform.minimax.io/user-center/basic-information/interface-key"
+    required: false
+    tier_hint: "가장 싼 유료 경로"
+  - id: fal_api_key
+    label: "fal.ai"
+    uses: "영상(Veo · Sora)"
+    signup: "https://fal.ai/dashboard/keys"
+    required: false
+    tier_hint: "영상 업셀의 유일한 입구"
+  - id: kling_api_key
+    label: "Kling AI"
+    uses: "영상(Kling 2.5 Turbo)"
+    signup: "https://klingai.com/global/dev"
+    required: false
+    tier_hint: "Veo 대안"
+  - id: seedream_api_key
+    label: "Seedream (Volcengine)"
+    uses: "이미지(Seedream 5.0)"
+    signup: "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey"
+    required: false
+    tier_hint: "최고 품질 이미지"
+  - id: deepseek_api_key
+    label: "DeepSeek"
+    uses: "대본(저가 대량)"
+    signup: "https://platform.deepseek.com/api_keys"
+    required: false
+    tier_hint: "Gemini 429 대비 백업"
+  - id: qwen_api_key
+    label: "Alibaba Qwen (DashScope)"
+    uses: "대본 · TTS"
+    signup: "https://bailian.console.aliyun.com/?apiKey=1"
+    required: false
+    tier_hint: "TTS 최저가"
+  - id: openai_api_key
+    label: "OpenAI"
+    uses: "이미지(GPT Image) · 대본 · TTS"
+    signup: "https://platform.openai.com/api-keys"
+    required: false
+    tier_hint: "지문 렌더링"
+  - id: elevenlabs_api_key
+    label: "ElevenLabs"
+    uses: "TTS"
+    signup: "https://elevenlabs.io/app/settings/api-keys"
+    required: false
+    tier_hint: "비쌈. 한국어는 중간."
+  - id: azure_speech_key
+    label: "Azure Speech"
+    uses: "TTS"
+    signup: "https://portal.azure.com/"
+    required: false
+    tier_hint: "한국어 TTS 안정"
+  - id: cloudflare_api_token
+    label: "Cloudflare Workers AI"
+    uses: "이미지(FLUX)"
+    signup: "https://dash.cloudflare.com/profile/api-tokens"
+    required: false
+    tier_hint: "무료 티어. neurons 한정."
+  # ── 아래는 '키 항목'에 없던 것들. 입력 UI 가 있어야 저장할 수 있다 ──
+  - id: cloudflare_worker_url
+    label: "Cloudflare TTS 프록시"
+    uses: "TTS(Azure 중계)"
+    signup: "https://workers.cloudflare.com/"
+    required: false
+    tier_hint: "Azure 키 대신 URL. 2026-09-27 실측 401 로 현재 비활성."
+    kind: url          # 비밀값이 아니라 URL 이라 마스킹하지 않는다
+  - id: typecast_api_key
+    label: "Typecast TTS"
+    uses: "TTS"
+    signup: "https://www.typecast.ai/"
+    required: false
+    tier_hint: "표정풍 TTS"
+  - id: cloudflare_account_id
+    label: "Cloudflare Account ID"
+    uses: "Workers AI 조회"
+    signup: "https://dash.cloudflare.com/"
+    required: false
+    tier_hint: "사용량 조회용"
+    kind: plain
+
+# ─────────────────────────────────────────────────────────────
+# 티어: 내부 42개 모델을 감추고 사용자에게는 3개만 노출한다.
+# ─────────────────────────────────────────────────────────────
+tiers:
+  free:
+    label: "무료 체험"
+    image_order: [pexels_stock, pollinations_flux, zimage_turbo, pollinations_turbo]
+    i2i_allowed: false
+    video_order: [kenburns]
+    desc: "실사 사진 + 무료 생성. 제품 일관성(참조 이미지)은 없습니다."
+  standard:
+    label: "표준"
+    image_order: [pexels_stock, nano_banana_2_1k, minimax_image_01,
+                  gemini_nano_banana_lite, pollinations_flux, zimage_turbo]
+    i2i_allowed: true
+    video_order: [kenburns]
+    desc: "참조 이미지로 제품 일관성 유지. 영상은 Ken Burns."
+  premium:
+    label: "프리미엄"
+    image_order: [pexels_stock, seedream_5, nano_banana_pro, nano_banana_2_2k,
+                  openai_gpt_image, nano_banana_2_1k, minimax_image_01,
+                  gemini_nano_banana_lite, pollinations_flux, zimage_turbo]
+    i2i_allowed: true
+    video_order: [kenburns, veo_3_1_lite, minimax_h3_768p, sora_2_720p,
+                  kling_2_5_turbo_i2v, veo_3_1_fast_720p, veo_3_1_standard]
+    desc: "핵심 장면 i2v 업그레이드 포함. 장당 비용이 크게 오른다."

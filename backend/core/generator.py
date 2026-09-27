@@ -314,10 +314,13 @@ async def generate_full_package(article_text, api_key=None, selected_model=None,
 
     if not api_key:
         config = load_config()
-        api_key = config.get('gemini_api_key')
+        from . import key_store
+        api_key = key_store.resolve_key("gemini_api_key", config,
+                                        env="GEMINI_API_KEY")
 
     if not api_key or api_key == "YOUR_GEMINI_API_KEY":
-        raise ValueError("Gemini API Key is missing. Please set it in config/settings.yaml or pass it as an argument.")
+        raise ValueError(
+            "Gemini API 키가 없습니다. 앱의 'API 키' 화면에서 등록하세요.")
 
     if progress_callback:
         await progress_callback(30, "Gemini AI 모델 구성을 확인하고 있습니다...")

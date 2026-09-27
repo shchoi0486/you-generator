@@ -76,9 +76,12 @@ def _workhorse_model():
 
 def _get_api_key():
     config = load_config()
-    api_key = config.get("gemini_api_key")
+    from . import key_store
+    api_key = key_store.resolve_key("gemini_api_key", config,
+                                    env="GEMINI_API_KEY")
     if not api_key or api_key == "YOUR_GEMINI_API_KEY":
-        raise ValueError("Gemini API Key is missing. Please set it in config/settings.yaml.")
+        raise ValueError(
+            "Gemini API 키가 없습니다. 앱의 'API 키' 화면에서 등록하세요.")
     return api_key, config
 
 
@@ -151,8 +154,131 @@ def _parse_json_response(text):
     raise ValueError(f"JSON 파싱 실패 (응답 길이 {len(raw)}자)")
 
 
+# 재시도해도 소용없는 모델 오류. 이건 '파싱 실패'가 아니라 사용자에게
+# 즉시 알려야 하는 설정/계정 문제다. (실측: 429 할당량 소진이 3회 재시도 후
+# '모델 응답 파싱 실패'로 표시돼 원인을 알 수 없었다)
+_FATAL_MODEL_MARKERS = (
+    "RESOURCE_EXHAUSTED", "429",
+    "PERMISSION_DENIED", "403",
+    "INVALID_API_KEY", "API_KEY_INVALID", "APIKEYINVALID",
+    "UNAUTHENTICATED", "401",
+    "BILLING", "QUOTA",
+)
+
+
+def _is_fatal_model_error(err):
+    """할당량/인증/과금 같은 재시도 무의미한 오류인지.
+
+    문자열 매칭은 라이브러리 예외 문자열이 바뀔 때 놓친다(실측: 'API_KEY_INVALID'
+    가 'API key not valid' 형태와 달라 두 번째 검사에서 놓쳤다). 그래서 예외
+    클래스 이름과 HTTP 상태 코드를 먼저 본다.
+    """
+    # 1) 예외 클래스 이름. '_'와 '.'을 빼고 대문자로 맞춘다.
+    # google.genai 는 API_KEY_INVALID / RESOURCE_EXHAUSTED 같은 이름을 쓴다(실측).
+    cls = re.sub(r"[^A-Z0-9]", "", type(err).__name__.upper())
+    if any(k in cls for k in ("RESOURCEEXHAUSTED", "CLIENTERROR", "PERMISSIONDENIED",
+                              "UNAUTHENTICATED", "INVALIDAPIKEY", "APIKEYINVALID")):
+        return True
+    # 2) 상태 코드
+    code = getattr(err, "code", None) or getattr(err, "status_code", None)
+    try:
+        if code is not None and int(code) in (401, 402, 403, 429):
+            return True
+    except (TypeError, ValueError):
+        pass
+    # 3) 메시지. 라이브러리가 'API_KEY_INVALID'처럼 쓰기도 하고
+    # 'API key not valid'처럼 공백을 넣어 쓰기도 한다(실측 둘 다 실제로 나옴).
+    s_raw = str(err)
+    s = s_raw.upper()
+    if any(m in s for m in _FATAL_MODEL_MARKERS):
+        return True
+    return "API KEY NOT VALID" in s or "API KEY IS NOT VALID" in s
+
+
+class _FatalModelError(Exception):
+    """재시도하지 않고 사용자에게 그대로 알릴 오류."""
+
+
+# 위 판정기가 참이면 raise를 그대로 통과시킨다(재시도 루프 위에서 except).
+_FATAL_MODEL_ERRORS = (_FatalModelError,)
+
+
+def _raise_fatal_model_error(err):
+    """모델 오류를 사람이 읽을 한국어 메시지로 바꿔 올린다."""
+    s = str(err)
+    up = s.upper()
+    code = None
+    try:
+        code = int(getattr(err, "code", None) or getattr(err, "status_code", None) or 0)
+    except (TypeError, ValueError):
+        code = None
+    if code == 429 or "RESOURCE_EXHAUSTED" in up or "429" in up or "QUOTA" in up:
+        detail = ""
+        for key in ("quota", "billing"):
+            i = up.find(key.upper())
+            if i >= 0:
+                detail = s[i: i + 160]
+                break
+        msg = (
+            "AI 모델 호출 한도(quota)를 초과했습니다. 이건 대본 문제가 아니라 "
+            "결제/할량 문제입니다. 사용한 모델의 과금 상태를 확인하거나 "
+            "settings.yaml 의 텍스트 모델을 더 저렴한 모델로 바꾸세요."
+        )
+        if detail:
+            msg += f"\n(원본: {detail})"
+        raise _FatalModelError(msg)
+    if (code in (401, 403)
+            or any(k in up for k in ("API KEY NOT VALID", "API KEY IS NOT VALID",
+                                     "INVALID_API_KEY", "APIKEYINVALID", "INVALID KEY"))
+            or "401" in up):
+        if "PERMISSION" in up or "403" in up:
+            raise _FatalModelError(
+                "AI 모델 접근이 거부됐습니다(403). 키에 해당 모델 권한이 있는지 확인하세요."
+            )
+        raise _FatalModelError(
+            "AI 모델 API 키가 올바르지 않습니다. settings.yaml 의 키를 확인하세요."
+        )
+    if "PERMISSION_DENIED" in up or "403" in up:
+        raise _FatalModelError(
+            "AI 모델 접근이 거부됐습니다(403). 키에 해당 모델 권한이 있는지 확인하세요."
+        )
+    raise _FatalModelError(s[:300])
+
+
 # storyboard 아이템으로 인정하는 키. 이 중 하나도 없으면 스키마 위반으로 재시도.
 _KNOWN_ITEM_KEYS = ("narration_ko", "text", "voice_script", "voice", "subtitle_ko")
+
+# _convert_storyboard_items가 실제로 읽는 대사 키 순서(generator.py:201-204와 동일).
+_NARRATION_KEYS = ("narration_ko", "text", "voice_script", "voice")
+
+
+def _narration_key(item):
+    """이 스토리보드 아이템이 대사를 담는 키를 돌려준다.
+
+    후처리가 대사를 고칠 때 무조건 `narration_ko`에 쓰면 안 된다. 모델이 옛
+    스키마(text/voice_script)로 답한 경우, conversion은 `narration_ko is not None`을
+    먼저 보기 때문에 새로 만든 키가 원본 대사를 덮어써 버린다(실측: text 스키마
+    3개 장면 중 1개가 통째로 소실).
+    """
+    for k in _NARRATION_KEYS:
+        if item.get(k) is not None:
+            return k
+    return "narration_ko"
+
+
+def _narration_of(item):
+    """대사 문자열. 키가 무엇이든 같은 값을 읽는다."""
+    for k in _NARRATION_KEYS:
+        v = item.get(k)
+        if v is not None:
+            return str(v)
+    return ""
+
+
+def _set_narration(item, text):
+    """대사를 원래 키에 그대로 쓴다(스키마 유지)."""
+    item[_narration_key(item)] = text
+
 
 
 def _call_storyboard_json(model, prompt, what="대본", max_attempts=3):
@@ -184,7 +310,12 @@ def _call_storyboard_json(model, prompt, what="대본", max_attempts=3):
                 return result_json
             last_err = "usable 장면 0개 (스키마 위반)"
             print(f"[Shorts] {what} {attempt + 1}회차: {last_err}")
+        except _FATAL_MODEL_ERRORS:
+            # 이미 사람이 읽을 메시지로 바뀌었다. 그대로 올린다.
+            raise
         except Exception as e:
+            if _is_fatal_model_error(e):
+                _raise_fatal_model_error(e)
             last_err = str(e)[:200]
             print(f"[Shorts] {what} {attempt + 1}회차 실패: {last_err}")
     raise ValueError(f"모델 응답 파싱 실패: {last_err}")
@@ -202,6 +333,16 @@ ANALYSIS_JSON_SPEC = """
   "hashtags": ["#태그1", "#태그2"],
   "suggested_duration": 40,
   "tone": "톤앤매너 한 줄",
+    "style_analysis": {
+      "hook_style": "도발형",
+      "cta_style": "저장 유도",
+      "tone_style": "전문가 단언",
+      "ending_ratio": "어미별 비율",
+      "sentence_patterns": ["넣어 주고", "볶다가", "끓이다가 마무리해 주면"],
+      "honorific": true,
+      "ending_style": "높임말 존댓말(-요 체)",
+      "pacing": "빠름"
+    },
   "storyboard": [
     {
       "speaker": "BJ 이슈왕",
@@ -210,6 +351,34 @@ ANALYSIS_JSON_SPEC = """
     }
   ]
 }
+
+스타일 분석 기준:
+- hook_style: 첫 문장 유형. 질문형/도발형/공감형/숫자형/반전형/인사형/후회형 중 선택.
+  * '후회형' = '이거 왜 이제 먹었지' 식의 진심 어린 후회. 예: '저 진짜 맛있는 걸 왜 이제 먹었나 후회했습니다'
+- cta_style: 마지막 문장 유형. 저장 유도/댓글 유도/구독 유도/팔로우 유도/감정 유도/시청자 질문 중 선택.
+  * '감정 유도' = 완성 후 친근한 반응으로 끝남. 예: '많이 먹어', '어때?', '극락입니다'
+  * '시청자 질문' = 구독자/덧댓글로 값을 물음. 예: '구독자님이 알려주셨는데'
+- tone_style: 전체 톤. 아래 10개 중 하나를 고르되 반드시 'ending_ratio'로 근거를 댄다.
+  1) 담백 1인칭   : 반말체, 짧은 구어 리듬
+  2) MZ 직설      : 단문 위주 쿨한 반말, 종결어미 없음
+  3) 감각 묘사     : 오감(소리/질감) 묘사 우선
+  4) 실패 회고     : 1인칭 과거형, 후회 뉘앙스
+  5) 전문가 단언   : 셰프 관점 단언
+  6) 자조 개그 반말: 자기 비하·친근한 농담이 섞인 반말. 예: '최소는 형이 먹으세요'
+  7) 낭독 존댓말  : '~습니다'와 '~요'가 섞인 읽어주기 톤. 예: '물기 닦아 넣어 줍니다/끝이고요'
+  8) 추억 회상     : '~거든요/~죠/~이에요'가 섞인 친근한 톤. 예: '어렸을 때 즐겨 먹었거든요'
+  9) 지시 혼용 조리: '~해 줍니다/변해 줍니다'이 다수. 도구·불·시간을 명시하는 매뉴얼식
+  10) 브금 개그    : 짧은 '~해요' 구어체 + 대괄호 독백 개그가 교차. 예: '[보금자리로 이사해줬어요]'
+  * 7~10은 서로 다른 채널의 실제 예시에서 갈라낸 축이다. "친근 조리 나레이션"처럼
+    뭉뚱그리는 이름은 쓰지 말고, 어미를 세어 가장 큰 축을 고른다.
+- ending_ratio: 어미별 등장 비율. 반드시 채워라. 예: '있습니다 15%, 준비해 주세요 15%, 하겠습니다 15%,
+  묻혀줍니다/볶아줍니다 40%, 끝입니다 15%'. 이 비율이 tone_style을 결정하는 근거다.
+- sentence_patterns: 이 대본에서 반복 쓰인 어미/연결 표현 2~3개. 문장 전체가 아니라
+  그대로 재사용할 수 있는 조각으로 뽑는다. 괄호 채움(예: '(재료) 투척')도 재사용 가능하므로 포함한다.
+- honorific: 높임말 존댓말을 쓰면 true, 반말이면 false.
+- ending_style: 문말 어미 계열. 예: '높임말 존댓말(-요 체)' 또는 '반말(~한다/~다 체)'.
+- pacing: 전개 속도. 빠름/보통/느림 중 선택.
+- density_note: 대사 밀도 특이점 (예: '재료와 양념을 한 문장에 몰아넣음').
 """
 
 
@@ -280,15 +449,28 @@ def fetch_transcript(video_id):
         try:  # v1.x 신 API
             fetched = YouTubeTranscriptApi().fetch(video_id, languages=["ko", "en"])
             chunks = fetched.snippets if hasattr(fetched, "snippets") else fetched
-            return " ".join(getattr(c, "text", c.get("text", "")) for c in chunks)
-        except Exception:
-            pass
-        try:  # 구 API
+            # snippet은 dataclass(dict 아님)라 .get()이 없으면 getattr로만 읽는다.
+            # getattr의 기본값 인자는 항상 평가되므로 getattr 두 번 쓰는 게 안전.
+            return " ".join(
+                (c.text if hasattr(c, "text") else (c.get("text", "") if hasattr(c, "get") else ""))
+                for c in chunks
+            )
+        except Exception as e:
+            print(f"transcript fetch(ko,en) failed: {e}")
+        try:  # 언어 지정 없이 재시도 (foreign 언어가 섞인 영상 대비)
+            fetched = YouTubeTranscriptApi().fetch(video_id)
+            chunks = fetched.snippets if hasattr(fetched, "snippets") else fetched
+            return " ".join(
+                (c.text if hasattr(c, "text") else (c.get("text", "") if hasattr(c, "get") else ""))
+                for c in chunks
+            )
+        except Exception as e2:
+            print(f"transcript fetch() failed: {e2}")
+        try:  # 구 API (0.x)
             tracks = YouTubeTranscriptApi.get_transcript(video_id, languages=["ko", "en"])
             return " ".join(t.get("text", "") for t in tracks)
         except Exception:
-            tracks = YouTubeTranscriptApi.get_transcript(video_id)
-            return " ".join(t.get("text", "") for t in tracks)
+            pass
     except Exception as e:
         print(f"Transcript unavailable for {video_id}: {e}")
         return ""
@@ -362,6 +544,122 @@ def analyze_youtube(url):
     return result
 
 
+# 분석 리포트의 style_analysis(한글 값) → 프리셋 축 ID 매핑.
+# 프리셋보다 분석이 우선한다. 사용자가 "이 영상 느낌으로" 하면 축을 덮어쓴다.
+_STYLE_HOOK_MAP = {
+    "질문형": "question", "도발형": "provoke", "공감형": "empathy",
+    "숫자형": "number", "반전형": "twist",
+    # 2026-09-27: 톤 3분할 재분석에서 새로 관찰된 훅 유형
+    "후회형": "regret", "인사형": "greeting",
+    # 분석기가 '후회형/도발형' 처럼 섞어 쓴 경우의 접두 라벨.
+    # '팔로우업'은 여기 있었는데 뜻이 달라 후회형으로 잘못 매핑했다(복사/붙여넣기 잔재).
+    "후회": "regret", "인사": "greeting",
+}
+_STYLE_CTA_MAP = {
+    "저장 유도": "save", "댓글 유도": "comment",
+    "구독 유도": "subscribe", "팔로우 유도": "follow",
+    "감정 유도": "emotion", "시청자 질문": "ask_viewer",
+    # 분석기가 '감정 유도 및 시청자 대화' 처럼 섞어 쓴 경우의 접두 라벨
+    "감정": "emotion", "시청자": "ask_viewer", "질문": "ask_viewer", "대화": "emotion",
+}
+_STYLE_TONE_MAP = {
+    "담백 1인칭": "casual_first", "MZ 직설": "mz_blunt",
+    "감각 묘사": "sensory", "실패 회고": "retro",
+    "전문가 단언": "authority", "자조 개그 반말": "self_deprecating",
+    # 2026-09-27: 톤 3분할로 추가된 4축. 출처는 실루엣 예시 1~4번.
+    "낭독 존댓말": "polite_guide", "추억 회상": "warm_recall",
+    "지시 혼용 조리": "instruction_mix", "브금 개그": "bracket_quirk",
+    # 분석기가 '낭독 존댓말/브금 개그' 처럼 섞어 쓴 경우의 접두 라벨
+    "낭독": "polite_guide", "독백": "bracket_quirk",
+}
+
+
+def _style_axis_value(raw_value, mapping):
+    """분석기가 '감정 유도 및 시청자 대화' 처럼 섞어 쓴 값에서 축 하나를 고른다.
+
+    매핑 표의 라벨이 부분 문자열로 들어 있으면 그 축을, 없으면 원본 문자열을 정규화해
+    한 번 더 시도한다. 매핑 불가일 때만 None(=오버라이드 안 함)을 돌려준다.
+    """
+    v = str(raw_value or "").strip()
+    if not v:
+        return None
+    if v in mapping:
+        return mapping[v]
+    # '반전형/도발형' -> 둘 다 있으면 앞(훅)만 채택
+    for part in (p.strip() for p in v.replace("·", "/").split("/")):
+        if part in mapping:
+            return mapping[part]
+    # 부분 매칭은 '문자열에 먼저 등장한 것'으로 고른다. dict 순서로 돌면
+    # '시청자 질문으로 감정 유도'가 감정(사전 순서 4번)으로 먼저 잡혀 틀렸다.
+    # '(감정|시청자|질문|대화)' 같은 2글짜리 접두 키가 정식 라벨보다 먼저
+    # 매칭돼도 안 되도록, 같은 위치면 더 긴 라벨을 우선한다.
+    best = None  # (pos, -len, axis_id)
+    for label, axis_id in mapping.items():
+        if not label:
+            continue
+        pos = v.find(label)
+        if pos < 0:
+            continue
+        cand = (pos, -len(label), axis_id)
+        if best is None or cand < best:
+            best = cand
+    if best:
+        return best[2]
+    return None
+
+
+def _style_overrides_from_reference(reference_summary):
+    """분석 리포트의 스타일 분석 → {hook/tone/cta} 오버라이드 축 ID.
+
+   (style_analysis 하위 객체와 최상위 평면 두 형태 모두 지원한다.
+    매핑되는 값만 반환. 없으면 빈 딕셔너리 (프리셋 기본값 유지).
+    """
+    raw = str(reference_summary or "")
+    try:
+        rep = json.loads(raw) if raw.strip().startswith("{") else None
+    except Exception:
+        rep = None
+    if not isinstance(rep, dict):
+        return {}
+    sa = rep.get("style_analysis")
+    if not isinstance(sa, dict):
+        # 분석 결과가 최상위 평면인 경우 (style_analysis 래퍼 없이)
+        if any(k.endswith("_style") for k in rep):
+            sa = rep
+        else:
+            return {}
+    out = {}
+    for key, mapping in (("hook", _STYLE_HOOK_MAP), ("tone", _STYLE_TONE_MAP), ("cta", _STYLE_CTA_MAP)):
+        mapped = _style_axis_value(sa.get(f"{key}_style"), mapping)
+        if mapped:
+            out[key] = mapped
+    return out
+
+
+def _style_dense_narration(reference_summary):
+    """분석된 대본이 '재료+양념을 한 문장에 몰아넣는' 밀집형 문법인지 판정.
+
+    이런 원본은 어미 조각(~ 준비해 주고)이 길어서, 일반 Cap에 걸리면 문장 중간에서 잘려
+    분석 결과가 전부 사라진다(실측). 이 경우에만 Cap을 올려 문법을 보존한다.
+    """
+    raw = str(reference_summary or "")
+    try:
+        rep = json.loads(raw) if raw.strip().startswith("{") else None
+    except Exception:
+        rep = None
+    if not isinstance(rep, dict):
+        return False
+    note = str(rep.get("density_note") or "")
+    if not note:
+        sa = rep.get("style_analysis")
+        if isinstance(sa, dict):
+            note = str(sa.get("density_note") or "")
+    if not note:
+        return False
+    keys = ("몰아넣", "한 호흡", "한 문장", "짧게", "압축", "나열")
+    return any(k in note for k in keys)
+
+
 def _compact_reference(reference_summary):
     """분석 리포트에서 패턴 정보만 추출. 초안 대본·자막(다른 영상 것)은 제외 (베끼기 방지)."""
     raw = str(reference_summary or "")
@@ -377,6 +675,32 @@ def _compact_reference(reference_summary):
         val = rep.get(key)
         if val:
             keep.append(f"{key}: {json.dumps(val, ensure_ascii=False)[:800]}")
+    # 스타일 분석은 대본 생성에 직접 반영할 수 있도록 텍스트로 변환한다.
+    sa = rep.get("style_analysis")
+    if not isinstance(sa, dict):
+        sa = rep if any(k.endswith("_style") for k in rep) else {}
+    if isinstance(sa, dict) and any(sa.values()):
+        _hs = sa.get("hook_style") or ""
+        _cs = sa.get("cta_style") or ""
+        _ts = sa.get("tone_style") or ""
+        _sp = sa.get("sentence_patterns") or []
+        _pc = sa.get("pacing") or ""
+        _es = sa.get("ending_style") or ""
+        parts = []
+        if _hs:
+            parts.append(f"훅: {_hs}")
+        if _cs:
+            parts.append(f"CTA: {_cs}")
+        if _ts:
+            parts.append(f"톤: {_ts}")
+        if _es:
+            parts.append(f"문말: {_es}")
+        if _sp:
+            parts.append(f"[문장 패턴] {', '.join(str(x) for x in _sp[:3])}")
+        if _pc:
+            parts.append(f"전개 속도: {_pc}")
+        if parts:
+            keep.append("[분석된 스타일] " + " / ".join(parts))
     if not keep:
         return raw[:1500]
     return "\n".join(keep)
@@ -404,6 +728,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     # format_id 미지정/'auto'면 길이로 자동결정, 스냅(강제 target 맞춤)은 하지 않는다.
     # 포맷은 장면 구조용, 목표 시간은 duration 그대로 프롬프트에 전달한다.
     _recipe_fmt = None
+    _clamp_warnings = []
     if category == "recipe_short":
         try:
             from .recipe_prompts import get_format as _get_fmt, resolve_format_for_duration as _resolve_fmt
@@ -414,23 +739,45 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
             _fid = _resolve_fmt(duration)
             print(f"[Shorts Format] duration {duration}s → 포맷 자동결정: {_fid} (스냅 없음)")
         _recipe_fmt = _get_fmt(_fid)
+        # 포맷을 명시적으로 고른 경우에만 상한이 걸린다(auto는 길이에서 정해지므로 걸리지 않는다).
+        # 여기서 조용히 줄이면 사용자는 "600초"를 넣고 333초 영상을 받는다(실측).
+        # 여기서 조용히 줄이면 사용자는 "600초"를 넣고 333초 영상을 받는다(실측).
+        # 경고 힌트를 누적해 최종 응답에 실어 사용자가 알 수 있게 한다.
+        _limit = duration
         try:
-            _hi = int(_recipe_fmt["max_sec"])
+            _limit = int(_recipe_fmt["max_sec"]) + 300
         except (TypeError, ValueError, KeyError):
-            _hi = 330
-        duration = max(15, min(duration, _hi + 300))
+            _limit = duration
+        if duration > _limit:
+            _clamp_warnings.append(
+                f"요청 {duration}초가 포맷 '{_fid}'의 허용 상한({_limit}초)을 넘어 "
+                f"{_limit}초로 조정했습니다. 더 긴 영상이면 길이 버튼(180/300/600)을 고르세요.")
+            print(f"[Shorts Duration] {duration}s → {_limit}s로 조정 (포맷 {_fid} 상한)")
+            duration = _limit
+        duration = max(15, duration)
     else:
+        if duration > 180:
+            _clamp_warnings.append(f"요청 {duration}초가 최대 180초로 조정되었습니다.")
         duration = max(15, min(duration, 180))
     topic = new_topic.strip()
 
-    # 40초 기준 최소 6씬, 씬당 4~8초. 3줄 요약으로 끝나지 못하게 하한 강제.
-    # 모듈형 포맷 지정 시 포맷의 장면 수 범위를 따른다.
+    # 장면 수는 포맷 범위를 따르되, 60초는 6장면으로 고정한다.
+    # 실측: 장면당 8~12초를 유지한다. 장면 수를 길이로 나누면
+    # 30초=4~6장면, 1분=6~8장면, 3분=15~20장면, 5분=25~30장면으로 늘어난다.
+    # (이전처럼 90초 이하를 6장면으로 고정하니 3분도 6장면이라 대사가 모자랐다)
     if _recipe_fmt:
-        _pace = 7 if _recipe_fmt["target_sec"] <= 90 else 12
-        min_scenes = max(_recipe_fmt["scene_min"],
-                         min(_recipe_fmt["scene_max"], duration // _pace))
+        # 장면당 6~12초 범위를 유지한다. 30초에도 최소 4장면은 있어야
+        # 훅·재료·조리·마무리 구도가 성립한다(실측: 3장면이면 중간이 뭉갠다).
+        _min_s = 4
+        _target = max(_min_s, round(duration / 10))
+        _max_s = max(_min_s, _target)
+        min_scenes = max(_min_s, min(_max_s, _target))
+        _max_scenes = _max_s
+        print(f"[Shorts Scenes] {duration}s → 장면 {min_scenes}~{_max_scenes}개 "
+              f"(장면당 {round(duration / _max_scenes)}초)")
     else:
-        min_scenes = max(5, min(12, duration // 7))
+        _max_scenes = max(5, min(30, round(duration / 10)))
+        min_scenes = max(5, min(_max_scenes, round(duration / 10)))
 
     # 카테고리 프리셋 (templates.py): 지침 + 섹션 구조를 여기서 공급
     template = get_template(category)
@@ -514,20 +861,59 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     resolved_axes = None
     if _recipe_fmt:
         try:
-            from .recipe_prompts import compose_recipe_prompt, resolve_recipe_axes
+            from .recipe_prompts import (
+                compose_recipe_prompt, resolve_recipe_axes, RECIPE_PRESETS as _PRESETS,
+                TONE_VARIANTS as _TONES, CTA_VARIANTS as _CTAS, STRUCTURE_VARIANTS as _STRUCTS,
+                HOOK_VARIANTS as _HOOKS,
+            )
         except (ImportError, ValueError):
-            from recipe_prompts import compose_recipe_prompt, resolve_recipe_axes
+            from recipe_prompts import (
+                compose_recipe_prompt, resolve_recipe_axes, RECIPE_PRESETS as _PRESETS,
+                TONE_VARIANTS as _TONES, CTA_VARIANTS as _CTAS, STRUCTURE_VARIANTS as _STRUCTS,
+                HOOK_VARIANTS as _HOOKS,
+            )
+        # 프리셋이 교체돼도 예전 설정값이 남아 있지 않도록 축 유효성표를 함께 쓴다.
+        _PRESET_MAP_IDS = {p["id"] for p in _PRESETS}
+        _AXIS_IDS = {
+            "tone": {t["id"] for t in _TONES},
+            "cta": {c["id"] for c in _CTAS},
+            "structure": {s["id"] for s in _STRUCTS},
+            "hook": {h[0] for h in _HOOKS} | {"random"},
+        }
         try:
             _preset_cfg = load_config().get("recipe_prompt_preset") or {}
         except Exception:
             _preset_cfg = {}
-        _pid = preset_id or _preset_cfg.get("preset") or "random"
-        _hook = hook_id or _preset_cfg.get("hook") or "random"
-        _tone = tone_id or _preset_cfg.get("tone") or None
-        _struct = structure_id or _preset_cfg.get("structure") or None
-        _cta = cta_id or _preset_cfg.get("cta") or None
+        # 축 우선순위: 명시 파라미터 > 프리셋에 내장된 축 > 저장된 설정 > 기본값.
+        # (저장된 설정이 프리셋 축을 덮으면 "읽어주기 조리"를 골라도 mz_blunt로
+        #  생성되는 문제가 생긴다. 프리셋을 고른 이상 그 프리셋의 축이 그 조합이다.)
+        # 저장값은 UI에서 개별 축을 직접 고를 때만 쓰고, 유효하지 않은 ID는 버린다.
+        def _saved(axis):
+            v = _preset_cfg.get(axis)
+            return v if v in _AXIS_IDS[axis] else None
+
+        _saved_pid = _preset_cfg.get("preset")
+        if _saved_pid not in _PRESET_MAP_IDS:
+            _saved_pid = None
+        _pid = preset_id or _saved_pid or "random"
+        # 프리셋 ID가 유효하면 그 프리셋이 정한 축을 쓴다(_preset_cfg보다 우선).
+        _pdef = next((p for p in _PRESETS if p["id"] == _pid), None)
+        _hook = hook_id or (_pdef or {}).get("hook") or _saved("hook") or "random"
+        _tone = tone_id or (_pdef or {}).get("tone") or _saved("tone")
+        _struct = structure_id or (_pdef or {}).get("structure") or _saved("structure")
+        _cta = cta_id or (_pdef or {}).get("cta") or _saved("cta")
+        # 분석된 스타일이 프리셋보다 우선한다.
+        # (사용자가 "이 영상 느낌으로" 하면 hook/tone/cta 축을 덮어쓴다)
+        _style_ov = _style_overrides_from_reference(reference_summary)
+        if _style_ov.get("hook"):
+            _hook = _style_ov["hook"]
+        if _style_ov.get("tone"):
+            _tone = _style_ov["tone"]
+        if _style_ov.get("cta"):
+            _cta = _style_ov["cta"]
         # 재생성·수리 프롬프트에서도 같은 축을 쓰도록 확정해 둔다.
-        resolved_axes = resolve_recipe_axes(_pid, _hook, _tone, _struct, _cta)
+        # 정의 순서: (preset, hook, tone, cta, structure)
+        resolved_axes = resolve_recipe_axes(_pid, _hook, _tone, _cta, _struct)
         modular_block = compose_recipe_prompt(
             format_id=_recipe_fmt["id"],
             style_id=style_id or _preset_cfg.get("style") or "realistic",
@@ -538,6 +924,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
             tone_id=_tone,
             structure_id=_struct,
             cta_id=_cta,
+            axes_overridden=bool(_style_ov),
         )
         category_instructions = ""
     # SCRIPT 레이어: 카테고리별 대본 포맷 (recipe 모듈과 독립적으로 동작, 전 카테고리 적용)
@@ -549,15 +936,17 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     prompt = f"""
     [선택된 카테고리: {template_name}]
     {role_intro}
-    아래 [벤치마킹 패턴](훅 구조, 전개 속도, CTA 방식)을 계승해 [새 주제] 전용 풀 패키지를 작성하라.
+    아래 [벤치마킹 패턴](훅 구조, 전개 속도, CTA 방식, 문체)을 계승해 [새 주제] 전용 풀 패키지를 작성하라.
     speaker는 전부 "BJ 이슈왕"으로 통일 (TTS 호환).
 
     [작성 규칙 - 위반 시 실패작]
     1. 분량: 목표 {duration}초. 초당 3.5음절 기준으로 대본을 채울 것. 2~3개 장면으로 끝내지 마라.
-    2. 장면 수: 최소 {min_scenes}개 이상. 각 장면 4~8초 분량, 대사는 1~2문장.
-       나레이션은 한 문장 15자 내외로 짧게 쓸 것. narration_ko를 비울 수 있는 장면은 전체 중 최대 2개까지이며,
+    2. 장면 수: 최소 {min_scenes}개 이상, 최대 {_max_scenes}개 이하. 각 장면 8~12초 분량, 대사는 3~4문장.       나레이션은 한 문장 15자 내외로 짧게 쓸 것. narration_ko를 비울 수 있는 장면은 전체 중 최대 2개까지이며,
        빈 장면은 반드시 subtitle_ko에 계량을 넣을 것. HOOK·CTA·INGREDIENTS의 narration_ko는 절대 비우지 마라.
        narration_ko는 장면 1초당 공백 제외 4~5자 이내로 쓴다.
+       60초 영상이면 장면당 25~30자로 채워야 목표 길이에 맞는다. 이 길이를 절대 넘지 마라.
+       duration_sec는 대사 글자수 ÷ 3.5로 계산한다. (예: 28자 → 8초)
+       장면당 대사 길이는 장면 시간(초) × 3.5자로 계산한다. (예: 10초 장면 → 35자)
     3. 섹션 구성 (순서 고정, section 값은 아래 영문 태그 그대로):
 {sections_spec}
        - MAIN이 여러 개면 같은 태그를 반복 사용해도 된다.
@@ -596,11 +985,20 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     - scenes의 duration_sec 합계 = 목표 영상 길이({duration}초).
     - narration_ko가 빈 문자열이면 무음 구간이다. 이 경우 subtitle_ko에 계량을 반드시 넣어라.
       단, 빈 narration_ko는 전체 중 최대 2개까지, HOOK·CTA·INGREDIENTS는 반드시 채워라.
+    - **마지막 장면은 반드시 CTA 문장으로 끝낸다.** 조리 설명으로 끝내지 마라.
+      (예: "이 계정 계속 따라오시면 매주 하나씩 공유해요")
     - storyboard 각 아이템의 키는 section/speaker/narration_ko/subtitle_ko/sfx/duration_sec/visual 만 사용하라.
       dialogue/scene/voice 키 금지.
 
     [벤치마킹 패턴 - 구조·속도·CTA 방식만 참고하고, 포함된 대본 초안은 다른 영상의 것이므로 절대 베끼지 마라]
     {pattern_text}
+
+    [스타일 반영]
+    - 위 [분석된 스타일]이 있으면 훅·CTA·톤·문장 패턴을 그대로 유지한다. 단, 대사 내용은 새 주제에 맞게 다시 쓴다.
+    - 문장 패턴은 해당 표현을 실제로 써보되, 같은 문장을 3번 이상 반복하지 않는다.
+    - 전개 속도가 '빠름'이면 씬당 8~12초, '느림'이면 12~18초로 맞춘다.
+    - [문장 패턴]에 나온 어미(예: '~어 주세요', '~면서', '~다가')를 반드시 대사에 쓴다.
+      하나도 안 쓰면 분석이 무의미해진다. 최소 하나 이상을 자연스럽게 끼워 넣는다.
 
     [웹 검색 근거 - 배경 이해용으로만 읽고, 수치는 아래 확정 팩트만 사용하라]
     {(evidence_block[:800] + '...') if facts_text and len(evidence_block) > 800 else (evidence_block if evidence_block else '(근거 없음)')}
@@ -615,7 +1013,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     {facts_text if facts_text else '(확정 팩트 없음 - 아래 규칙을 따를 것)'}
 
     [작성 규칙 추가]
-    - 각 장면 대사에는 확정 팩트의 구체 수치를 1개 이상 포함하되, HOOK·CTA·INGREDIENTS(재료명 나열)는 예외로 한다
+    - 각 장면 대사에는 확정 팩트의 구체 수치를 1개 이상 포함하되, HOOK·CTA는 예외로 한다
     - 확정 팩트에 없는 수치는 절대 지어내지 마라. 없으면 수치 없이 쓰거나 '기호에 맞게'로 표현하라
     - {numeric_rule}
     - 출처 사이트명(만개의레시피, 블로그명 등)을 대사에 언급하지 마라
@@ -625,8 +1023,16 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     """
     result_json = _call_storyboard_json(model, prompt, what="stage1")
     items = result_json.get("storyboard", [])
+    # 모델이 최대 장면 수를 무시하고 더 많이 만들 수 있다. 넘치면 뒤에서 자른다.
+    # (앞을 자르면 오프닝/핵심이 사라지고, HOOK은 반드시 첫 장면에 있어야 한다.)
+    if len(items) > _max_scenes:
+        print(f"[Shorts Trim] {len(items)}개 장면이 최대 {_max_scenes}개를 초과해 뒤에서 잘랐다.")
+        items = items[:_max_scenes]
     if not items:
         raise ValueError("대본 생성 결과가 비어 있습니다.")
+
+    # 대사 길이 강제(30자) + duration_sec 재계산은 모든 후처리 이후에 적용한다.
+    # (Repair/Tone 패스가 items를 교체하면 Cap이 소실되므로 마지막에 해야 한다)
 
     # 분량 미달 시 1회 확장 (같은 스키마로 추가 장면 요청)
     def _total(itms):
@@ -636,16 +1042,13 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
                 from .generator import calculate_duration
             except (ImportError, ValueError):
                 from generator import calculate_duration
-            tx = it.get("narration_ko")
-            if tx is None:
-                tx = it.get("text", "") or ""
-            import re as _re
-            tx = _re.sub(r'\(.*?\)', '', tx).strip()
+            tx = _narration_of(it)
+            tx = re.sub(r'\(.*?\)', '', tx).strip()
             t += (calculate_duration(tx) if tx else min(max(float(it.get("duration_sec") or 3), 1.0), 15.0)) + 0.5
         return t
 
-    if _total(items) < duration * _MIN_RATIO and len(items) < 15:
-        last = "\n".join(f"- {i.get('section', '')}: {i.get('text', '')}" for i in items[-3:])
+    if _total(items) < duration * _MIN_RATIO and len(items) < _max_scenes:
+        last = "\n".join(f"- {i.get('section', '')}: {_narration_of(i)}" for i in items[-3:])
         ext_prompt = f"""
         위 대본은 {len(items)}개 장면으로 목표 {duration}초에 못 미친다.
         같은 주제({topic})로 이어지는 추가 장면 {max(2, min_scenes - len(items))}개를 같은 JSON 스키마(storyboard 배열)로만 출력하라.
@@ -662,6 +1065,15 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
                 print(f"[Shorts Extend] Added {len(ext_items)} scenes.")
         except Exception as ext_e:
             print(f"[Shorts Extend] failed: {ext_e}")
+
+    # 확장은 장면 수를 다시 세지 않고 그대로 붙인다. 그래서 여기서 한 번 더 정리한다.
+    # (확장 결과가 최대 장면 수를 넘으면 뒤를 자르고, 대사가 빈 장면은 뺀다)
+    if len(items) > _max_scenes:
+        print(f"[Shorts Trim] 확장 후 {len(items)}개가 최대 {_max_scenes}개를 초과해 뒤에서 잘랐다.")
+        items = items[:_max_scenes]
+    items = [it for it in items if _narration_of(it).strip()]
+    if len(items) < min_scenes:
+        print(f"[Shorts Scenes] {len(items)}개로 요청 {min_scenes}개에 못 미친다(장면당 시간이 늘어 영상 길이는 유지).")
 
     script_list, scene_guide_list, current_time = _convert_storyboard_items(items, 0, 0, allow_empty_text=True)
     if not script_list:
@@ -736,67 +1148,94 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
             print(f"[Shorts Repair] failed: {rep_e}")
 
     # 톤/구조 준수 검사 + 1회 재생성.
-    # 프롬프트로만 지시하면 LLM이 늘 평서문으로 돌아가므로, 기계적으로 잡아낸다.
-    if resolved_axes:
-        try:
-            from .recipe_prompts import check_tone_compliance, style_enforce_block
-        except (ImportError, ValueError):
-            from recipe_prompts import check_tone_compliance, style_enforce_block
-        _narr = [(s.get("text") or "") for s in script_list]
-        _viol = check_tone_compliance(_narr, resolved_axes["tone"], resolved_axes["structure"])
-        if _viol:
-            print(f"[Shorts Tone] {len(_viol)} violation(s), rewriting once: {_viol}")
-            # 전체 JSON을 다시 받으면 스키마/장면수가 드리프트해 버려진다(실측).
-            # 대사 텍스트만 JSON 배열로 받아 기존 장면에 이식한다.
-            # 장면 수·타임라인·섹션·비주얼이 그대로 유지되고 응답도 훨씬 짧다.
-            indexed = "\n".join(
-                f"{i + 1}. {s.get('text', '') or ''}" for i, s in enumerate(script_list)
-            )
-            tone_prompt = f"""
-            아래 {len(script_list)}개 줄은 각 장면의 대사다. 이 대사만 지정된 문체·구조로 고쳐라.
+    # 톤 수리 패스는 제거했다. 실측에서 "still violating"이 대부분이라 추가 LLM 호출
+    # 대비 효과가 거의 없었고, 프롬프트가 단순해지면서 style_enforce_block로 대체한다.
 
-            현재 위반:
-            {chr(10).join('- ' + v for v in _viol)}
-
-            {style_enforce_block(resolved_axes)}
-
-            규칙:
-            - 계량 수치(숫자+단위)는 그대로 두고 문체와 서술 순서만 고친다. 새 수치를 지어내지 마라.
-            - 대사 길이는 원래와 비슷한 길이로 유지한다.
-            - 빈 문자열로 만들지 마라.
-
-            반드시 JSON 배열로만 출력하라. 설명·마크다운·코드펜스 금지.
-            배열 길이는 정확히 {len(script_list)}개여야 하며, 각 원소는 해당 장면의 새 대사다.
-
-            [현재 대본]
-            {indexed}
-            """
+    # 첫 문장 예시 복사 강제 재생성.
+    # 실측: '배달 시키면 손해입니다'가 여러 프리셋에서 그대로 나왔다. 프롬프트에
+    # '복사하지 말라'고 써도 예시가 하나뿐이면 모델은 그 예시를 따라 쓴다.
+    # 프롬프트에서는 예시 문장을 빼고(구조만 설명) 여기서 결과물을 실제로 고친다.
+    _HOOK_BANNED = ("배달 시키면", "집에서 났습니다", "안 만들 이유가 있나요", "금방 끝납니다")
+    if items:
+        _f0 = _narration_of(items[0])
+        _hit = next((b for b in _HOOK_BANNED if b in _f0), None)
+        if _hit:
             try:
-                tone_txt = model.generate_content(tone_prompt).text
-                new_narr = _parse_json_response(tone_txt)
-                if isinstance(new_narr, dict):
-                    new_narr = new_narr.get("narrations") or new_narr.get("list") or []
-                if isinstance(new_narr, list) and len(new_narr) == len(script_list) \
-                        and all(isinstance(x, str) and x.strip() for x in new_narr):
-                    for _i, _txt in enumerate(new_narr):
-                        script_list[_i]["text"] = _txt.strip()
-                    _still = check_tone_compliance([(s.get("text") or "") for s in script_list],
-                                                  resolved_axes["tone"], resolved_axes["structure"])
-                    if _still:
-                        print(f"[Shorts Tone] still violating after rewrite, keeping rewrite "
-                              f"({len(_still)} left): {_still}")
+                _hp = (
+                    f"첫 문장만 다시 써라. 지금 첫 문장: '{_f0[:60]}'\n"
+                    f"이 문장에 '{_hit}'이 들어 있어 프롬프트의 예시 문장을 그대로 베낀 것이다.\n"
+                    f"이번 메뉴 '{topic}'에 맞는 새 첫 문장으로 바꿔라.\n"
+                    f"같은 반전/공감 구조는 유지하되 실제 문구는 새로 써야 한다. 20~30자.\n"
+                    f"나머지 {len(items) - 1}개 장면은 절대 건드리지 말고 그대로 둔다.\n"
+                    f"같은 JSON 스키마로 전체를 다시 출력하라."
+                )
+                _hj = _call_storyboard_json(model, _hp, what="hookfix")
+                _hi = _hj.get("storyboard", [])
+                if _hi and len(_hi) == len(items):
+                    _new0 = _narration_of(_hi[0]).strip()
+                    if _new0 and not any(b in _new0 for b in _HOOK_BANNED):
+                        _set_narration(items[0], _new0)
+                        # 자막도 함께 맞춰야 첫 화면 문구가 남지 않는다.
+                        _old_sub = str(items[0].get("subtitle_ko") or "").strip()
+                        if _old_sub and _old_sub in _f0:
+                            items[0]["subtitle_ko"] = _new0
+                        print(f"[Shorts Hook] 예시 복사 감지 → 첫 문장을 '{_new0[:40]}'로 교체했다.")
                     else:
-                        print("[Shorts Tone] applied.")
+                        print("[Shorts Hook] 교체 시도했지만 여전히 예시 문장이라 원본을 유지했다.")
                 else:
-                    _got = len(new_narr) if isinstance(new_narr, list) else type(new_narr).__name__
-                    print(f"[Shorts Tone] skipped (expected {len(script_list)} strings, got {_got}).")
-            except Exception as tone_e:
-                print(f"[Shorts Tone] failed: {tone_e}")
-        else:
-            print("[Shorts Tone] compliant.")
+                    print("[Shorts Hook] shape 불일치로 첫 문장을 유지한다.")
+            except Exception as hook_e:
+                print(f"[Shorts Hook] 교체 실패(원본 유지): {hook_e}")
+
+    # 마지막 장면 CTA 강제: 프롬프트 지시만으로는 모델이 조리 장면으로 끝낸다.
+    if resolved_axes and items:
+        try:
+            from .recipe_prompts import _AXIS_MAPS as _AX
+        except (ImportError, ValueError):
+            from recipe_prompts import _AXIS_MAPS as _AX
+        _cta_key = resolved_axes["cta"]
+        _last = items[-1]
+        _last_txt = _narration_of(_last)
+        _cta_sig = {"save": "저장", "comment": "댓글", "subscribe": "구독",
+                    "follow": "따라오", "emotion": "많이 먹", "ask_viewer": "여러분"}.get(_cta_key, "")
+        if _cta_sig and _cta_sig not in _last_txt:
+            # 중간 장면에 이미 CTA가 있으면 그 장면만 비운다.
+            # 인덱스 0(훅)은 절대 건드리지 않는다 — 1번 장면이 지워지면 대본이
+            # 도발 문장으로 시작하지 않아 앞에서 고친 훅 수정이 그대로 무너진다.
+            _dup = [i for i in range(1, len(items) - 1)
+                    if _cta_sig in _narration_of(items[i])]
+            for i in _dup:
+                print(f"[Shorts CTA] 중복 CTA가 있던 {i + 1}번 장면을 비웠다.")
+                _set_narration(items[i], "")
+            _cta_line = {
+                "save": "나중에 해먹으려면 저장해두세요.",
+                "comment": "오늘 저녁은 어떠신가요? 댓글로 남겨주세요.",
+                "subscribe": "다음 편에서 더 맛있는 레시피로 찾아올게요. 구독하세요.",
+                "follow": "이 계정 계속 따라오시면 매주 하나씩 공유해요.",
+                "emotion": "완성. 많이 먹어. 어때?",
+                "ask_viewer": "여러분은 뭐 넣으면 더 맛있어요?",
+            }.get(_cta_key, "")
+            _cta_caption = {
+                "save": "오늘 레시피 저장해두세요",
+                "comment": "댓글로 다음 레시피 요청하기",
+                "subscribe": "구독하고 다음 편 보기",
+                "follow": "이 계정 계속 팔로우하기",
+                "emotion": "많이 먹어 어때?",
+                "ask_viewer": "댓글로 알려주세요",
+            }.get(_cta_key, "")
+            _set_narration(_last, _cta_line)
+            # 대사를 CTA로 바꾸면 자막도 같이 바꿔야 한다(실측: 이전 조리 자막이 남았음)
+            _last["subtitle_ko"] = _cta_caption
+            _last["section"] = "CTA"
+            # script_list/scene_guide_list는 여기서 직접 건드리지 않는다.
+            # _convert_storyboard_items가 내부적으로 짧은 조각을 합치므로
+            # items와 인덱스가 어긋난다(실측: 4개 → 2개 병합). 마지막에 items로
+            # 다시 변환하므로 여기서 건드릴 필요가 없다.
+            print(f"[Shorts CTA] 마지막 장면을 {_cta_key} CTA로 교체했다(자막 동기화).")
+
     # 섹션 정보 유지 (Step2 뱃지 표시용, section/type 둘 다 허용)
     for sc, it in zip(scene_guide_list, items):
-        sec = (it.get("section") or it.get("type") or "").strip().upper()
+        sec = (str(it.get("section") or it.get("type") or "")).strip().upper()
         if sec:
             sc["section"] = sec
     # visual.keyword/description 유실·오염 시 씬별 폴백 (전 씬 동일 문구 금지)
@@ -837,6 +1276,111 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
             _en = _SEC_EN.get(_sec, 'cooking scene in progress')
             fixed_kw = (sc.get("keyword") or topic[:20]).strip()
             sc["description"] = f"{_en}, {fixed_kw} cooking, steam rising, photorealistic food photography"
+
+    # 빈 대사 장면 제거.
+    # CTA 중복 제거가 남긴 빈 문자열 대사(실측: 3분 대본 8번)가 그대로 결과에 노출되면
+    # TTS가 읽을 게 없는 0자 장면이 된다. 자막만 남아 있어도 제거한다.
+    _before = len(items)
+    items = [it for it in items if _narration_of(it).strip()]
+    if len(items) < _before:
+        print(f"[Shorts Cleanup] 대사가 빈 장면 {_before - len(items)}개를 제거했다.")
+    if not items:
+        raise ValueError("대본 생성 결과가 비어 있습니다.")
+
+    # 대사 길이 강제(길이 비례) + duration_sec 재계산 — 모든 후처리의 마지막에 적용한다.
+    # Repair/Tone 패스가 items를 교체하면 이전 Cap이 소실되므로 여기서 해야 한다.
+    # duration_sec는 대사 길이가 아니라 목표 길이를 장면 수로 나눈 값으로 고정한다.
+    # (대사가 짧으면 무음 공백이 생기지만 문장은 안 잘린다)
+    #
+    # 아래 루프는 장면 사이에 0.5초 공백(SCENE_GAP_SEC)을 넣는다. 그 공백을
+    # 빼지 않고 duration/N만 쓰면 총합이 duration + 0.5*N이 되어 180초가
+    # 189초로 밀린다(실측: 300→315, 600→630, 30→34). 오디오는 마스터이므로
+    # 이런 silent overshoot는 그대로 안 된다.
+    _gap = 0.5
+    _n = max(1, len(items))
+    _per_scene = max(3.0, (duration - _gap * _n) / _n)
+    _cap = max(30, min(80, round(_per_scene * 3.5)))
+    # 원본이 '재료+양념을 한 문장에 몰아넣는' 밀집형 문법이면 문장당 상한을 올린다.
+    # 실측: 신즈 '역대급 레시피'는 어미 조각(~ 준비해 주고)을 살리려면 45자+가 필요했는데
+    # 30초 장면 상한(33자)에 잘려 전부 사라졌다. 상한을 올려도 시간 배정은 그대로라
+    # 영상 길이는 안 늘어난다(오디오가 짧으면 무음 공백이 될 뿐).
+    # 톤별 대사 상한.
+    # 실측: bracket_quirk/자조개그는 대괄호 독백·농담 한 마디가 통째로 잘려나갔다.
+    # (30초 장면 상한 33자 vs 독백 '[이거 안 태우면 어떡하지...]' 19자 + 서술 20자)
+    # 톤 rule이 '필수'라고 말해도 모델이 100% 지킨다는 보장이 없어 길이 상한을 함께 푼다.
+    _tone_now = str((resolved_axes or {}).get("tone") or "")
+    if _tone_now in ("bracket_quirk", "self_deprecating"):
+        _cap = max(_cap, 40)
+        print(f"[Shorts Cap] {_tone_now} 톤 → 독백이 잘리지 않도록 상한 {_cap}자로 완화")
+    for it in items:
+        tx = _narration_of(it)
+        if len(tx) > _cap:
+            head = tx[:_cap]
+            cut = max(head.rfind(". "), head.rfind("? "), head.rfind("! "))
+            if cut < 15:
+                cut = head.rfind(" ")
+            trimmed = (head[:cut + 1] if cut > 0 else head).strip()
+            # Cap이 빈 문자열로 자르면 조리 정보가 통째로 사라진다. 자르지 않고 되돌린다.
+            if not trimmed:
+                print(f"[Shorts Cap] 자르다 빈 문자열이 될 수 있어 축약 취소 ({len(tx)}자 유지)")
+            else:
+                _set_narration(it, trimmed)
+                print(f"[Shorts Cap] 대사 {len(tx)}자 -> {len(trimmed)}자로 축약")
+        it["duration_sec"] = _per_scene
+
+    # 톤 rule 후처리: 브금 개그 / 자조 개그의 특징이 없으면 LLM 재시도 없이 지어 넣는다.
+    # (프롬프트 rule에 '필수'라고 써도 모델이 놓친 실측 4/4. 규칙은 확률이라 확인이 필요하다)
+    # Cap 뒤에 둔다 — 앞에서는 길이 상한에 잘려 독백만 반쪽 남았다(실측 '[연기만 나면').
+    _tone_enforce = str((resolved_axes or {}).get("tone") or "")
+    _all_txt = " ".join(_narration_of(it) for it in items)
+    if _tone_enforce == "bracket_quirk":
+        # 대괄호 독백은 TTS가 읽으면 안 되는 '화면 전용 지문'이다.
+        # generator.py:215가 대사에서 대괄호를 통째로 지우므로 narration_ko에 넣으면
+        # 100% 증발한다(실측). 원본 무니키친도 화면 자막에만 나오는 독백이다.
+        # 1) 모델이 대사에与大括弧 독백을 이미 넣었다면 상단 자막으로 옮겨 살린다.
+        for it in items:
+            tx = _narration_of(it)
+            if "[" in tx and "]" in tx:
+                aside = " ".join(re.findall(r"\[[^\]]*\]", tx))
+                tx_clean = re.sub(r"\[[^\]]*\]", "", tx)
+                tx_clean = re.sub(r"[ \t]{2,}", " ", tx_clean).strip()
+                _set_narration(it, tx_clean)
+                if aside.strip():
+                    it["subtitle_ko"] = (str(it.get("subtitle_ko") or "").strip()
+                                          + " " + aside.strip()).strip()
+        # 2) 독백이 아예 없으면 직접 만든다. 질문형 1회 포함.
+        if "[" not in " ".join(str(it.get("subtitle_ko") or "") for it in items):
+            _qidx = max(1, len(items) // 2)
+            _oidx = min(len(items) - 2, _qidx + 1)
+            for _i, _g in ((_qidx, "[이거 안 태우면 어떡하지...]"),
+                           (_oidx, "[연기만 나면 그만이죠...]")):
+                if _i == _oidx and len(items) < 3:
+                    continue
+                base = str(items[_i].get("subtitle_ko") or "").strip()
+                items[_i]["subtitle_ko"] = (base + " " + _g).strip() if base else _g
+            print("[Shorts Tone] 브금 개그 독백이 없어 상단 자막에 2회를 직접 넣었다.")
+    elif _tone_enforce == "self_deprecating" and not any(
+            k in _all_txt for k in ("먹으세", "ㅋㅋ", "제가 제일", "실력이 없어")):
+        # 농담은 TTS로 읽혀야 하므로 대사에 붙인다(화면 전용이 아니다).
+        _jidx = max(1, len(items) // 2)
+        _set_narration(items[_jidx],
+                       _narration_of(items[_jidx]).rstrip() + " 요리 실력이 없어도 맛은 있죠.")
+        print("[Shorts Tone] 자조 개그 농담이 없어 한 마디를 직접 넣었다.")
+
+    script_list, scene_guide_list, current_time = _convert_storyboard_items(
+        items, 0, 0, allow_empty_text=True)
+    # _convert_storyboard_items는 duration_sec를 무시하고 대사 길이로 시간을
+    # 다시 계산한다(generator.py:262). 목표 길이를 맞추려면 여기서 보정해야 한다.
+    # 장면 수는 _n이지만 병합 후 실제 장면 수가 줄 수 있어 len(scene_guide_list)를 쓴다.
+    _m = max(1, len(scene_guide_list))
+    _per_scene = max(3.0, (duration - _gap * _m) / _m)
+    _t = 0.0
+    for _sc in scene_guide_list:
+        _sc["time_start"] = round(_t, 1)
+        _sc["time_end"] = round(_t + _per_scene, 1)
+        _t += _per_scene + _gap
+    # 마지막 공백은 영상의 끝이라 빼지 않는다.
+    current_time = round(_t - _gap, 1)
 
     out = {
         "grounded": bool(evidence_block),

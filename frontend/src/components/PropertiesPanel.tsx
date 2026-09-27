@@ -957,6 +957,9 @@ const SubtitleSettings: React.FC<SubtitleSettingsProps> = ({ subtitleStyle, setS
           if (preset) setSubtitleStyle({ ...subtitleStyle, preset: id, ...preset });
         }}
       />
+      <p className="text-[9px] text-zinc-400 leading-relaxed">
+        글자 크기·위치 조정은 &lsquo;제작 설정 &gt; 자막&rdquo;에서 합니다.
+      </p>
     </div>
 
     <div className="space-y-3">

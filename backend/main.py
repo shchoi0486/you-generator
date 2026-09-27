@@ -18,7 +18,14 @@ from core.config_utils import load_config, get_asset_dir, get_export_dir
 
 from fastapi.staticfiles import StaticFiles
 
+# 프로바이더 가격/키 API (BYOK). providers.yaml 이 단일 출처.
+try:
+    from routers.providers_api import router as providers_router
+except ImportError:  # 패키지 모드로 실행될 때
+    from backend.routers.providers_api import router as providers_router
+
 app = FastAPI()
+app.include_router(providers_router)
 
 
 @app.get("/cloudflare/usage")
@@ -708,6 +715,14 @@ async def shorts_create(request: ShortsCreateRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # 모델 할량/인증 실패는 500이 아니라 402/401로 보낸다. 프론트가
+        # "대본 생성 실패"가 아니라 "결제/키 문제"로 안내할 수 있어야 한다
+        # (실측: 429가 '모델 응답 파싱 실패'라는 400으로 떠 원인을 몰랐다).
+        from core.shorts_lab import _FatalModelError
+        if isinstance(e, _FatalModelError):
+            code = 402 if "한도" in str(e) or "quota" in str(e).lower() else 401
+            print(f"[Shorts Create Fatal] {e}")
+            raise HTTPException(status_code=code, detail=str(e))
         print(f"[Shorts Create Error] {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

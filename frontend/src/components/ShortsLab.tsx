@@ -1,118 +1,25 @@
 import React, { useState } from 'react';
 import { Upload, Link2, Zap, Hash, Clock, Loader2, X, Settings2, Check, FileText, ExternalLink, Sparkles } from 'lucide-react';
 import { api, type ShortsReport, type AppContent, type Article } from '../services/api';
+import {
+  FALLBACK_RECIPE_OPTIONS as RECIPE_FALLBACK,
+  EMPTY_RECIPE_PRESET,
+  type RecipePresetState,
+} from '../constants/recipeOptions';
 
 const CATEGORY_LABELS: Record<string, string> = {
   recipe_short: '요리 / 레시피',
   review_short: '제품 리뷰 / 추천',
   knowledge_short: '지식 / 정보',
-  travel_short: '여행 / 브이로그',
+  travel_short: '여행 / 브로그',
 };
 
-/** 프롬프트 설정용 라디오 그룹 (포맷/스타일/플랫폼) */
-const PresetOptions: React.FC<{
-  title: string;
-  options: Array<{ id: string; name: string; desc?: string }>;
-  value: string;
-  onPick: (id: string) => void;
-}> = ({ title, options, value, onPick }) => (
-  <div className="space-y-1.5">
-    <p className="text-xs font-black text-gray-700">■ {title}</p>
-    <div className="flex flex-wrap gap-1.5">
-      {options.map((o) => {
-        const active = value === o.id;
-        return (
-          <button
-            key={o.id}
-            onClick={() => onPick(o.id)}
-            title={o.desc || o.name}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-bold transition-all ${
-              active
-                ? 'bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-200'
-                : 'bg-white border-gray-200 text-gray-500 hover:border-indigo-300 hover:text-indigo-600'
-            }`}
-          >
-            <span className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center shrink-0 ${active ? 'border-white' : 'border-gray-300'}`}>
-              {active && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
-            </span>
-            {o.name}
-          </button>
-        );
-      })}
-    </div>
-  </div>
-);
-
-// 백엔드 /shorts/recipe-options 실패 시 폴백 (백엔드 기본값과 동일)
-const FALLBACK_RECIPE_OPTIONS = {  formats: [
-    { id: 'auto', name: '자동', desc: '영상 길이에 맞춰 자동 선택' },
-    { id: 'short_30', name: '30초 숏폼', desc: '세로형 · 30초 · 5~6장면', target_sec: 30 },
-    { id: 'short_60', name: '60초 숏폼', desc: '세로형 · 60초 · 6~8장면', target_sec: 60 },
-    { id: 'long_5', name: '5분 롱폼', desc: '가로/세로 · 약 5분 · 장면 수 자유', target_sec: 300 },
-  ],
-  styles: [
-    { id: 'realistic', name: '현실적인 요리', desc: '한국 가정식 기본값' },
-    { id: 'jasuisaeng', name: '자취생', desc: '원룸 주방 · 단순 · 빠른 컷' },
-    { id: 'asmr', name: 'ASMR', desc: '음식 소리 중심' },
-    { id: 'cinematic', name: '시네마틱', desc: '영화적인 고급 음식 영상' },
-  ],
-  platforms: [
-    { id: 'youtube', name: 'YouTube', desc: '제목·설명·해시태그' },
-    { id: 'instagram', name: 'Instagram', desc: '짧은 캡션·해시태그' },
-    { id: 'tiktok', name: 'TikTok', desc: '짧은 후킹 캡션' },
-  ],
-  hooks: [
-    { id: 'random', name: '매번 변경', desc: '생성할 때마다 5종 중 무작위로 시작' },
-    { id: 'question', name: '질문형', desc: '시청자에게 던지는 짧은 질문으로 시작' },
-    { id: 'provoke', name: '도발형', desc: '상식을 뒤집는 단언으로 시작' },
-    { id: 'empathy', name: '공감형', desc: '실패 경험에 공감하며 시작' },
-    { id: 'number', name: '숫자형', desc: '시간·금액·개수 숫자로 시작' },
-    { id: 'twist', name: '반전형', desc: '예상 밖 결과 선언으로 시작' },
-  ],
-  presets: [
-    { id: 'random', name: '매번 변경', desc: '생성할 때마다 8종 중 무작위 세트' },
-    { id: 'jachae_real', name: '자취생 리얼', desc: '실패 경험에서 출발해 담백한 1인칭으로 풀어봄', hook: 'question', tone: 'casual_first', structure: 'fail_try', cta: 'save' },
-    { id: 'banjeon_meme', name: '반전 밈', desc: '결론을 먼저 던지고 MZ 반말로 근거를 붙임', hook: 'provoke', tone: 'mz_blunt', structure: 'conclusion_first', cta: 'comment' },
-    { id: 'asmr_immersion', name: 'ASMR 몰입', desc: '감각 묘사만으로 무언 나열, 구독으로 연결', hook: 'number', tone: 'sensory', structure: 'silent_list', cta: 'subscribe' },
-    { id: 'fail_story', name: '실패 회고', desc: '망한 적을 회고하며 원인을 짚고 해결로 마무리', hook: 'empathy', tone: 'retro', structure: 'problem_cause_fix', cta: 'subscribe' },
-    { id: 'ultra_list', name: '초압축 리스트', desc: '숫자로 시작해 짧고 강하게 끝내는 압축형', hook: 'number', tone: 'mz_blunt', structure: 'silent_list', cta: 'save' },
-    { id: 'chef_secret', name: '셰프 레시피', desc: '전문가 단언으로 비결을 단계별로 공개', hook: 'twist', tone: 'authority', structure: 'problem_cause_fix', cta: 'follow' },
-    { id: 'debate_check', name: '논쟁 검증', desc: '질문으로 시작해 반론을 근거로 정리', hook: 'question', tone: 'casual_first', structure: 'conclusion_first', cta: 'comment' },
-    { id: 'challenge_30', name: '30초 챌린지', desc: '시간 압박을 내세워 도발적으로 시작', hook: 'provoke', tone: 'mz_blunt', structure: 'fail_try', cta: 'save' },
-  ],
-  tones: [
-    { id: 'casual_first', name: '담백 1인칭', desc: '반말체, 담담한 1인칭' },
-    { id: 'mz_blunt', name: 'MZ 직설', desc: '짧고 강한 단문 위주 쿨한 반말' },
-    { id: 'sensory', name: '감각 묘사', desc: '오감 묘사 우선, 설명 최소화' },
-    { id: 'retro', name: '실패 회고', desc: '1인칭 과거형 회고, 후회 뉘앙스' },
-    { id: 'authority', name: '전문가 단언', desc: '전문가 관점의 여유롭고 단정적인 문장' },
-  ],
-  structures: [
-    { id: 'fail_try', name: '실패 → 시도 → 결과', desc: '망한 경험 → 바꿔본 것 → 결과' },
-    { id: 'conclusion_first', name: '결론 먼저 → 근거', desc: '역순 서술, 첫 문장에 결과/핵심' },
-    { id: 'silent_list', name: '무언 나열', desc: '이야기 없이 재료 → 동작 → 완성' },
-    { id: 'problem_cause_fix', name: '문제 → 원인 → 해결', desc: '잘 안 되는 증상 → 진단 → 해결 조각' },
-  ],
-  ctas: [
-    { id: 'save', name: '저장 유도', desc: "'나중에 해먹으려면 저장' + 이유 한 줄" },
-    { id: 'comment', name: '댓글 유도', desc: '질문형으로 끝내고 다음 편 연결' },
-    { id: 'subscribe', name: '구독 유도', desc: '다음 편 예고로 구독 유도' },
-    { id: 'follow', name: '팔로우 유도', desc: '정서적 약속으로 팔로우 유도' },
-  ],
-};
+// 백엔드 /shorts/recipe-options 실패 시 폴백.
+// 목록은 ../constants/recipeOptions 에서 공유한다 — 이 컴포넌트와
+// VideoPresetPanel에 복붙돼 있어 한쪽만 고쳐 훅 2종이 누락된 버그가 났다.
+const FALLBACK_RECIPE_OPTIONS = RECIPE_FALLBACK as unknown as typeof RECIPE_FALLBACK;
 
 type RecipePresetOption = { id: string; name: string; desc: string };
-
-type RecipePresetState = {
-  format: string;
-  style: string;
-  platform: string;
-  hook?: string;
-  preset?: string;
-  tone?: string;
-  structure?: string;
-  cta?: string;
-};
 
 interface ShortsLabProps {
   onComplete: (article: Article, content: AppContent) => void;
@@ -127,9 +34,7 @@ interface ShortsLabProps {
   topic: string;
   setTopic: (v: string) => void;
   duration: number;
-  setDuration: (v: number) => void;
   category: string;
-  setCategory: (v: string) => void;
   onDirectCreate: (topic: string, duration: number, category: string, reference?: string) => void | Promise<void>;
   onAutoMake?: () => void;
   recipePreset?: RecipePresetState;
@@ -152,11 +57,10 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
   topic = '',
   setTopic = () => {},
   duration = 60,
-  setDuration = () => {},
   category = 'recipe_short',
   onDirectCreate = () => {},
   onAutoMake,
-  recipePreset = { format: 'auto', style: 'realistic', platform: 'youtube', hook: 'random', preset: 'random' },
+  recipePreset = EMPTY_RECIPE_PRESET,
   setRecipePreset = () => {},
   scriptId = '',
   sourceRef = '',
@@ -213,9 +117,7 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
     }
   };
 
-  type DraftAxes = Partial<{ format: string; style: string; platform: string; hook: string; preset: string; tone: string; structure: string; cta: string }>;
-
-  const loadComposedPreview = async (draft: DraftAxes) => {
+  const loadComposedPreview = async (draft: { format: string; style: string; platform: string; hook?: string; preset?: string; tone?: string; structure?: string; cta?: string }) => {
     try {
       const r = await api.getRecipePromptPreview(
         draft.format || 'auto', draft.style || 'realistic', draft.platform || 'youtube',
@@ -228,25 +130,6 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
       setComposedPreview('');
       setResolvedFormatName('');
     }
-  };
-
-  // 프리셋을 고르면 톤/구조/훅/CTA가 한 세트로 함께 채워진다.
-  // 개별 축을 직접 바꾼 경우에만 해당 축만 오버라이드로 넘어가고, 나머지는 프리셋 값을 따른다.
-  const pickPresetDraft = (patch: DraftAxes) => {
-    let next = { ...presetDraft, ...patch };
-    if (patch.preset && !('tone' in patch) && !('structure' in patch) && !('cta' in patch) && !('hook' in patch)) {
-      const p = (recipeOptions || FALLBACK_RECIPE_OPTIONS).presets.find((x) => x.id === patch.preset) as
-        (RecipePresetOption & { tone?: string; structure?: string; hook?: string; cta?: string }) | undefined;
-      if (p && p.tone) {
-        next = { ...next, tone: p.tone || '', structure: p.structure || '', hook: p.hook || '', cta: p.cta || '' };
-      } else {
-        // '매번 변경'은 실제 세트를 백엔드가 뽑으므로 축을 비워서 넘긴다.
-        next = { ...next, tone: '', structure: '', hook: '', cta: '' };
-      }
-    }
-    setPresetDraft(next);
-    // 포맷은 장면 구조만 정한다. 영상 길이는 제작 설정이 주인이라 여기서 duration을 바꾸지 않는다.
-    loadComposedPreview(next);
   };
 
   const openPromptModal = async () => {
@@ -277,8 +160,14 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
       loadComposedPreview(draft);
       try {
         const cfg = await api.getConfig();
+        // 서버 config는 '처음 한 번만' 초기값으로 쓴다. 이게 draft를 덮으면
+        // 제작 설정에서 고른 프리셋이 프롬프트 확인 화면에서 '매번 변경'으로
+        // 보이다가, 여기서 저장하면 제작 설정까지 되돌아간다(실측).
+        // 순서: recipePreset(제작 설정) > 서버 config(신규 사용자에만 의미 있음).
         const saved = (cfg?.recipe_prompt_preset || {}) as Partial<typeof draft>;
-        if (saved.format || saved.style || saved.platform || saved.hook || saved.preset) {
+        const railIsUntouched =
+          !recipePreset.preset || recipePreset.preset === 'random';
+        if (railIsUntouched && (saved.style || saved.platform || saved.preset)) {
           // 구 기본값 short_60 → auto 마이그레이션
           const savedFmt = saved.format || draft.format;
           const merged = {
@@ -466,18 +355,22 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
   };
 
   // 프리셋이 지정한 축과 개별 오버라이드 중 실제로 적용될 값을 화면에 보여준다.
+  // 출처를 나눠야 한다: presetDraft는 '프롬프트 확인' 모달을 열어야 갱신되는 로컬
+  // 복사본이라, 모달 밖에서 읽으면 항상 초기값(매번 변경)이 showed다(실측).
+  // 모달이 열려 있으면 편집 중인 draft를, 닫혀 있으면 제작 설정의 진실을 보여준다.
   const _opts = recipeOptions || FALLBACK_RECIPE_OPTIONS;
+  const _src = showPromptModal ? presetDraft : recipePreset;
   const _nameOf = (list: Array<{ id: string; name: string }> | undefined, id?: string) =>
     (id ? list?.find((x) => x.id === id)?.name : undefined) || '';
-  const _preset = _opts.presets.find((p) => p.id === (presetDraft.preset || 'random')) as
+  const _preset = _opts.presets.find((p) => p.id === (_src.preset || 'random')) as
     (RecipePresetOption & { tone?: string; structure?: string; hook?: string; cta?: string }) | undefined;
   const _isRandomPreset = !_preset || !_preset.tone;
   const _fallback = (label: string) => (_isRandomPreset ? '생성 시 무작위' : label);
-  const activePresetName = _opts.presets.find((p) => p.id === (presetDraft.preset || 'random'))?.name || '매번 변경';
-  const activeToneName = _nameOf(_opts.tones, presetDraft.tone || _preset?.tone) || _fallback('프리셋 지정대로');
-  const activeStructureName = _nameOf(_opts.structures, presetDraft.structure || _preset?.structure) || _fallback('프리셋 지정대로');
-  const activeHookName = _nameOf(_opts.hooks, presetDraft.hook || _preset?.hook) || _fallback('프리셋 지정대로');
-  const activeCtaName = _nameOf(_opts.ctas, presetDraft.cta || _preset?.cta) || _fallback('프리셋 지정대로');
+  const activePresetName = _opts.presets.find((p) => p.id === (_src.preset || 'random'))?.name || '매번 변경';
+  const activeToneName = _nameOf(_opts.tones, _src.tone || _preset?.tone) || _fallback('프리셋 지정대로');
+  const activeStructureName = _nameOf(_opts.structures, _src.structure || _preset?.structure) || _fallback('프리셋 지정대로');
+  const activeHookName = _nameOf(_opts.hooks, _src.hook || _preset?.hook) || _fallback('프리셋 지정대로');
+  const activeCtaName = _nameOf(_opts.ctas, _src.cta || _preset?.cta) || _fallback('프리셋 지정대로');
 
   return (
     <div className="space-y-6">
@@ -784,17 +677,9 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
               className="w-full px-4 py-2.5 bg-white border border-gray-200 rounded-xl text-sm outline-none focus:border-indigo-500"
             />
             <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1.5">
-                {[15, 30, 40, 60].map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => setDuration(s)}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all ${duration === s ? 'bg-indigo-50 border-indigo-200 text-indigo-600' : 'bg-white border-gray-100 text-gray-400'}`}
-                  >
-                    {s}초
-                  </button>
-                ))}
-              </div>
+              {/* 길이 선택은 '제작 설정'의 단일 셀렉터가 유일한 진실이다.
+                  여기에도 버튼을 두면 같은 상태를 두 곳에서 고치게 되고,
+                  값도 어긋났다(여기는 15/30/40/60, 제작 설정은 30/60/180/300/600). */}
               <button
                 onClick={handleCreate}
                 disabled={creating || !topic.trim()}
@@ -837,77 +722,19 @@ const ShortsLab: React.FC<ShortsLabProps> = ({
                   <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-2.5 text-[11px] font-bold leading-relaxed text-gray-500">
                     🎬 영상 구조: 자동 (길이 {duration}초{resolvedFormatName ? ` → ${resolvedFormatName} 구조` : ''}) · 시간·장면 구성은 제작 설정의 영상 길이를 따릅니다
                   </div>
-                  <div className="space-y-2">
-                    <p className="text-xs font-bold text-gray-700">■ 대본 프리셋 <span className="font-normal text-gray-400">— 하나 고르면 톤·구조·훅·CTA가 한 세트로 맞춰집니다</span></p>
-                    <div className="grid grid-cols-2 gap-1.5">
-                      {(recipeOptions || FALLBACK_RECIPE_OPTIONS).presets.map((p) => {
-                        const on = (presetDraft.preset || 'random') === p.id;
-                        return (
-                          <button
-                            key={p.id}
-                            onClick={() => pickPresetDraft({ preset: p.id })}
-                            className={`text-left px-3 py-2 rounded-lg border transition-all ${on ? 'border-indigo-500 bg-indigo-50 ring-1 ring-indigo-200' : 'border-gray-200 bg-white hover:border-indigo-300'}`}
-                          >
-                            <p className={`text-xs font-bold ${on ? 'text-indigo-700' : 'text-gray-700'}`}>{p.name}</p>
-                            <p className="text-[10px] text-gray-400 leading-snug mt-0.5">{p.desc}</p>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                  <div className="rounded-xl border border-indigo-200 bg-indigo-50/70 px-4 py-3">
-                    <p className="text-xs font-bold text-indigo-800 mb-1.5">적용될 대본 흐름</p>
+                  <div className="rounded-xl border border-indigo-100 bg-indigo-50/50 px-4 py-3">
+                    <p className="text-xs font-bold text-indigo-800 mb-1.5">현재 대본 설정</p>
                     <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-indigo-900">
                       <span>프리셋: <b>{activePresetName}</b></span>
                       <span>톤: <b>{activeToneName}</b></span>
                       <span>구조: <b>{activeStructureName}</b></span>
                       <span>훅: <b>{activeHookName}</b></span>
+                      <span>스타일: <b>{(recipeOptions || FALLBACK_RECIPE_OPTIONS).styles.find((s) => s.id === presetDraft.style)?.name || presetDraft.style}</b></span>
+                      <span>플랫폼: <b>{(recipeOptions || FALLBACK_RECIPE_OPTIONS).platforms.find((p) => p.id === presetDraft.platform)?.name || presetDraft.platform}</b></span>
                       <span className="col-span-2">CTA: <b>{activeCtaName}</b></span>
                     </div>
+                    <p className="text-[10px] text-indigo-400 mt-1.5">프리셋·스타일·톤·구조·훅·CTA 변경은 제작 설정 레일의 「대본 다양화」에서 하세요</p>
                   </div>
-                  <details className="rounded-xl border border-gray-200 bg-white overflow-hidden">
-                    <summary className="px-4 py-2.5 text-xs font-bold text-gray-500 cursor-pointer hover:text-indigo-600">
-                      세분 조정 (톤·구조·훅·CTA 개별 변경)
-                    </summary>
-                    <div className="px-4 py-3 space-y-3 border-t border-gray-100">
-                      <PresetOptions
-                        title="내레이션 톤"
-                        options={(recipeOptions || FALLBACK_RECIPE_OPTIONS).tones}
-                        value={presetDraft.tone || ''}
-                        onPick={(id) => pickPresetDraft({ tone: id })}
-                      />
-                      <PresetOptions
-                        title="대본 구조"
-                        options={(recipeOptions || FALLBACK_RECIPE_OPTIONS).structures}
-                        value={presetDraft.structure || ''}
-                        onPick={(id) => pickPresetDraft({ structure: id })}
-                      />
-                      <PresetOptions
-                        title="오프닝 훅"
-                        options={(recipeOptions || FALLBACK_RECIPE_OPTIONS).hooks}
-                        value={presetDraft.hook || ''}
-                        onPick={(id) => pickPresetDraft({ hook: id })}
-                      />
-                      <PresetOptions
-                        title="마무리 CTA"
-                        options={(recipeOptions || FALLBACK_RECIPE_OPTIONS).ctas}
-                        value={presetDraft.cta || ''}
-                        onPick={(id) => pickPresetDraft({ cta: id })}
-                      />
-                    </div>
-                  </details>
-                  <PresetOptions
-                    title="영상 스타일"
-                    options={(recipeOptions || FALLBACK_RECIPE_OPTIONS).styles}
-                    value={presetDraft.style}
-                    onPick={(id) => pickPresetDraft({ style: id })}
-                  />
-                  <PresetOptions
-                    title="플랫폼"
-                    options={(recipeOptions || FALLBACK_RECIPE_OPTIONS).platforms}
-                    value={presetDraft.platform}
-                    onPick={(id) => pickPresetDraft({ platform: id })}
-                  />
                   <details className="rounded-xl border border-gray-200 bg-gray-50 overflow-hidden">
                     <summary className="px-4 py-2.5 text-xs font-bold text-gray-500 cursor-pointer hover:text-indigo-600">
                       조합된 프롬프트 미리보기 (프리셋: {activePresetName} · 읽기 전용)

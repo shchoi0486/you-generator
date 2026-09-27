@@ -17,7 +17,29 @@ import {
 import SubtitlePresetSelect, { subtitlePreviewStyle, type SubtitlePresetDef } from './SubtitlePresetSelect';
 import ModelPricingModal from './ModelPricingModal';
 import { subtitlePresets } from '../constants/data';
+import {
+  FALLBACK_RECIPE_OPTIONS,
+  DURATION_PRESETS,
+  type RecipePresetState,
+} from '../constants/recipeOptions';
 import type { CaptionStyle } from '../services/api';
+import { api } from '../services/api';
+
+// 대본 다양화 선택지는 백엔드 /shorts/recipe-options 를 단일 출처로 삼는다.
+// 아래 FALLBACK은 그 API가 죽었을 때만 쓴다(오프라인/백엔드 미기동 대비).
+// 목록은 ../constants/recipeOptions 에서 공유한다 — 여기와 ShortsLab에 복붙돼
+// 있어 한쪽만 고쳐 4개 프리셋의 훅이 UI에 안 뜨는 버그가 났다.
+// 프리셋에 길이가 없는 게 설계다. 길이는 DURATION_PRESETS로 따로 고른다.
+const FALLBACK_OPTIONS = FALLBACK_RECIPE_OPTIONS as unknown as typeof FALLBACK_RECIPE_OPTIONS;
+
+async function fetchRecipeOptions() {
+  // 로컬호스트를 직접 박으면 패키징(Tauri) 빌드에서 백엔드 주소가 꼬인다.
+  // 공통 API 클라이언트를 타야 설정을 한 곳에서만 바꾼다.
+  try {
+    return await api.getRecipeOptions();
+  } catch { /* 폴백 사용 */ }
+  return null;
+}
 
 export type CutSpeed = 'fast' | 'slow';
 export type ScriptFormat = 'hook' | 'summary' | 'story';
@@ -31,7 +53,9 @@ export const ASPECT_OPTIONS: Array<{ label: string; value: string; icon: React.F
   { label: '3:4', value: '3:4 (Portrait)', icon: Smartphone },
 ];
 
-export const DURATION_PRESETS = [30, 60, 90, 180, 300, 600];
+// 실측에서 30초·1분·3분·5분·10분이 압도적이다. 1.5분(90초)은 사용 빈도가 낮아 제외.
+// 값은 ../constants/recipeOptions 에서 온다(백엔드 포맷 5단계와 한 곳에서 유지).
+export { DURATION_PRESETS };
 
 export type ScriptGroup = 'cooking' | 'product' | 'knowledge' | 'travel' | 'news' | 'shorts_lab';
 
@@ -166,6 +190,9 @@ interface VideoPresetPanelProps {
   setZoomPct: (v: number) => void;
   /** 도킹 레일용: 바깥 카드 장식 없이 내용만 렌더 */
   bare?: boolean;
+  /** 대본 다양화 선택 (레시피 카테고리 전용) */
+  recipePreset?: RecipePresetState;
+  setRecipePreset?: (p: RecipePresetState) => void;
 }
 
 const activeBtn = 'bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-200';
@@ -357,8 +384,29 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
   showSceneCaptions,
   setShowSceneCaptions,
   bare = false,
+  recipePreset,
+  setRecipePreset,
 }) => {
   const [pricingTab, setPricingTab] = React.useState<null | 'image' | 'video'>(null);
+  // 상단 자막 프리셋 ID. 예전엔 captionStyle의 색/배경에서 ID를 역산했는데,
+  // PropertiesPanel에서 배경을 transparent로 바꾸면 어떤 항목에도 안 맞아
+  // 화면엔 '기본'이라고 떠 있고 실제 스타일과 어긋났다. ID를 직접 들고 있는다.
+  const [captionPresetId, setCaptionPresetId] = React.useState<string>(() => {
+    const hit = CAPTION_PRESETS.find(
+      (p) => p.style.color === captionStyle.color && p.style.bg_color === captionStyle.bg_color
+    );
+    return hit?.id ?? CAPTION_PRESETS[0].id;
+  });
+  const [recipeOptions, setRecipeOptions] = React.useState<typeof FALLBACK_OPTIONS | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    fetchRecipeOptions().then((o) => {
+      if (alive && o?.presets) setRecipeOptions(o);
+    });
+    return () => { alive = false; };
+  }, []);
+  const opts = recipeOptions || FALLBACK_OPTIONS;
+  const activePresetName = opts.presets.find((p) => p.id === (recipePreset?.preset || 'random'))?.name || '매번 변경';
   const currentScript = scriptOptions.find((f) => f.id === scriptId) ?? scriptOptions.find((f) => f.recommended) ?? scriptOptions[0];
   const engineName = ENGINE_OPTIONS.find((e) => e.id === selectedEngine)?.label ?? selectedEngine;
   const sizeName = SUBTITLE_SIZES.find((s) => s.id === subtitleSize)?.label ?? '';
@@ -476,10 +524,18 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[10px] text-gray-400 font-bold">직접 입력</span>
           <input
             type="number"
+            min={15}
+            max={3600}
             value={duration}
-            onChange={(e) => setDuration(parseInt(e.target.value) || 0)}
+            // 0이 들어갈 수 있었다. 백엔드는 int(duration or 40)로 조용히 40초를
+            // 대입하므로 화면엔 "0초"인데 생성은 40초가 된다(비정상).
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              if (Number.isNaN(n)) return;
+              setDuration(Math.min(3600, Math.max(15, n)));
+            }}
             placeholder="초 단위 입력"
-            title="영상 길이(초)"
+            title="영상 길이(초). 15~3600"
             className="w-full pl-16 pr-10 py-1.5 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 outline-none focus:border-indigo-500"
           />
           <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-gray-400 font-bold">sec</span>
@@ -536,7 +592,180 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         )}
       </RailSection>
 
-      <RailSection order={5} icon={<Mic size={13} />} title="기본 음성 엔진" summary={engineName}>
+      <RailSection order={5} icon={<Clapperboard size={13} />} title="대본 다양화" summary={activePresetName}>
+        {recipePreset && setRecipePreset ? (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-1.5">
+              {opts.presets.map((p) => {
+                const on = (recipePreset.preset || 'random') === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    onClick={() => {
+                      // 프리셋의 축을 state에 굳히지 않는다. 굳히면 그 스냅샷이
+                      // 명시 파라미터로 계속 전송되어, 나중에 서버가 프리셋 톤을
+                      // 바꿔도 브라우저가 옛 값을 덮어써 영영 못 본다(실측 구조).
+                      // 빈 문자열 = '오버라이드 없음'으로 두고 서버가 프리셋 값으로
+                      // 채우게 한다(백엔드 우선순위: 파라미터 > 프리셋 > 저장값).
+                      setRecipePreset({
+                        ...recipePreset,
+                        preset: p.id,
+                        hook: '', tone: '', structure: '', cta: '',
+                      });
+                    }}
+                    title={p.desc}
+                    className={`text-left px-3 py-2 rounded-lg border transition-all ${on ? 'border-indigo-500 bg-indigo-50 ring-1 ring-indigo-200' : 'border-gray-200 bg-white hover:border-indigo-300'}`}
+                  >
+                    <p className={`text-xs font-bold ${on ? 'text-indigo-700' : 'text-gray-700'}`}>{p.name}</p>
+                    <p className="text-[10px] text-gray-400 leading-snug mt-0.5">{p.desc}</p>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <div>
+                <p className="text-[10px] font-bold text-gray-500 mb-1">스타일</p>
+                <select
+                  value={recipePreset.style}
+                  onChange={(e) => setRecipePreset({ ...recipePreset, style: e.target.value })}
+                  className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-bold text-gray-700 outline-none focus:border-indigo-500"
+                >
+                  {opts.styles.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <p className="text-[10px] font-bold text-gray-500 mb-1">플랫폼</p>
+                <select
+                  value={recipePreset.platform}
+                  onChange={(e) => setRecipePreset({ ...recipePreset, platform: e.target.value })}
+                  className="w-full px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-[11px] font-bold text-gray-700 outline-none focus:border-indigo-500"
+                >
+                  {opts.platforms.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <details className="rounded-lg border border-gray-200 bg-white overflow-hidden">
+              <summary className="px-3 py-2 text-[11px] font-bold text-gray-500 cursor-pointer hover:text-indigo-600">
+                개별 조정 (톤·구조·훅·CTA)
+              </summary>
+              <div className="px-3 py-2.5 space-y-2.5 border-t border-gray-100">
+                {/* 프리셋 축은 state에 저장하지 않는다(빈 값=오버라이드 없음).
+                    그래서 '실제로 무엇이 적용되는지'는 여기서 계산해서 보여줘야 한다. */}
+                {(() => {
+                  const _p = opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as
+                    { tone?: string; structure?: string; hook?: string; cta?: string } | undefined;
+                  const _eff = {
+                    tone: recipePreset.tone || _p?.tone || '',
+                    structure: recipePreset.structure || _p?.structure || '',
+                    hook: recipePreset.hook || _p?.hook || '',
+                    cta: recipePreset.cta || _p?.cta || '',
+                  };
+                  const _dirty = Object.keys(_eff).some((k) => recipePreset[k as keyof typeof _eff]);
+                  if (!_p) return null;
+                  return (
+                    <div className="flex items-center justify-between gap-2 rounded-lg bg-gray-50 px-2.5 py-1.5">
+                      <p className="text-[10px] font-bold text-gray-500">
+                        적용 중: {opts.tones.find((t) => t.id === _eff.tone)?.name || '프리셋 지정'}
+                      </p>
+                      {_dirty ? (
+                        <button
+                          onClick={() => setRecipePreset({ ...recipePreset, hook: '', tone: '', structure: '', cta: '' })}
+                          className="text-[10px] font-bold text-indigo-600 hover:underline"
+                          title="개별 조정을 지우고 프리셋에 정해진 조합을 그대로 쓴다"
+                        >
+                          프리셋값으로 되돌리기
+                        </button>
+                      ) : (
+                        <span className="text-[10px] font-bold text-gray-400">프리셋 값 그대로</span>
+                      )}
+                    </div>
+                  );
+                })()}
+                <div>
+                  <p className="text-[10px] font-bold text-gray-500 mb-1">내레이션 톤</p>
+                  <div className="flex flex-wrap gap-1">
+                    {opts.tones.map((t) => {
+                      const _on = (recipePreset.tone || (opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as { tone?: string } | undefined)?.tone) === t.id;
+                      return (
+                        <button
+                          key={t.id}
+                          onClick={() => setRecipePreset({ ...recipePreset, tone: t.id })}
+                          title={t.desc}
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold border transition-all ${_on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'}`}
+                        >
+                          {t.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold text-gray-500 mb-1">대본 구조</p>
+                  <div className="flex flex-wrap gap-1">
+                    {opts.structures.map((s) => {
+                      const _on = (recipePreset.structure || (opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as { structure?: string } | undefined)?.structure) === s.id;
+                      return (
+                        <button
+                          key={s.id}
+                          onClick={() => setRecipePreset({ ...recipePreset, structure: s.id })}
+                          title={s.desc}
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold border transition-all ${_on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'}`}
+                        >
+                          {s.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold text-gray-500 mb-1">오프닝 훅</p>
+                  <div className="flex flex-wrap gap-1">
+                    {opts.hooks.map((h) => {
+                      const _on = (recipePreset.hook || (opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as { hook?: string } | undefined)?.hook) === h.id;
+                      return (
+                        <button
+                          key={h.id}
+                          onClick={() => setRecipePreset({ ...recipePreset, hook: h.id })}
+                          title={h.desc}
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold border transition-all ${_on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'}`}
+                        >
+                          {h.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold text-gray-500 mb-1">마무리 CTA</p>
+                  <div className="flex flex-wrap gap-1">
+                    {opts.ctas.map((c) => {
+                      const _on = (recipePreset.cta || (opts.presets.find((x) => x.id === (recipePreset.preset || 'random')) as { cta?: string } | undefined)?.cta) === c.id;
+                      return (
+                        <button
+                          key={c.id}
+                          onClick={() => setRecipePreset({ ...recipePreset, cta: c.id })}
+                          title={c.desc}
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold border transition-all ${_on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'}`}
+                        >
+                          {c.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </details>
+          </div>
+        ) : (
+          <Hint>요리/레시피 카테고리에서만 표시됩니다</Hint>
+        )}
+      </RailSection>
+
+      <RailSection order={6} icon={<Mic size={13} />} title="기본 음성 엔진" summary={engineName}>
         <select
           value={selectedEngine}
           onChange={(e) => setSelectedEngine(e.target.value as EngineId)}
@@ -550,7 +779,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         <Hint>화자별 목소리는 3단계에서 세부 조정</Hint>
       </RailSection>
 
-      <RailSection order={6} icon={<Gauge size={13} />} title="음성 빠르기" summary={voiceRate === '+0%' ? '보통' : '빠르게'}>
+      <RailSection order={7} icon={<Gauge size={13} />} title="음성 빠르기" summary={voiceRate === '+0%' ? '보통' : '빠르게'}>
         <div className="flex p-1 bg-gray-50 border border-gray-200 rounded-xl">
           {[
             { label: '보통', value: '+0%' },
@@ -570,7 +799,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
       </RailSection>
 
       <RailSection
-        order={7}
+        order={8}
         icon={<ImageIcon size={13} />}
         title="이미지 생성 모델"
         summary={AI_MODEL_OPTIONS.find((m) => m.value === selectedAiModel)?.label.split(' ')[0] ?? ''}
@@ -594,7 +823,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         </Hint>
       </RailSection>
 
-      <RailSection order={8} icon={<Clapperboard size={13} />} title="영상 생성 모델" summary={VIDEO_MODEL_OPTIONS.find((m) => m.value === videoModel)?.label.split(' (')[0] ?? '미선택'} action={<PriceLink onClick={() => setPricingTab('video')} />}>
+      <RailSection order={9} icon={<Clapperboard size={13} />} title="영상 생성 모델" summary={VIDEO_MODEL_OPTIONS.find((m) => m.value === videoModel)?.label.split(' (')[0] ?? '미선택'} action={<PriceLink onClick={() => setPricingTab('video')} />}>
         <select
           value={videoModel}
           onChange={(e) => setVideoModel(e.target.value)}
@@ -630,7 +859,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         })()}
       </RailSection>
 
-      <RailSection order={9} icon={<Captions size={13} />} title="자막 설정" summary={subtitlePreset}>
+      <RailSection order={10} icon={<Captions size={13} />} title="자막 설정" summary={subtitlePreset}>
         <div className="space-y-1">
           <div className="flex items-center justify-between">
             <p className="text-[11px] font-extrabold text-gray-700">상단 자막 <span className="font-medium text-gray-400">(씬 요약 밴드)</span></p>
@@ -643,10 +872,19 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
             </button>
           </div>
           <CaptionPresetSelect
-            value={CAPTION_PRESETS.find((p) => captionStyle.color === p.style.color && captionStyle.bg_color === p.style.bg_color)?.id ?? ''}
+            value={captionPresetId}
             onChange={(id) => {
               const p = CAPTION_PRESETS.find((x) => x.id === id);
-              if (p) setCaptionStyle((prev) => ({ ...prev, ...p.style }));
+              if (!p) return;
+              setCaptionPresetId(id);
+              // factor를 곱해야 '자막 크기' 설정과 어긋나지 않는다
+              // (PropertiesPanel 쪽은 factor를 빼고 그대로 덮어써서 값이 갈렸다)
+              const factor = SUBTITLE_SIZES.find((s) => s.id === subtitleSize)?.factor ?? 1;
+              setCaptionStyle((prev) => ({
+                ...prev,
+                ...p.style,
+                font_size: Math.round((p.style.font_size ?? 13) * factor),
+              }));
             }}
           />
           <Hint>문구는 Step2 장면 카드의 TOP 입력란에서 입력</Hint>
@@ -681,7 +919,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         </div>
       </RailSection>
 
-      <RailSection order={10} icon={<Type size={13} />} title="자막 크기" summary={sizeName}>
+      <RailSection order={11} icon={<Type size={13} />} title="자막 크기" summary={sizeName}>
         <div className="flex p-1 bg-gray-50 border border-gray-200 rounded-xl">
           {SUBTITLE_SIZES.map((s) => (
             <button
@@ -698,7 +936,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         <Hint>화면 높이 대비 글자 크기입니다. 템플릿 기본 크기에 배율 적용</Hint>
       </RailSection>
 
-      <RailSection order={11} icon={<Monitor size={13} />} title="화면 미리보기" summary={aspectRatio.split(' ')[0]}>
+      <RailSection order={12} icon={<Monitor size={13} />} title="화면 미리보기" summary={aspectRatio.split(' ')[0]}>
         {(() => {
           const base = (subtitlePresets as Record<string, SubtitlePresetDef>)[subtitlePreset];
           const factor = SUBTITLE_SIZES.find((s) => s.id === subtitleSize)?.factor ?? 1;
@@ -755,7 +993,7 @@ const VideoPresetPanel: React.FC<VideoPresetPanelProps> = ({
         })()}
       </RailSection>
 
-      <RailSection order={12} icon={<Hammer size={13} />} title="추가 설정" summary="준비중" defaultOpen={false}>
+      <RailSection order={13} icon={<Hammer size={13} />} title="추가 설정" summary="준비중" defaultOpen={false}>
         {['내 레퍼런스 (0/9)', '영상 생성 모델', '유튜브 채널 연결'].map((t) => (
           <div
             key={t}
