@@ -76,17 +76,34 @@ class GenModel:
     def _cli(self):
         return self._client or _get_client()
 
-    def generate_content(self, contents):
-        return self._cli().models.generate_content(
-            model=self.model_name,
-            contents=_normalize_contents(contents),
-        )
+    def generate_content(self, contents, config=None):
+        """config 는 새 google-genai SDK 의 GenerateContentConfig 다.
 
-    async def generate_content_async(self, contents):
-        return await self._cli().aio.models.generate_content(
-            model=self.model_name,
-            contents=_normalize_contents(contents),
-        )
+        구 SDK 에서는 config={'temperature': ...} 같은 dict 를 받던 않아서
+        llm_providers.GeminiAdapter 가 넘겨주던 인자를 버리고 있었다.
+        """
+        kwargs = {"model": self.model_name,
+                  "contents": _normalize_contents(contents)}
+        if config:
+            from google.genai import types as _types
+            if isinstance(config, dict):
+                config = _types.GenerateContentConfig(**{
+                    k: v for k, v in config.items() if v is not None
+                })
+            kwargs["config"] = config
+        return self._cli().models.generate_content(**kwargs)
+
+    async def generate_content_async(self, contents, config=None):
+        kwargs = {"model": self.model_name,
+                  "contents": _normalize_contents(contents)}
+        if config:
+            from google.genai import types as _types
+            if isinstance(config, dict):
+                config = _types.GenerateContentConfig(**{
+                    k: v for k, v in config.items() if v is not None
+                })
+            kwargs["config"] = config
+        return await self._cli().aio.models.generate_content(**kwargs)
 
 
 def get_model(model_name, client=None):

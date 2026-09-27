@@ -639,26 +639,139 @@ tts:
 
 # ─────────────────────────────────────────────────────────────
 # 대본 (LLM)
+#
+# 이 섹션이 대본 모델의 단일 출처다. core/llm_providers.py 가 여기서
+# 폴백 체인을 만든다. (예전엔 settings.yaml 의 gemini_text_models 가
+# 진짜 경로였고 여기는 장식이었다 — 그 중복을 없앴다.)
+#
+# 순서 = 사용자가 pricing 분석으로 낸 결론
+#   1 DeepSeek V4 Flash  : 13,000 요청/월, $30 상당, 가성비 1위 → 주력
+#   2 Qwen3.8 Flash      :  5,400 요청/월, $30 상당, 가성비 2위 → 백업
+#   3+ Gemini 계열       : DeepSeek/Qwen 키가 없을 때 자동 사용
+#
+# adapter
+#   openai_compat : POST {base_url}/chat/completions (OpenAI 호환 프로토콜)
+#                   DeepSeek 와 DashScope(Qwen) 이 둘 다 이 프로토콜이다.
+#   gemini        : google-genai SDK (스트리밍·멀티모달)
+#
+# 실측 2026-09-27 (generation 1회, 출력 3토큰)
+#   gemini-3.5-flash-lite  200   1078ms
+#   gemini-3.1-flash-lite  200   1839ms
+#   gemini-3.6-flash       200   1739ms
+#   gemini-3.7-flash       200   2762ms
+#   gemini-3.8-flash       200   6255ms
+#   gemini-3.5-flash       200  19658ms   <- 3토큰에 20초. 마지막.
+#   gemini-2.5-flash-lite  404  "no longer supported" -> 제외
 # ─────────────────────────────────────────────────────────────
 llm:
-  gemini_flash_lite:
-    label: "Gemini 3.x Flash-Lite"
-    adapter: gemini
-    cost_input_per_1m: 0.15
-    cost_output_per_1m: 1.25
-    key_env: gemini_api_key
-    quality: 72
-    enabled: true
-
+  # ── 주력 · 백업 (OpenAI 호환) ────────────────────────────
   deepseek_v4_flash:
     label: "DeepSeek V4 Flash"
-    adapter: openai_compatible
+    adapter: openai_compat
+    model_id: "deepseek-v4-flash"
+    base_url: "https://api.deepseek.com"
     cost_input_per_1m: 0.14
     cost_output_per_1m: 0.28
     key_env: deepseek_api_key
-    base_url: "https://api.deepseek.com/v1"
+    modes: [text]
+    quality: 78
+    enabled: true
+    tier_hint: "가성비 1위 (13,000 요청/월, $30 상당)"
+    notes: >-
+      주력 모델. 요청당 비용이 가장 낮아 같은 돈으로 처리량이 가장 많다.
+      키를 등록하면 자동으로 1순위가 된다.
+
+  qwen3_8_flash:
+    label: "Qwen3.8 Flash (DashScope)"
+    adapter: openai_compat
+    model_id: "qwen3.8-flash"
+    base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode"
+    cost_input_per_1m: 0.15
+    cost_output_per_1m: 0.30
+    key_env: qwen_api_key
+    modes: [text]
+    quality: 76
+    enabled: true
+    tier_hint: "백업 (5,400 요청/월, $30 상당)"
+    notes: >-
+      DeepSeek 가 429 로 막힐 때 대체. base_url 에 /compatible-mode 이 붙는
+      점만 다르고 프로토콜은 같다.
+
+  # ── Gemini 폴백 ─────────────────────────────────────────
+  gemini_3_5_flash_lite:
+    label: "Gemini 3.5 Flash-Lite"
+    adapter: gemini
+    model_id: "gemini-3.5-flash-lite"
+    cost_input_per_1m: 0.30
+    cost_output_per_1m: 2.50
+    key_env: gemini_api_key
+    modes: [text]
     quality: 74
-    enabled: false           # 키 미등록. 429 대비 대체 경로로 권장.
+    enabled: true
+    tier_hint: "키가 이미 등록됨 · 응답 1.0초로 가장 빠름"
+    notes: "실측 200, 1078ms. DeepSeek/Qwen 키가 없으면 이게 1순위가 된다."
+
+  gemini_3_1_flash_lite:
+    label: "Gemini 3.1 Flash-Lite"
+    adapter: gemini
+    model_id: "gemini-3.1-flash-lite"
+    cost_input_per_1m: 0.15
+    cost_output_per_1m: 1.25
+    key_env: gemini_api_key
+    modes: [text]
+    quality: 72
+    enabled: true
+    notes: "실측 200, 1839ms."
+
+  gemini_3_6_flash:
+    label: "Gemini 3.6 Flash (품질)"
+    adapter: gemini
+    model_id: "gemini-3.6-flash"
+    cost_input_per_1m: 1.50
+    cost_output_per_1m: 7.50
+    key_env: gemini_api_key
+    modes: [text]
+    quality: 86
+    enabled: true
+    notes: "실측 200, 1739ms. 품질이 필요할 때만 쓴다."
+
+  gemini_3_7_flash:
+    label: "Gemini 3.7 Flash"
+    adapter: gemini
+    model_id: "gemini-3.7-flash"
+    cost_input_per_1m: 0.75
+    cost_output_per_1m: 3.75
+    key_env: gemini_api_key
+    modes: [text]
+    quality: 78
+    enabled: true
+    notes: "실측 200, 2762ms."
+
+  gemini_3_8_flash:
+    label: "Gemini 3.8 Flash"
+    adapter: gemini
+    model_id: "gemini-3.8-flash"
+    cost_input_per_1m: 0.75
+    cost_output_per_1m: 3.75
+    key_env: gemini_api_key
+    modes: [text]
+    quality: 80
+    enabled: true
+    notes: "실측 200, 6255ms. flash-lite 보다 느리다."
+
+  gemini_3_5_flash:
+    label: "Gemini 3.5 Flash"
+    adapter: gemini
+    model_id: "gemini-3.5-flash"
+    cost_input_per_1m: 1.50
+    cost_output_per_1m: 9.00
+    key_env: gemini_api_key
+    modes: [text]
+    quality: 84
+    enabled: true
+    notes: >-
+      실측 200이지만 19658ms — 3토큰에 20초. 대본 생성에서 발자국으로 남으므로
+      마지막 순서. 앞의 7종이 모두 실패할 때만 쓰인다.
 
 # ─────────────────────────────────────────────────────────────
 # BYOK: 사용자가 직접 키를 등록하는 곳.

@@ -27,16 +27,6 @@ interface SettingsManagerProps {
   setPlanI2v: (n: number) => void;
 }
 
-const TEXT_MODEL_COSTS: Array<{ id: string; label: string; cost: string }> = [
-  { id: 'gemini-3.5-flash-lite', label: '3.5 Flash-Lite', cost: '입력 $0.30 / 출력 $2.50' },
-  { id: 'gemini-3.7-flash', label: '3.7 Flash', cost: '입력 $0.75 / 출력 $3.75' },
-  { id: 'gemini-3.8-flash', label: '3.8 Flash', cost: '입력 $0.75 / 출력 $3.75' },
-  { id: 'gemini-3.6-flash', label: '3.6 Flash (품질 추천)', cost: '입력 $1.50 / 출력 $7.50' },
-  { id: 'gemini-3.5-flash', label: '3.5 Flash', cost: '입력 $1.50 / 출력 $9.00' },
-];
-
-const DEFAULT_TEXT_MODEL_ORDER = TEXT_MODEL_COSTS.map((m) => m.id);
-
 const SettingsManager: React.FC<SettingsManagerProps> = ({
   config,
   setConfig,
@@ -65,57 +55,10 @@ const SettingsManager: React.FC<SettingsManagerProps> = ({
 
     gemini_api_key: (
       <div className="space-y-2">
-        <label className="text-[11px] font-bold text-gray-600">Gemini 텍스트 모델 순서</label>
         <p className="text-[10px] text-gray-400">
-          앞부터 시도, 실패 시 다음으로 폴백. 대본 생성은 출력 위주라 출력 요금이 핵심.
+          대본 모델 목록·가격·켜기/끄기는 위 <b>대본 카드</b>에서 합니다.
+          (providers.yaml 이 단일 출처입니다)
         </p>
-        {(() => {
-          const enabled = ((config?.gemini_text_models as string[]) ?? DEFAULT_TEXT_MODEL_ORDER)
-            .filter((id) => TEXT_MODEL_COSTS.some((m) => m.id === id));
-          const disabled = TEXT_MODEL_COSTS.filter((m) => !enabled.includes(m.id));
-          const move = (idx: number, dir: -1 | 1) => {
-            const next = [...enabled];
-            const j = idx + dir;
-            if (j < 0 || j >= next.length) return;
-            [next[idx], next[j]] = [next[j], next[idx]];
-            setConfig((prev) => (prev ? { ...prev, gemini_text_models: next } : null));
-          };
-          return (
-            <div className="space-y-1">
-              {enabled.map((id, idx) => {
-                const m = TEXT_MODEL_COSTS.find((x) => x.id === id)!;
-                return (
-                  <div key={id} className="flex items-center gap-2 px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg">
-                    <span className="text-[10px] font-black text-indigo-400 w-3">{idx + 1}</span>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[11px] font-bold text-gray-800 truncate">{m.label}</p>
-                      <p className="text-[9.5px] text-gray-400 tabular-nums">{m.cost}</p>
-                    </div>
-                    <button onClick={() => move(idx, -1)} disabled={idx === 0} className="p-0.5 text-gray-400 hover:text-indigo-600 disabled:opacity-30" aria-label="위로">▲</button>
-                    <button onClick={() => move(idx, 1)} disabled={idx === enabled.length - 1} className="p-0.5 text-gray-400 hover:text-indigo-600 disabled:opacity-30" aria-label="아래로">▼</button>
-                    <button
-                      onClick={() => setConfig((prev) => (prev ? { ...prev, gemini_text_models: enabled.filter((x) => x !== id) } : null))}
-                      className="p-0.5 text-gray-400 hover:text-red-500" aria-label="제외">✕</button>
-                  </div>
-                );
-              })}
-              {disabled.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => setConfig((prev) => (prev ? { ...prev, gemini_text_models: [...enabled, m.id] } : null))}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 bg-white border border-dashed border-gray-200 rounded-lg text-gray-400 hover:border-indigo-300 hover:text-indigo-600"
-                >
-                  <span className="text-[10px]">+</span>
-                  <span className="text-[11px] font-bold">{m.label}</span>
-                  <span className="text-[9.5px] tabular-nums ml-auto">{m.cost}</span>
-                </button>
-              ))}
-              {enabled.length === 0 && (
-                <p className="text-[10.5px] text-red-500 font-bold">모델을 1개 이상 켜야 대본 생성이 됩니다.</p>
-              )}
-            </div>
-          );
-        })()}
         <div className="pt-1">
           <label className="text-[11px] font-bold text-gray-600">Gemini 이미지 모델 (Nano Banana)</label>
           <select

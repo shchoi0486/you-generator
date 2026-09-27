@@ -47,31 +47,62 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 ANALYSIS_MODEL_FALLBACK = "gemini-3.6-flash"
 
 
+def _llm_chain():
+    """providers.yaml 의 llm 폴백 체인 (레지스트리가 단일 출처).
+
+    예전엔 settings.yaml 의 gemini_text_models 에서 이름 하나를 고르고
+    Gemini SDK 로 직접 불렀다. 그래서 DeepSeek/Qwen 을 쓸 수 없었다.
+    이제 순서·어댑터·키 해석을 레지스트리에 맡긴다.
+    """
+    from .provider_registry import registry
+    return registry.order_for("llm", "free")
+
+
+def _llm_run(prompt, *, images=None, json_mode=False, system="",
+             max_output_tokens=None, temperature=None):
+    """폴백 체인을 타고 생성한다. json_mode 이면 파싱까지 해 준다."""
+    from . import llm_providers
+    return llm_providers.generate_chain(
+        _llm_chain(), prompt, system=system, images=images,
+        json_mode=json_mode, max_output_tokens=max_output_tokens,
+        temperature=temperature, parse_json=json_mode,
+    )
+
+
+def _llm_run_text(prompt, *, images=None, system="", max_output_tokens=None):
+    """텍스트만 필요한 경우(파싱 없음)."""
+    from . import llm_providers
+    return llm_providers.generate_chain(
+        _llm_chain(), prompt, system=system, images=images,
+        max_output_tokens=max_output_tokens,
+    )
+
+
 def _analysis_model():
-    """settings gemini_text_models 맨 앞 모델 우선, 없으면 폴백."""
+    """하위 호환: 첫 번째 사용 가능한 LLM 의 model_id."""
     try:
-        models = (load_config().get("gemini_text_models") or [])
-        models = [m for m in models if isinstance(m, str) and m.strip()]
-        if models:
-            return models[0]
+        from .provider_registry import registry
+        for p in _llm_chain():
+            if p.get("enabled") and registry.usable(p):
+                return p.get("model_id") or p["id"]
     except Exception:
         pass
     return ANALYSIS_MODEL_FALLBACK
 
 
 def _workhorse_model():
-    """대본 생성용: 설정 목록 중 lite가 아닌 첫 모델 (지시 이행력 우선)."""
+    """하위 호환: 'lite' 가 아닌 첫 번째 사용 가능한 LLM 의 model_id."""
     try:
-        models = (load_config().get("gemini_text_models") or [])
-        models = [m for m in models if isinstance(m, str) and m.strip()]
-        capable = [m for m in models if "lite" not in m.lower()]
-        if capable:
-            return capable[0]
-        if models:
-            return models[0]
+        from .provider_registry import registry
+        for p in _llm_chain():
+            if not (p.get("enabled") and registry.usable(p)):
+                continue
+            mid = p.get("model_id") or p["id"]
+            if "lite" not in str(mid).lower():
+                return mid
     except Exception:
         pass
-    return ANALYSIS_MODEL_FALLBACK
+    return _analysis_model()
 
 
 def _get_api_key():
@@ -281,7 +312,7 @@ def _set_narration(item, text):
 
 
 
-def _call_storyboard_json(model, prompt, what="대본", max_attempts=3):
+def _call_storyboard_json(prompt, what="대본", max_attempts=3):
     """LLM 호출 + JSON 파싱 + 스키마 검증.
 
     재시도마다 출력 크기를 줄여 실제로 성공률을 올린다.
@@ -300,7 +331,7 @@ def _call_storyboard_json(model, prompt, what="대본", max_attempts=3):
                 p = (prompt + "\n반드시 유효한 JSON만 출력하라. 설명·마크다운 금지."
                      "\n문법 오류가 났다. 마지막 콤마(,)를 절대 쓰지 말고 모든 문자열에 큰따옴표를 붙여라."
                      "\n이번엔 장면을 최대한 적게(3개 이내) 써서 JSON을 짧게 만들어라.")
-            result_json = _parse_json_response(model.generate_content(p).text)
+            result_json = _llm_run(p, json_mode=True)
             items = result_json.get("storyboard", []) or []
             usable = [it for it in items if isinstance(it, dict) and any(k in it for k in _KNOWN_ITEM_KEYS)]
             if usable:
@@ -389,10 +420,7 @@ def analyze_upload(file_bytes, mime_type, hint=""):
     if not file_bytes or len(file_bytes) > MAX_UPLOAD_BYTES:
         raise ValueError("File is empty or exceeds 100MB.")
 
-    api_key, _ = _get_api_key()
-    _llm_configure(api_key=api_key)
-    model = _llm_model(_analysis_model())
-
+    _get_api_key()   # 키가 하나라도 있어야 폴백 체인이 동작한다
     is_video = mime_type.startswith("video/")
     kind = "숏폼 영상" if is_video else "이미지"
     prompt = f"""
@@ -402,11 +430,7 @@ def analyze_upload(file_bytes, mime_type, hint=""):
     마지막으로 이 레퍼런스를 그대로 재현할 수 있는 대본(storyboard, 대사 1~2문장씩)도 함께 작성하라.
     {ANALYSIS_JSON_SPEC}
     """
-    response = model.generate_content([
-        {"mime_type": mime_type, "data": file_bytes},
-        prompt,
-    ])
-    result = _parse_json_response(response.text)
+    result = _llm_run(prompt, images=[file_bytes], json_mode=True)
     result["source_type"] = "upload"
     result["stats"] = None
     result["stats_note"] = "업로드 파일은 조회수/좋아요가 없음"
@@ -521,8 +545,7 @@ def analyze_youtube(url):
     transcript = fetch_transcript(video_id)
     stats = fetch_youtube_stats(video_id, config.get("youtube_api_key"))
 
-    _llm_configure(api_key=api_key)
-    model = _llm_model(_analysis_model())
+    _get_api_key()
     prompt = f"""
     아래는 유튜브 숏폼 레퍼런스의 수집 데이터이다. 영상 파일은 없으므로 자막+메타데이터로 분석하라.
     수치가 없으면(stats 없음) 반응 이유를 지어내지 말고 '수치 미확인'이라 명시하라.
@@ -533,7 +556,7 @@ def analyze_youtube(url):
     해시태그를 추출하고, 같은 패턴의 재현 대본(storyboard)도 작성하라.
     {ANALYSIS_JSON_SPEC}
     """
-    result = _parse_json_response(model.generate_content(prompt).text)
+    result = _llm_run(prompt, json_mode=True)
     result["source_type"] = "youtube"
     result["video_id"] = video_id
     result["stats"] = stats
@@ -804,11 +827,9 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     else:
         numeric_rule = "통계·연구 수치는 확정 팩트에 있는 것만 인용하라"
 
-    api_key, _ = _get_api_key()
-    _llm_configure(api_key=api_key)
-    # 대본 생성은 지시 이행력이 중요 → workhorse 모델 사용 (분석용 lite와 분리)
-    model = _llm_model(_workhorse_model())
-    # 근거 없을 때는 표준 패턴으로 (분석 스킵 '바로 만들기' 경로)
+    _get_api_key()
+    # 폴백 체인은 _llm_run 이 내부에서 만든다 (설정 하드코딩 없음)
+    # 근거 수집 표본 구성 (수집 실패는 '출처 없음' 으로 처리 — 추측 금지)
     pattern_text = _compact_reference(reference_summary)
     if not pattern_text:
         pattern_text = "(기본 패턴 사용: 훅→전개→연결→CTA)"
@@ -833,17 +854,16 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     fact_lines = extract_fact_sentences(evidence, limit=12)
     facts_text = ""
     if fact_lines:
-        lite = _llm_model(_analysis_model())
         fact_prompt = (
-            f"주제 '{topic}'의 레시피/제작 정보를 아래 문장에서 뽑아 JSON만 출력하라.\n"
-            '{"ingredients": [{"name": "재료명", "amount": "분량"}], '
-            '"steps": [{"order": 1, "action": "동작", "numbers": "온도·시간·분량"}], '
-            '"tips": ["꿀팁"]}\n'
-            "모르는 분량은 amount를 빈 문자열로 (지어내기 금지).\n"
+            f"주제 '{topic}'에 사실/수치 근거가 있는 항목만 추려 JSON으로 정리해라.\n"
+            '{"ingredients": [{"name": "재료", "amount": "수량"}], '
+            '"steps": [{"order": 1, "action": "행동", "numbers": "수치 근거"}], '
+            '"tips": ["팁"]}\n'
+            "모든 값은 amount와 숫자 근거를 본문에서만 가져와 (근거 없으면 비워라).\n"
             + "\n".join(f"- {f}" for f in fact_lines)
         )
         try:
-            facts_text = lite.generate_content(fact_prompt).text
+            facts_text = _llm_run_text(fact_prompt)
             print(f"[Shorts Facts] confirmed {len(fact_lines)} fact sentences.")
         except Exception as fe:
             print(f"[Shorts Facts] failed: {fe}")
@@ -1021,7 +1041,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
     [새 주제]
     {topic}
     """
-    result_json = _call_storyboard_json(model, prompt, what="stage1")
+    result_json = _call_storyboard_json(prompt, what="stage1")
     items = result_json.get("storyboard", [])
     # 모델이 최대 장면 수를 무시하고 더 많이 만들 수 있다. 넘치면 뒤에서 자른다.
     # (앞을 자르면 오프닝/핵심이 사라지고, HOOK은 반드시 첫 장면에 있어야 한다.)
@@ -1058,7 +1078,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
         {last}
         """
         try:
-            ext_json = _call_storyboard_json(model, ext_prompt, what="extend")
+            ext_json = _call_storyboard_json(ext_prompt, what="extend")
             ext_items = ext_json.get("storyboard", [])
             if ext_items:
                 items = items + ext_items
@@ -1131,7 +1151,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
         {numbered}
         """
         try:
-            rep_json = _call_storyboard_json(model, repair_prompt, what="repair")
+            rep_json = _call_storyboard_json(repair_prompt, what="repair")
             rep_items = rep_json.get("storyboard", [])
             if rep_items and len(rep_items) == len(items):
                 _rs, _rg, _rt = _convert_storyboard_items(rep_items, 0, 0, allow_empty_text=True)
@@ -1169,7 +1189,7 @@ def create_from_pattern(reference_summary, new_topic, duration=40, category="rec
                     f"나머지 {len(items) - 1}개 장면은 절대 건드리지 말고 그대로 둔다.\n"
                     f"같은 JSON 스키마로 전체를 다시 출력하라."
                 )
-                _hj = _call_storyboard_json(model, _hp, what="hookfix")
+                _hj = _call_storyboard_json(_hp, what="hookfix")
                 _hi = _hj.get("storyboard", [])
                 if _hi and len(_hi) == len(items):
                     _new0 = _narration_of(_hi[0]).strip()
@@ -1468,19 +1488,15 @@ def _extract_clip_frames(abs_path, is_video, max_frames=3):
     return out
 
 
-def _describe_clip_images(model, frames, label):
+def _describe_clip_images(frames, label):
     """프레임들을 Vision으로 2줄 요약. 실패하면 빈 문자열."""
     if not frames:
         return ""
     try:
-        parts = [
-            "이 클립 화면에 실제로 보이는 것을 2줄로 요약하라. "
-            "색·동작·도구·음식 위주로, 추측이나 꾸밈말 금지. 한글로 답하라."
-        ]
-        for mime, data in frames:
-            parts.append({"mime_type": mime, "data": data})
-        resp = model.generate_content(parts)
-        text = (resp.text or "").strip()
+        text = (_llm_run_text(
+            "이 클립 장면을 사람 눈으로 묘사해라. 무엇이 나오는지와 카메라·연출. "
+            "해석을 빼고 사실만. 한 문장으로.",
+            images=list(frames)) or "").strip()
         print(f"[Refine] Clip described ({label}): {text[:80]}")
         return text
     except Exception as e:
@@ -1500,9 +1516,7 @@ def refine_scene(scene, clips, topic="", category="recipe_short"):
     if not clips:
         raise ValueError("다듬기에 쓸 클립이 없습니다. 클립을 1개 이상 선택하세요.")
 
-    api_key, _ = _get_api_key()
-    _llm_configure(api_key=api_key)
-    vision = _llm_model(_analysis_model())
+    _get_api_key()   # 폴백 체인이 열쇠를 찾도록 미리 확인
 
     clip_notes = []
     for i, c in enumerate(clips):
@@ -1517,11 +1531,10 @@ def refine_scene(scene, clips, topic="", category="recipe_short"):
         if abs_path:
             # 업로드·스톡 영상은 프레임 Vision 분석, 이미지는 원본 1장으로 요약
             frames = _extract_clip_frames(abs_path, is_video)
-            summary = _describe_clip_images(vision, frames, f"clip{i + 1}")
+            summary = _describe_clip_images(frames, f"clip{i + 1}")
         desc = summary or note or "(분석 생략: 원격 파일)"
         clip_notes.append(f"클립{i + 1} [{source or '?'}]: {desc}")
 
-    workhorse = _llm_model(_workhorse_model())
     scene_sec = scene.get("section", "")
     scene_text = scene.get("text", "")
     scene_sub = scene.get("subtitle", "")
@@ -1552,7 +1565,7 @@ def refine_scene(scene, clips, topic="", category="recipe_short"):
     for attempt in range(2):
         try:
             p = base_prompt if attempt == 0 else base_prompt + "\n반드시 유효한 JSON만 출력하라. 설명·마크다운 금지."
-            cand = _parse_json_response(workhorse.generate_content(p).text)
+            cand = _llm_run(p, json_mode=True)
             if isinstance(cand, dict) and ("narration_ko" in cand or "subtitles" in cand):
                 result = cand
                 break

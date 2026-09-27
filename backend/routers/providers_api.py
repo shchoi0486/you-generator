@@ -744,58 +744,75 @@ def _project(rows: List[Dict[str, Any]], kind: str,
 
 
 def _llm_rows() -> List[Dict[str, Any]]:
-    """대본 모델 체인.
+    """대본 모델 = providers.yaml 의 llm 섹션 (단일 출처).
 
-    주의: 대본 생성은 레지스트리를 거치지 않는다. 실제 경로는
-    settings.yaml 의 gemini_text_models 목록을 앞에서부터 시도하는 것이고
-    (core/llm.py), providers.yaml 의 llm 섹션은 아직 배선이 안 돼 있다.
-    그래서 여기서 '레지스트리가 아니라 실제 설정을' 보여준다.
+    예전엔 settings.yaml 의 gemini_text_models 를 읽었다. 그게 실제 경로였고
+    providers.yaml 의 llm 섹션은 어댑터가 없는 장식이었다 — 서로 다른 두 목록이
+    어긋난 채로 있었다. 이제 providers.yaml 한 곳만 본다.
     """
     try:
-        from .core.config_utils import load_config
+        from ..core.llm_providers import ADAPTERS as LLM_ADAPTERS
     except ImportError:
-        from core.config_utils import load_config
-    try:
-        cfg = load_config() or {}
-    except Exception:
-        cfg = {}
+        from core.llm_providers import ADAPTERS as LLM_ADAPTERS
 
-    chain = cfg.get("gemini_text_models") or []
-    if isinstance(chain, str):
-        chain = [chain]
-    if not chain:
-        return []
+    pin_set = {k.split("/", 1)[1] for k, v in provider_overrides.get_pinned().items()
+               if v and k.startswith("llm/")}
 
-    has_key = bool(registry.resolve_key({"key_env": "gemini_api_key"}))
-    rows = []
-    for i, mid in enumerate(chain):
-        rows.append({
-            "id": mid,
-            "label": mid.replace("gemini-", "Gemini "),
-            "adapter": "config:gemini_text_models",
-            # 'config' = 어댑터가 아니라 설정으로 관리되는 경로
-            "adapter_state": "config",
-            "enabled": True,
-            "enabled_by_user": False,
-            "needs_key": True,
+    src = registry.section("llm")
+    order_of = {k: (v.get("order") or 999) for k, v in src.items()}
+    by_id = {k: v for k, v in src.items()
+             if not v.get("hidden") and v.get("enabled")}
+
+    pinned = sorted((by_id[i] for i in pin_set if i in by_id),
+                    key=lambda p: (order_of.get(p["id"], 999), p["id"]))
+    rest = sorted((p for k, p in by_id.items() if k not in pin_set),
+                  key=lambda p: (order_of.get(p["id"], 999), p["id"]))
+    disabled = sorted((p for p in src.values()
+                       if not p.get("hidden") and not p.get("enabled")),
+                      key=lambda p: (order_of.get(p["id"], 999), p["id"]))
+    final = pinned + rest + disabled
+
+    krw = registry.usd_krw()
+    out: List[Dict[str, Any]] = []
+    for i, p in enumerate(final):
+        pid = p["id"]
+        ad = p.get("adapter")
+        state = "yes" if ad in LLM_ADAPTERS else ("missing" if not ad else "stub")
+        has_key = bool(p.get("key_env")) and registry.usable(p)
+        cin = p.get("cost_input_per_1m")
+        cout = p.get("cost_output_per_1m")
+        out.append({
+            "id": pid,
+            "label": p.get("label"),
+            "adapter": ad,
+            "adapter_state": state,
+            "enabled": bool(p.get("enabled")),
+            "enabled_by_user": bool(p.get("enabled_by_user")),
+            "needs_key": bool(p.get("key_env")),
             "has_key": has_key,
-            "key_env": "gemini_api_key",
+            "key_env": p.get("key_env"),
             "modes": ["text"],
-            "cost_usd": None,       # 토큰 과금이라 장당 환산이 불가능
-            "unit": "토큰",
+            # 장당 비용이 아니라 토큰 과금이라 '별도' 로 표기한다
+            "cost_usd": None,
             "cost_krw": None,
-            "tier_ranked": True,
-            "pinned": False,
-            "ready": has_key,
-            "order": i + 1,
-            "notes": ("Google AI Studio 토큰 과금. 장당 비용이 아니라 사용량에 비례합니다. "
-                      "무료 티어 할량 안에서는 $0 이지만 할량을 넘으면 과금됩니다."),
+            "unit": "토큰",
+            "cost_input_per_1m": cin,
+            "cost_output_per_1m": cout,
+            "cost_input_krw": round((cin or 0) * krw),
+            "cost_output_krw": round((cout or 0) * krw),
+            "quality": p.get("quality"),
+            "model_id": p.get("model_id"),
+            "base_url": p.get("base_url"),
+            "tier_ranked": pid in pin_set,
+            "pinned": pid in pin_set,
+            "order": order_of.get(pid, i + 1),
+            "tier_hint": p.get("tier_hint") or "",
+            "notes": (p.get("notes") or "").strip(),
+            "ready": bool(p.get("enabled")) and has_key and state == "yes",
         })
-    return rows
+    return out
 
 
-# 표시 순서: 대본 → 이미지 → 영상 → 음성
-# 대본이 맨 위인 이유: 모든 작업의 첫 단계이고, 여기서 막히면 뒤는 돈도 쓸 필요가 없다.
 PLAN_KIND_ORDER = ("llm", "image", "video", "tts")
 PLAN_KIND_LABEL = {"llm": "대본", "image": "이미지", "video": "영상", "tts": "음성"}
 
