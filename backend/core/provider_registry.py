@@ -174,6 +174,21 @@ class ProviderRegistry:
                         key=lambda x: (x.get("cost_usd", x.get("cost_per_sec", 0)) or 0)):
             if p["id"] not in listed:
                 out.append(p)
+
+        # ── 사용자 지정 순서 (최우선) ──────────────────────
+        # 고정(pin) 도 순서로도 쓸 수 있게 했지만, 순서가 더 강력하다.
+        # 지정된 부분만 앞쪽으로 당기고, 나머지는 위에서 정한 순서를 유지한다.
+        user_order = _overrides.get_order(kind)
+        if user_order:
+            rank = {mid: i for i, mid in enumerate(user_order)}
+            # 고정 항목은 사용자가 '맨 앞' 이라고 명시한 것이라 항상 최우선.
+            front = [p for p in out if p["id"] in pin_ids]
+            rest = [p for p in out if p["id"] not in pin_ids]
+            # 지정 안 된 항목은 원래 순서(behind) 유지, 지정된 것만 rank 순.
+            known = [p for p in rest if p["id"] in rank]
+            unknown = [p for p in rest if p["id"] not in rank]
+            known.sort(key=lambda p: rank[p["id"]])
+            out = front + known + unknown
         return out
 
     def tier(self, name: str) -> Dict[str, Any]:

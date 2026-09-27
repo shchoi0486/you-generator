@@ -2,6 +2,7 @@
 import {
   Loader2, AlertTriangle, Info, Zap, Check, Wallet, Film, ImageIcon,
   Volume2, Type, Pin, KeyRound, ExternalLink, Trash2, Eye, EyeOff, Play,
+  ChevronUp, ChevronDown,
 } from 'lucide-react';
 import { api, type ProviderPlan, type ProviderPlanRow } from '../services/api';
 
@@ -73,8 +74,30 @@ const ModelPlanCard: React.FC<Props> = ({
   const [msg, setMsg] = React.useState<Record<string, { ok: boolean; text: string }>>({});
   const [draft, setDraft] = React.useState<Record<string, string>>({});
   const [reveal, setReveal] = React.useState<Record<string, boolean>>({});
+  const [moving, setMoving] = React.useState(false);
 
   const order = plan?.kind_order?.length ? plan.kind_order : ['llm', 'image', 'video', 'tts'];
+
+  /** 우선순위 한 칸 이동. 실패하면 plan 을 다시 그려야 화면이 실제와 맞는다. */
+  const moveModel = async (kind: string, r: ProviderPlanRow, delta: -1 | 1) => {
+    setMoving(true);
+    setBusy((b) => ({ ...b, [r.id]: true }));
+    try {
+      const res = await api.moveProviderOrder(kind, r.id, delta);
+      if (!res.moved && res.error) {
+        setWarn((w) => ({ ...w, [r.id]: [res.error as string] }));
+      } else {
+        setWarn((w) => { const x = { ...w }; delete x[r.id]; return x; });
+      }
+      await onRefresh();
+    } catch (e) {
+      setWarn((w) => ({ ...w, [r.id]: [(e as Error).message] }));
+    } finally {
+      setMoving(false);
+      setBusy((b) => ({ ...b, [r.id]: false }));
+    }
+  };
+
 
   const toggleModel = async (kind: string, r: ProviderPlanRow) => {
     setBusy((b) => ({ ...b, [r.id]: true }));
@@ -122,11 +145,16 @@ const ModelPlanCard: React.FC<Props> = ({
 
   const checkKey = async (kind: string, g: KeyGroup) => {
     if (!g.key_env) return;
-    const value = (draft[g.key_env] ?? '').trim();
     const mk = msgKey(kind, g);
-    if (!value) { setMsg((m) => ({ ...m, [mk]: { ok: false, text: '검증할 키를 입력하세요.' } })); return; }
+    const value = (draft[g.key_env] ?? '').trim();
+    // 입력창이 비어 있어도 괜찮다 — 저장된 키를 그대로 검증한다.
+    // (키는 이미 저장돼 있으므로 다시 붙여넣으라고 강요하면 성의 없음)
+    if (!value && !g.has_key) {
+      setMsg((m) => ({ ...m, [mk]: { ok: false, text: '저장된 키가 없습니다. 입력창에 붙여넣으세요.' } }));
+      return;
+    }
     setBusy((b) => ({ ...b, [g.key_env!]: true }));
-    setMsg((m) => ({ ...m, [mk]: { ok: true, text: '검증 중...' } }));
+    setMsg((m) => ({ ...m, [mk]: { ok: true, text: value ? '검증 중...' : '저장된 키 검증 중...' } }));
     try {
       const r = await api.validateProviderKey(g.key_env, value);
       setMsg((m) => ({ ...m, [mk]: { ok: !!r.ok, text: r.message || (r.ok ? '정상입니다.' : '실패') } }));
@@ -175,6 +203,7 @@ const ModelPlanCard: React.FC<Props> = ({
   const shared = {
     plan, openKey, setOpenKey, busy, warn, msg, draft,
     setDraft, reveal, setReveal, onToggleModel: toggleModel, onPin: pinModel,
+    onMove: moveModel, moving,
     onSaveKey: saveKey, onCheckKey: checkKey, onRemoveKey: removeKey,
     onEnableAll: enableAll, onTestTTS,
   };
@@ -250,6 +279,8 @@ type Shared = {
   setReveal: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   onToggleModel: (kind: string, r: ProviderPlanRow) => void;
   onPin: (kind: string, r: ProviderPlanRow, pin: boolean) => void;
+  onMove: (kind: string, r: ProviderPlanRow, delta: -1 | 1) => void;
+  moving: boolean;
   onSaveKey: (kind: string, g: KeyGroup) => void;
   onCheckKey: (kind: string, g: KeyGroup) => void;
   onRemoveKey: (kind: string, g: KeyGroup) => void;
@@ -451,7 +482,7 @@ const ProviderBlock: React.FC<{
       <div className="pl-2 pr-1.5 py-1 space-y-px">
         {g.models.map((r) => (
           <ModelRow
-            key={r.id} r={r} kind={kind} p={p}
+            key={r.id} r={r} kind={kind} p={p} groupSize={g.models.length}
             isFirst={firstLabel === r.id}
             warn={p.warn[r.id]}
           />
@@ -464,8 +495,8 @@ const ProviderBlock: React.FC<{
 /** 상세 모델 1줄 — 왼쪽 세로선으로 프로바이더와 연결한다 */
 const ModelRow: React.FC<{
   r: ProviderPlanRow; kind: string; p: Shared; isFirst: boolean;
-  warn?: string[];
-}> = ({ r, kind, p, isFirst, warn }) => {
+  groupSize: number; warn?: string[];
+}> = ({ r, kind, p, isFirst, groupSize, warn }) => {
   return (
     <div className="relative pl-2.5">
       {/* 프로바이더 연결선 */}
@@ -496,9 +527,44 @@ const ModelRow: React.FC<{
           <span className="text-[8px] font-black text-gray-400 bg-gray-100 px-1 rounded shrink-0">코드없음</span>
         )}
         <span className="flex-1" />
+        {/* LLM 은 '편당 비용' 이 의미가 있다 (이미지=장당/영상=초당 과 다름) */}
+        {kind === 'llm' && r.script_cost && (
+          <span
+            className={`text-[9.5px] font-bold tabular-nums shrink-0 ${
+              !r.script_cost.known ? 'text-gray-400'
+                : r.rank === 1 ? 'text-violet-700' : 'text-amber-700'}`}
+            title={r.script_cost.known
+              ? `대본 1편(60초) 기준 실측 기준가 · 입력 ${r.script_cost.script_in?.toLocaleString() ?? '?'}토큰, `
+                + `출력 ${r.script_cost.script_out?.toLocaleString() ?? '?'}토큰`
+                + (r.script_cost.script_reasoning ? ` (추론 ${r.script_cost.script_reasoning.toLocaleString()})` : '')
+              : (r.script_cost.note || '아직 1편을 생성하지 않아 편당 비용을 모릅니다')}
+          >
+            {r.script_cost.known
+              ? `편당 ${r.script_cost.label_krw}`
+              : '편당 미측정'}
+          </span>
+        )}
+        {kind === 'llm' && (
+          <span className="flex items-center shrink-0">
+            <button
+              onClick={() => p.onMove(kind, r, -1)}
+              disabled={p.busy[r.id] || p.moving || r.rank === 1}
+              className="p-0.5 text-gray-300 hover:text-indigo-600 disabled:opacity-25 shrink-0"
+              title="한 칸 위로 (1순위에 가깝게)" aria-label={`${r.label} 위로`}>
+              <ChevronUp size={10} />
+            </button>
+            <button
+              onClick={() => p.onMove(kind, r, 1)}
+              disabled={p.busy[r.id] || p.moving || r.rank === groupSize}
+              className="p-0.5 text-gray-300 hover:text-indigo-600 disabled:opacity-25 shrink-0"
+              title="한 칸 아래로" aria-label={`${r.label} 아래로`}>
+              <ChevronDown size={10} />
+            </button>
+          </span>
+        )}
         <span className={`text-[9.5px] font-bold tabular-nums shrink-0 ${
-          r.cost_krw == null ? 'text-gray-400'
-            : r.cost_krw > 0 ? 'text-amber-700' : 'text-emerald-600'}`}>
+          kind === 'llm' ? 'hidden' : (r.cost_krw == null ? 'text-gray-400'
+            : r.cost_krw > 0 ? 'text-amber-700' : 'text-emerald-600')}`}>
           {r.cost_krw == null ? '별도'
             : r.cost_krw > 0 ? `${r.cost_krw.toLocaleString()}원` : '무료'}
         </span>

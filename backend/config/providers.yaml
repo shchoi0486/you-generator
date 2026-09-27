@@ -668,7 +668,7 @@ llm:
   deepseek_v4_flash:
     label: "DeepSeek V4 Flash"
     adapter: openai_compat
-    model_id: "deepseek-v4-flash"
+    model_id: "deepseek-flash"
     base_url: "https://api.deepseek.com"
     cost_input_per_1m: 0.14
     cost_output_per_1m: 0.28
@@ -680,14 +680,22 @@ llm:
     notes: >-
       주력 모델. 요청당 비용이 가장 낮아 같은 돈으로 처리량이 가장 많다.
       키를 등록하면 자동으로 1순위가 된다.
+      실측 2026-09-27: /v1/models 는 200 이지만 잔액 0.00 이라 /chat/completions 가
+      402 (Insufficient Balance) 를 준다. 충전 전에는 실제 호출이 안 된다.
+      또 모델 id 는 'deepseek-v4-flash' 가 아니라 'deepseek-flash' 다
+      (같은 키로 확인 가능한 목록: deepseek-flash, deepseek-v4-pro).
 
   qwen3_8_flash:
-    label: "Qwen3.8 Flash (DashScope)"
+    label: Qwen3.8 Flash
     adapter: openai_compat
     model_id: "qwen3.8-flash"
+    # 일반 dashscope.aliyuncs.com 은 이 키로 401 이다. 국제 엔드포인트만 200.
     base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode"
+    # 백업 후보. 실측: 본문 생성에 45초. 기본 120초였을 때 3회 연속 timeout 으로
+    # 6분을 날리고도 실패했다. 75초면 45초 실측 + 여유를 잡으면서 최악의 체류를 줄인다.
+    timeout_sec: 75
     cost_input_per_1m: 0.15
-    cost_output_per_1m: 0.30
+    cost_output_per_1m: 0.3
     key_env: qwen_api_key
     modes: [text]
     quality: 76
@@ -695,7 +703,10 @@ llm:
     tier_hint: "백업 (5,400 요청/월, $30 상당)"
     notes: >-
       DeepSeek 가 429 로 막힐 때 대체. base_url 에 /compatible-mode 이 붙는
-      점만 다르고 프로토콜은 같다.
+      점만 다르고 프로토콜은 같다. 실측: 본문 생성에 45초 (Gemini Flash-Lite 는 12초).
+      reasoning 모델이라 비추론으로 못 바꾼다 (enable_thinking:false, thinking_budget:0
+      모두 무시됨). 내부 추론 토큰까지 합쳐 in 4,268 / out 2,875 / 추론 2,010 —
+      출력이 41% 늘어난다. 이게 편당 비용을 잡아먹는 주원인이고, 그래도 Flash-Lite 보단 싸다.
 
   # ── Gemini 폴백 ─────────────────────────────────────────
   gemini_3_5_flash_lite:

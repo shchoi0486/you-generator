@@ -286,10 +286,24 @@ export interface ProviderPlanRow {
   quality?: number;
   res?: string;
   tier_ranked: boolean;
-  /** 사용자가 '1순위로 지정' 한 항목 */
+  /** 사용자가 '1순위로 고정' 한 항목 */
   pinned: boolean;
+  /** 화면/실행 순서에서의 위치 (1 = 1순위) */
+  rank?: number;
+  /** 대본 1편(60초) 기준 예상 비용. known=false 면 미측정. */
+  script_cost?: {
+    krw: number | null;
+    usd: number | null;
+    known: boolean;
+    label_krw?: string;
+    note?: string;
+    script_in?: number;
+    script_out?: number;
+    script_reasoning?: number;
+    samples?: number;
+  };
   notes: string;
-  /** 켜져 있고 + 키 있고 + 어댑터 있음 = 실제로 사용 가능 */
+  /** 켜짐 + 키 있음 + 어댑터 있음 = 실제로 써도 되는 상태 */
   ready: boolean;
 }
 
@@ -802,18 +816,41 @@ export const api = {
     });
   },
 
-  /** 형식 + 실제 API 호출 검증. 과금 없이 가능한 범위에서만 호출한다. */
+  /**
+   * 형식 + 실제 API 호출 검증. 과금 없이 가능한 범위에서만 호출한다.
+   * value 를 빈 문자열로 보내면 '이미 저장된 키' 를 검증한다.
+   */
   validateProviderKey: async (keyId: string, value: string): Promise<{
     ok: boolean;
     stage: string;
     message: string;
     format_note?: string | null;
+    using_stored?: boolean;
   }> => {
     return handleFetch(`${API_BASE_URL}/providers/keys/validate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key_id: keyId, value }),
     });
+  },
+
+  /** 우선순위를 한 칸 위(-1)/아래(1)로. providers.yaml 은 안 바뀐다. */
+  moveProviderOrder: async (kind: string, id: string, delta: -1 | 1): Promise<{
+    ok: boolean;
+    moved: boolean;
+    error?: string;
+    order?: string[];
+  }> => {
+    return handleFetch(`${API_BASE_URL}/providers/order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, id, delta }),
+    });
+  },
+
+  /** 누적 LLM 비용 (모델별 토큰/금액). */
+  getLLMCost: async () => {
+    return handleFetch(`${API_BASE_URL}/providers/cost`, { method: 'GET' });
   },
 
   /** 프로바이더 1개로 실제 생성 1회(과금됨). 어댑터 동작 확인용. */

@@ -105,13 +105,14 @@ const ProviderKeySections: React.FC<Props> = ({ data, loading, onRefresh, extras
   };
 
   const check = async (k: ProviderKeyRow) => {
+    // 저장된 키가 있으면 입력창이 비어 있어도 검증한다(재입력 강요 금지).
     const value = (draft[k.id] ?? '').trim();
-    if (!value) {
-      setMsg((m) => ({ ...m, [k.id]: { ok: false, text: '검증할 키를 입력하세요.' } }));
+    if (!value && !k.has_key) {
+      setMsg((m) => ({ ...m, [k.id]: { ok: false, text: '저장된 키가 없습니다. 입력창에 붙여넣으세요.' } }));
       return;
     }
     setBusyOn(k.id, 'check');
-    setMsg((m) => ({ ...m, [k.id]: { ok: true, text: '검증 중...' } }));
+    setMsg((m) => ({ ...m, [k.id]: { ok: true, text: value ? '검증 중...' : '저장된 키 검증 중...' } }));
     try {
       const r = await api.validateProviderKey(k.id, value);
       setMsg((m) => ({ ...m, [k.id]: { ok: !!r.ok, text: r.message || (r.ok ? '정상입니다.' : '실패') } }));

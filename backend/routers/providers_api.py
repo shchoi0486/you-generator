@@ -336,12 +336,40 @@ def save_key(payload: KeyPayload) -> Dict[str, Any]:
 
 @router.post("/keys/validate")
 def validate_key(payload: KeyPayload) -> Dict[str, Any]:
-    """형식 검사 + (가능하면) 실제 API 호출 1회."""
-    if not payload.value:
-        raise HTTPException(status_code=400, detail="키가 비어 있습니다.")
-    fmt = key_store.validate_format(payload.key_id, payload.value)
+    """형식 검사 + 실제 API 호출 1회.
+
+    value 가 비어 있으면 '이미 저장된 키' 를 검증한다.
+    예전에는 값이 반드시 들어와야 해서, 키를 이미 저장해 놓고도
+    '검증할 키를 입력하세요' 라고 해야 했다(사용자가 모르는 사이 어색함).
+    """
+    known = {k.get("id") for k in registry.api_keys()}
+    if payload.key_id not in known:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 키 항목: {payload.key_id}")
+
+    value = (payload.value or "").strip()
+    using_stored = False
+    if not value:
+        # 저장된 키로 검증 (입력창에 다시 붙여넣으라고 강요하지 않는다).
+        # registry._key_names 로 별칭까지 같이 본다 — qwen_api_key 는 실제로
+        # dashscope_api_key 로 저장돼 있다. key_store.get 만 쓰면
+        # '키가 분명히 있는데 저장된 키가 없다' 고 잘못 말하게 된다(실측).
+        for name in registry._key_names(payload.key_id):
+            try:
+                found = (key_store.get(name) or "").strip()
+            except Exception:
+                found = ""
+            if found:
+                value = found
+                using_stored = True
+                break
+    if not value:
+        raise HTTPException(status_code=400,
+                            detail="저장된 키가 없습니다. 입력창에 붙여넣으세요.")
+
+    fmt = key_store.validate_format(payload.key_id, value)
     if fmt:
-        return {"ok": False, "stage": "format", "message": fmt}
+        return {"ok": False, "stage": "format", "message": fmt,
+                "using_stored": using_stored}
 
     probe = {
         "gemini_api_key": _probe_gemini,
@@ -353,17 +381,46 @@ def validate_key(payload: KeyPayload) -> Dict[str, Any]:
         "cloudflare_api_token": _probe_cloudflare,
         "elevenlabs_api_key": _probe_elevenlabs,
         "deepseek_api_key": _probe_deepseek,
+        "qwen_api_key": _probe_qwen,
     }.get(payload.key_id)
     if not probe:
         return {"ok": True, "stage": "format",
                 "message": "형식이 정상입니다. (이 항목은 실제 호출 검사를 지원하지 않습니다 — "
                            "등록 후 모델을 1회 생성해 확인하세요)"}
     try:
-        ok, msg = probe(payload.value)
+        ok, msg = probe(value)
     except Exception as e:
-        return {"ok": False, "stage": "network", "message": f"{type(e).__name__}: {str(e)[:180]}"}
+        return {"ok": False, "stage": "network",
+                "message": f"{type(e).__name__}: {str(e)[:180]}",
+                "using_stored": using_stored}
     return {"ok": ok, "stage": "api", "message": msg,
-            "format_note": key_store.format_note(payload.key_id, payload.value)}
+            "using_stored": using_stored,
+            "format_note": key_store.format_note(payload.key_id, value)}
+
+
+def _probe_deepseek(key: str):
+    """잔액 조회. 과금 없음.
+
+    402(잔액 0) 여기도 구분해서 알려준다 — '키가 틀렸다' 와
+    '키는 맞는데 충전이 안 됐다' 는 사용자가 할 일이 전혀 다르다.
+    """
+    import requests
+    r = requests.get("https://api.deepseek.com/user/balance",
+                     headers={"Authorization": f"Bearer {key}"}, timeout=30)
+    if r.status_code == 401:
+        return False, "키가 유효하지 않습니다 (401)"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:120]}"
+    d = r.json() or {}
+    bal = (d.get("balance_infos") or [{}])[0]
+    total = bal.get("total_balance", "?")
+    avail = d.get("is_available")
+    models = "deepseek-flash, deepseek-v4-pro"
+    if not avail:
+        return (True,
+                f"키는 정상이나 잔액 ${total} 입니다. 충전해야 실제 호출이 됩니다. "
+                f"(사용 가능 모델: {models})")
+    return True, f"정상. 잔액 ${total} (사용 가능 모델: {models})"
 
 
 def _probe_cloudflare(key: str):
@@ -387,14 +444,29 @@ def _probe_elevenlabs(key: str):
     return False, f"HTTP {r.status_code}: {r.text[:160]}"
 
 
-def _probe_deepseek(key: str):
-    """잔액 조회. 과금 없음."""
+def _probe_qwen(key: str):
+    """DashScope 국제 엔드포인트로 최소 호출. 과금 금액은 0원에 가깝다.
+
+    일반 dashscope.aliyuncs.com 이 아니라 intl 이어야 이 키가 통한다
+    (providers.yaml 의 base_url 과 같은 이유).
+    """
     import requests
-    r = requests.get("https://api.deepseek.com/user/balance",
-                     headers={"Authorization": f"Bearer {key}"}, timeout=30)
-    if r.ok:
-        return True, f"정상. 잔액 {r.text[:80]}"
-    return False, f"HTTP {r.status_code}: {r.text[:160]}"
+    r = requests.post(
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"model": "qwen3.8-flash",
+              "messages": [{"role": "user", "content": "ok"}], "max_tokens": 1},
+        timeout=60)
+    if r.status_code == 401:
+        return False, ("키가 유효하지 않습니다 (401). 이 키는 DashScope 국제站 "
+                       "(dashscope-intl) 전용입니다.")
+    if r.status_code == 403:
+        return False, "권한이 없습니다 (403) — 모델 접근 권한을 확인하세요."
+    if r.status_code == 429:
+        return True, "키는 정상. 다만 지금 할량이 초과됐습니다 (429)."
+    if not r.ok:
+        return False, f"HTTP {r.status_code}: {r.text[:140]}"
+    return True, "정상. DashScope 국제站 사용 가능 (qwen3.8-flash 확인)"
 
 
 def _probe_gemini(key: str):
@@ -743,6 +815,25 @@ def _project(rows: List[Dict[str, Any]], kind: str,
     }
 
 
+def _llm_script_cost(p: Dict[str, Any]) -> Dict[str, Any]:
+    """대본 1편(기본 60초) 기준 예상 비용.
+
+    실측된 프로파일이 있는 모델만 숫자를 준다. 없는 모델은 '미측정' 을
+    돌려준다 — 토큰 수를 지어내서 가격을 붙이면 사용자가 그 숫자를 믿고
+   .Provider 선택을 하니까.
+    """
+    try:
+        from ..core.llm_cost import estimate_usd, format_krw
+    except ImportError:
+        from core.llm_cost import estimate_usd, format_krw
+    try:
+        e = estimate_usd(p)
+    except Exception:
+        return {"krw": None, "usd": None, "known": False, "note": "계산 실패"}
+    e["label_krw"] = format_krw(e.get("krw"))
+    return e
+
+
 def _llm_rows() -> List[Dict[str, Any]]:
     """대본 모델 = providers.yaml 의 llm 섹션 (단일 출처).
 
@@ -759,18 +850,33 @@ def _llm_rows() -> List[Dict[str, Any]]:
                if v and k.startswith("llm/")}
 
     src = registry.section("llm")
-    order_of = {k: (v.get("order") or 999) for k, v in src.items()}
+    # 동률이면 YAML 에 적힌 순서를 쓴다. id 로 정렬하면 화면이 알파벳순이 되어
+    # 'DeepSeek 가 1순위' 인데 실행은 다른 모델이 도는 일이 생긴다(실측).
+    yaml_pos = {name: i for i, name in enumerate(src)}
+    order_of = {k: (v.get("order") if v.get("order") is not None else 999)
+                for k, v in src.items()}
+    pos_of = {k: (order_of.get(k, 999), yaml_pos.get(k, 999)) for k in src}
     by_id = {k: v for k, v in src.items()
              if not v.get("hidden") and v.get("enabled")}
 
     pinned = sorted((by_id[i] for i in pin_set if i in by_id),
-                    key=lambda p: (order_of.get(p["id"], 999), p["id"]))
+                    key=lambda p: pos_of.get(p["id"], (999, 999)))
     rest = sorted((p for k, p in by_id.items() if k not in pin_set),
-                  key=lambda p: (order_of.get(p["id"], 999), p["id"]))
+                  key=lambda p: pos_of.get(p["id"], (999, 999)))
     disabled = sorted((p for p in src.values()
                        if not p.get("hidden") and not p.get("enabled")),
-                      key=lambda p: (order_of.get(p["id"], 999), p["id"]))
+                      key=lambda p: pos_of.get(p["id"], (999, 999)))
     final = pinned + rest + disabled
+
+    # ── 사용자 지정 순서 (위/아래 버튼) ─────────────────────
+    # 사용자가 직접 정한 순서가 YAML order 보다 우선이다.
+    # 1순위가 실제로 어느 모델인지가 '내 돈이 어디로 가는가' 이므로
+    # 화면에 보이는 순서와 실행 순서를 반드시 일치시킨다.
+    user_order = provider_overrides.get_order("llm")
+    if user_order:
+        rank = {mid: i for i, mid in enumerate(user_order)}
+        final.sort(key=lambda p: rank.get(p["id"], 10_000 + yaml_pos.get(p["id"], 999)))
+
 
     krw = registry.usd_krw()
     out: List[Dict[str, Any]] = []
@@ -781,6 +887,7 @@ def _llm_rows() -> List[Dict[str, Any]]:
         has_key = bool(p.get("key_env")) and registry.usable(p)
         cin = p.get("cost_input_per_1m")
         cout = p.get("cost_output_per_1m")
+        est = _llm_script_cost(p)
         out.append({
             "id": pid,
             "label": p.get("label"),
@@ -805,7 +912,9 @@ def _llm_rows() -> List[Dict[str, Any]]:
             "base_url": p.get("base_url"),
             "tier_ranked": pid in pin_set,
             "pinned": pid in pin_set,
-            "order": order_of.get(pid, i + 1),
+            "order": order_of.get(pid, 999),
+            "rank": i + 1,
+            "script_cost": est,
             "tier_hint": p.get("tier_hint") or "",
             "notes": (p.get("notes") or "").strip(),
             "ready": bool(p.get("enabled")) and has_key and state == "yes",
@@ -986,6 +1095,56 @@ def pin(body: TogglePayload) -> Dict[str, Any]:
     if registry.section(body.kind).get(body.id) is None:
         raise HTTPException(404, f"'{body.id}' 은(는) 없는 {body.kind} 모델입니다.")
     return provider_overrides.set_pinned(body.kind, body.id, body.pinned)
+
+
+class OrderPayload(BaseModel):
+    kind: str
+    id: str
+    delta: int = 0
+
+
+@router.post("/order")
+def order(body: OrderPayload) -> Dict[str, Any]:
+    """우선순위를 한 칸 위/아래로 이동한다(위/아래 버튼).
+
+    delta=+1 이 '한 칸 아래'(순서상 뒤로), -1 이 '한 칸 위'.
+    사용자가 직접 정한 순서만 저장한다. providers.yaml 은 건드리지 않는다.
+    """
+    if registry.section(body.kind).get(body.id) is None:
+        raise HTTPException(404, f"'{body.id}' 은(는) 없는 {body.kind} 모델입니다.")
+    if body.delta not in (-1, 1):
+        raise HTTPException(400, "delta 는 -1(위로) 또는 1(아래로) 이어야 합니다.")
+    res = provider_overrides.move(body.kind, body.id, body.delta)
+    if not res.get("ok"):
+        return {"ok": False, "moved": False, "error": res.get("error"),
+                "order": res.get("order", provider_overrides.get_order(body.kind))}
+    rows = {k: v for k, v in registry.section(body.kind).items()}
+    return {
+        "ok": True, "moved": True, "kind": body.kind, "id": body.id,
+        "order": res.get("order", []),
+        "rank": {r["id"]: i + 1 for i, r in enumerate(_llm_rows())
+                 if body.kind == "llm"} or None,
+    }
+
+
+@router.post("/order/reset")
+def order_reset(kind: str = "llm") -> Dict[str, Any]:
+    """우선순위 지정을 지우고 기본(티어/가격) 순서로 되돌린다."""
+    return provider_overrides.clear_order(kind)
+
+
+@router.get("/cost")
+def cost() -> Dict[str, Any]:
+    """누적 LLM 비용 + 모델별 실측 프로파일.
+
+    '한 편에 얼마가 들나' 는 estimate 로, '지금까지 얼마 썼나' 는 totals 로.
+    둘을 섞지 않는다.
+    """
+    try:
+        from ..core.llm_cost import totals as _t
+    except ImportError:
+        from core.llm_cost import totals as _t
+    return _t()
 
 
 @router.post("/auto-enable")
